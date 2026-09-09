@@ -156,7 +156,7 @@ cmake --build host/build --target time_sync_test
 
 > `-Dlibhcs_SOF_DIAG=ON` 会占用 `DataId::kUart0`（本板的 UART1 数据口）来送遥测，
 > 与 `-Dlibhcs_CAN_DIAG=ON` 是同一条通道，**两个开关不要同时打开**。验证完把板子刷回
-> 常规镜像（`./flash-dual.sh`，或不带 `-Dlibhcs_SOF_DIAG` 重建）即可。
+> 常规镜像（`./tools/flash.sh hpm5321`，或不带 `-Dlibhcs_SOF_DIAG` 重建）即可。
 
 ## 4. 共享时间轴的实现 [实测 2026-08-19]
 

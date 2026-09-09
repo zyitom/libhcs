@@ -163,7 +163,7 @@ Ozone 是依赖实体 J-Link 的 GUI 调试器，同样只在宿主机安装。�
 `jlink 9.68.0` / `ozone 3.501`，二进制落在 `/usr/bin/JLinkExe`、`/usr/bin/JLinkGDBServer`、
 `/usr/bin/ozone`，`.deb` 安装时会自动装 udev 规则。`[实测 2026-08-14]`
 
-安装后，`./jlink-debug.sh` 提供命令行 J-Link GDB Server 流程，`./ozone-debug.sh` 打开
+安装后，`./tools/jlink-debug.sh` 提供命令行 J-Link GDB Server 流程，`./tools/ozone-debug.sh` 打开
 仓库中预设的 Ozone 工程；可用 `--list` 查看目标。它们用于 `c_board`、`mc02` 和
 `hpm_board`，**不用于 `ch32_board`**。
 

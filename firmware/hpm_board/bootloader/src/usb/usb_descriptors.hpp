@@ -103,7 +103,7 @@ private:
     // and its compile-time PID can only be one of them (0x5321). Leaving it at
     // that would make a dual board enumerate its DFU interface as 0x5321, which
     // breaks every `dfu-util -d 0xa511:0x5322` command line in the repo
-    // (flash-dual.sh, flash-dual-bootloader.sh, BUILD_ENVIRONMENT.md) and any
+    // (tools/flash.sh hpm5321, flash-dual-bootloader.sh, BUILD_ENVIRONMENT.md) and any
     // udev rule keyed on it. The merge is supposed to be invisible from the host
     // side; the PID is the one field that makes that true.
     //

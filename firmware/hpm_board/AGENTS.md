@@ -114,7 +114,8 @@ sudo ./host-tuning.sh --pmqos  # 另开一个终端，测量期间持住（只�
 
 ## 烧录
 
-见本文「构建与烧录命令」一节的 `dfu-util` 用法；`flash-ecat.sh` / `flash-ecat-swap.sh`
+App 走 USB DFU：`./tools/flash.sh hpm5321`（默认 release；末尾加 `debug`）。
+手工 `dfu-util` 见本文「构建」一节。`flash-ecat.sh` / `flash-ecat-swap.sh`
 两个脚本随 EtherCAT 桥一并移出仓库（见归档）。
 
 ## CAN 采样点：必须对齐总线，不是对齐推荐表 [实测 2026-08-03]

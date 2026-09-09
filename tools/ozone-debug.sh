@@ -5,15 +5,15 @@
 # interface, speed, connect mode and program file.
 #
 # Usage:
-#   ./ozone-debug.sh mc02             # STM32H723VGT6 bootloader, SWD
-#   ./ozone-debug.sh mc02 app         # STM32H723VGT6 application, SWD
-#   ./ozone-debug.sh c_board          # STM32F407IGH6 bootloader, SWD
-#   ./ozone-debug.sh c_board app      # STM32F407IGH6 application, SWD
-#   ./ozone-debug.sh hpm6e8y          # HPM6E8Y core0 bootloader, JTAG
-#   ./ozone-debug.sh hpm6e8y app      # HPM6E8Y application, JTAG
-#   ./ozone-debug.sh hpm5321          # hpm_board hpm5321 bootloader, JTAG (attach)
-#   ./ozone-debug.sh hpm5321 app      # hpm_board hpm5321 application, JTAG (attach)
-#   ./ozone-debug.sh --list
+#   ./tools/ozone-debug.sh mc02             # STM32H723VGT6 bootloader, SWD
+#   ./tools/ozone-debug.sh mc02 app         # STM32H723VGT6 application, SWD
+#   ./tools/ozone-debug.sh c_board          # STM32F407IGH6 bootloader, SWD
+#   ./tools/ozone-debug.sh c_board app      # STM32F407IGH6 application, SWD
+#   ./tools/ozone-debug.sh hpm6e8y          # HPM6E8Y core0 bootloader, JTAG
+#   ./tools/ozone-debug.sh hpm6e8y app      # HPM6E8Y application, JTAG
+#   ./tools/ozone-debug.sh hpm5321          # hpm_board hpm5321 bootloader, JTAG (attach)
+#   ./tools/ozone-debug.sh hpm5321 app      # hpm_board hpm5321 application, JTAG (attach)
+#   ./tools/ozone-debug.sh --list
 #
 # Omit the image selector to use the project default image. Passing "app" creates
 # a temporary attach-mode project for the board application ELF.
@@ -23,12 +23,12 @@
 #
 # ch32_board is deliberately absent: it is debugged over WCH-Link, which Ozone
 # does not speak. Use the VS Code "ch32 - Debug V3F boot core" configuration, or
-# ./jlink-debug.sh for the command-line route on the J-Link boards.
+# ./tools/jlink-debug.sh for the command-line route on the J-Link boards.
 #
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$SCRIPT_DIR/ozone"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_DIR="$ROOT/ozone"
 CACHE_DIR="${TMPDIR:-/tmp}/libhcs-ozone-${UID:-$(id -u)}"
 
 OZONE="${OZONE:-}"
@@ -64,16 +64,16 @@ usage() {
 app_elf_for_project() {
     case "$1" in
     mc02)
-        printf '%s\n' "$SCRIPT_DIR/firmware/mc02/build/app/mc02_app.elf"
+        printf '%s\n' "$ROOT/firmware/mc02/build/app/mc02_app.elf"
         ;;
     c_board)
-        printf '%s\n' "$SCRIPT_DIR/firmware/c_board/build/app/c_board_app.elf"
+        printf '%s\n' "$ROOT/firmware/c_board/build/app/c_board_app.elf"
         ;;
     hpm6e8y)
-        printf '%s\n' "$SCRIPT_DIR/firmware/hpm_board/build/app/output/hpm_board_app_hpm6e8y.elf"
+        printf '%s\n' "$ROOT/firmware/hpm_board/build/app/output/hpm_board_app_hpm6e8y.elf"
         ;;
     hpm5321)
-        printf '%s\n' "$SCRIPT_DIR/firmware/hpm_board/build/app/output/hpm_board_app_hpm5321.elf"
+        printf '%s\n' "$ROOT/firmware/hpm_board/build/app/output/hpm_board_app_hpm5321.elf"
         ;;
     *)
         return 1

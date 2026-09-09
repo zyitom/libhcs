@@ -151,7 +151,16 @@ App 之后即可通过下面的 DFU 流程烧录，无需调试器。
 
 ### 烧录 App（USB DFU）
 
-App 镜像 `*.dfu` 已带好镜像哈希与 DFU 后缀，`dfu-util` 会按 VID/PID 自动匹配设备。
+日常入口是 `./tools/flash.sh <target>`：编对应 preset（默认 release），再 `dfu-util`。
+
+```bash
+./tools/flash.sh mc02            # 默认 release
+./tools/flash.sh mc02 debug      # 只有末尾是 debug 才换成 debug
+./tools/flash.sh c_board
+./tools/flash.sh hpm5321
+```
+
+App 镜像 `*.dfu` 已带好镜像哈希与 DFU 后缀。下面是脚本做的手工步骤。
 
 1. **让设备进入 DFU 模式**，任选其一：
    - 由上位机软件发起 DFU 重启请求（App 运行时触发）——最常用；

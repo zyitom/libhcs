@@ -2,7 +2,7 @@
 * Ozone project: hpm6e8y BOOTLOADER -- JTAG.
 *
 *   /opt/SEGGER/Ozone_V350a/Ozone ozone/hpm6e8y.jdebug
-*   ./ozone-debug.sh hpm6e8y
+*   ./tools/ozone-debug.sh hpm6e8y
 *
 * Build first:
 *   export PATH=~/3rd_party/rv32imac_zicsr_zifencei_multilib_b_ext-linux/bin:$PATH

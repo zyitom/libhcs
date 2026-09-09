@@ -2,7 +2,7 @@
 * Ozone project: hpm5321 BOOTLOADER -- JTAG, download-and-reset.
 *
 *   /opt/SEGGER/Ozone_V350a/Ozone ozone/hpm5321.jdebug
-*   ./ozone-debug.sh hpm5321
+*   ./tools/ozone-debug.sh hpm5321
 *
 * Build first (see ../firmware/hpm_board/BUILD_ENVIRONMENT.md for the
 * toolchain path convention):
@@ -31,7 +31,7 @@
 * is for the SDK, not the debugger.
 *
 * To debug the running APPLICATION instead, use:
-*   ./ozone-debug.sh hpm5321 app
+*   ./tools/ozone-debug.sh hpm5321 app
 * which points this same attach mode at hpm_board_app_hpm5321.elf.
 **********************************************************************/
 

@@ -2,7 +2,7 @@
 * Ozone project: hpm6e8y core1 -- EtherCAT stack (SSC + ESC + FoE), JTAG.
 *
 *   /opt/SEGGER/Ozone_V350a/Ozone ozone/hpm6e8y-core1.jdebug
-*   ../ozone-debug.sh hpm6e8y-core1
+*   ../tools/ozone-debug.sh hpm6e8y-core1
 *
 * WHAT RUNS HERE (changed with the core swap, 2026-08-14): core1 is the EtherCAT
 * core -- Beckhoff SSC, the ESC port layer, the FoE handler and the MBX1 flash

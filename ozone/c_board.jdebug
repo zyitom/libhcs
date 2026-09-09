@@ -2,14 +2,14 @@
 * Ozone project: c_board BOOTLOADER -- STM32F407IGH6, SWD.
 *
 *   /opt/SEGGER/Ozone_V350a/Ozone ozone/c_board.jdebug
-*   ./ozone-debug.sh c_board
+*   ./tools/ozone-debug.sh c_board
 *
 * Build first:
 *   cmake --build firmware/c_board/build --target c_board_bootloader
 *
 * Bootloader rather than application, and download-and-reset rather than attach:
 * same reasoning as ozone/mc02.jdebug -- the app is deployed over DFU
-* (./flash-cboard.sh), and the bootloader is only observable from reset because
+* (./tools/flash.sh c_board), and the bootloader is only observable from reset because
 * it hands over to the app within milliseconds.
 *
 * To debug the running APPLICATION instead, change File.Open to

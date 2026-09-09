@@ -6,7 +6,7 @@
 # and the VS Code configs in .vscode/launch.json.
 #
 # THESE DEBUG THE BOOTLOADERS. That is what a debug probe is for on these boards:
-# applications are deployed over DFU (./flash-mc02.sh, ./flash-cboard.sh), while
+# applications are deployed over DFU (./tools/flash.sh <target>), while
 # the bootloader is what you program and step through over SWD/JTAG. A bootloader
 # also hands control to the application within milliseconds, so it is only
 # observable from reset -- the bootloader targets therefore reset and break at
@@ -19,11 +19,11 @@
 # next cold boot (firmware/*/bootloader/src/flash/validation.hpp).
 #
 # Usage:
-#   ./jlink-debug.sh mc02              # mc02 bootloader,    STM32H723VGT6, SWD
-#   ./jlink-debug.sh c_board           # c_board bootloader, STM32F407IGH6, SWD
-#   ./jlink-debug.sh hpm6e8y           # bootloader,         HPM6E8Y,       JTAG
-#   ./jlink-debug.sh hpm5321           # hpm_board bootloader, HPM5361 (hpm5321 board),      JTAG
-#   ./jlink-debug.sh --list            # show the target table and exit
+#   ./tools/jlink-debug.sh mc02              # mc02 bootloader,    STM32H723VGT6, SWD
+#   ./tools/jlink-debug.sh c_board           # c_board bootloader, STM32F407IGH6, SWD
+#   ./tools/jlink-debug.sh hpm6e8y           # bootloader,         HPM6E8Y,       JTAG
+#   ./tools/jlink-debug.sh hpm5321           # hpm_board bootloader, HPM5361 (hpm5321 board),      JTAG
+#   ./tools/jlink-debug.sh --list            # show the target table and exit
 #
 # Environment overrides (all optional):
 #   ELF=<path>            debug a different image than the default
@@ -39,7 +39,7 @@
 #
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 ARM_GDB="${ARM_GDB:-/opt/arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi/bin/arm-none-eabi-gdb}"
 RISCV_GDB="${RISCV_GDB:-$HOME/3rd_party/hpm/rv32imac_zicsr_zifencei_multilib_b_ext-linux/bin/riscv32-unknown-elf-gdb}"
@@ -79,14 +79,14 @@ case "$TARGET" in
 mc02)
     DEFAULT_DEVICE="STM32H723VGTx"
     DEFAULT_IFACE="SWD"
-    DEFAULT_ELF="$SCRIPT_DIR/firmware/mc02/build/bootloader/mc02_bootloader.elf"
+    DEFAULT_ELF="$ROOT/firmware/mc02/build/bootloader/mc02_bootloader.elf"
     GDB="$ARM_GDB"
     RESET_TO_MAIN=1
     ;;
 c_board)
     DEFAULT_DEVICE="STM32F407IGHx"
     DEFAULT_IFACE="SWD"
-    DEFAULT_ELF="$SCRIPT_DIR/firmware/c_board/build/bootloader/c_board_bootloader.elf"
+    DEFAULT_ELF="$ROOT/firmware/c_board/build/bootloader/c_board_bootloader.elf"
     GDB="$ARM_GDB"
     RESET_TO_MAIN=1
     ;;
@@ -99,7 +99,7 @@ hpm6e8y)
     # connection fails, the package suffix is the first thing to try.
     DEFAULT_DEVICE="HPM6E8YxGNx"
     DEFAULT_IFACE="JTAG"
-    DEFAULT_ELF="$SCRIPT_DIR/firmware/hpm_board/build/bootloader/output/hpm_board_bootloader_hpm6e8y.elf"
+    DEFAULT_ELF="$ROOT/firmware/hpm_board/build/bootloader/output/hpm_board_bootloader_hpm6e8y.elf"
     GDB="$RISCV_GDB"
     RESET_TO_MAIN=1
     ;;
@@ -121,7 +121,7 @@ hpm5321)
     # no loader for this part.
     DEFAULT_DEVICE="HPM5321xEGx"
     DEFAULT_IFACE="JTAG"
-    DEFAULT_ELF="$SCRIPT_DIR/firmware/hpm_board/build/bootloader/output/hpm_board_bootloader_hpm5321.elf"
+    DEFAULT_ELF="$ROOT/firmware/hpm_board/build/bootloader/output/hpm_board_bootloader_hpm5321.elf"
     GDB="$RISCV_GDB"
     RESET_TO_MAIN=1
     ;;

@@ -8,22 +8,22 @@
 # defaults to the reversible half of the job.
 #
 # Usage:
-#   ./erase.sh <target>            # erase the application region (default, reversible over DFU)
-#   ./erase.sh <target> --all      # full chip erase, DFU bootloader included
-#   ./erase.sh <target> --dry-run  # print the J-Link script instead of running it
-#   ./erase.sh --list
+#   ./tools/erase.sh <target>            # erase the application region (default, reversible over DFU)
+#   ./tools/erase.sh <target> --all      # full chip erase, DFU bootloader included
+#   ./tools/erase.sh <target> --dry-run  # print the J-Link script instead of running it
+#   ./tools/erase.sh --list
 #
-# Target names match ./ozone-debug.sh and ./jlink-debug.sh.
+# Target names match ./tools/ozone-debug.sh and ./tools/jlink-debug.sh.
 #
 # WHAT "APP" MEANS. Every board here boots a DFU bootloader that validates the
 # application against a SHA-256 metadata record. The app erase starts at the
 # metadata record, not at the application image, so no stale record survives to
 # describe an image that is no longer there. The bootloader itself is untouched,
-# so the board still enumerates over USB and ./flash-*.sh keeps working with no
+# so the board still enumerates over USB and ./tools/flash.sh keeps working with no
 # debugger attached.
 #
 # A full erase takes the bootloader with it. The only way back in after that is
-# the debugger: ./ozone-debug.sh <target> opens a CM_DOWNLOAD_RESET project, so
+# the debugger: ./tools/ozone-debug.sh <target> opens a CM_DOWNLOAD_RESET project, so
 # just opening it reprograms the bootloader.
 #
 # Environment overrides:
@@ -150,7 +150,22 @@ done
 }
 
 if [[ "$MODE" == all ]]; then
-    ERASE_CMD="erase"
+    # Bare `erase` is J-Link's chip-erase path: after erasing it resets the core,
+    # halts it and sanity-checks the PC. On a part that runs XIP from external
+    # NOR the erase also takes the boot header at FLASH_BASE + 0x400, so the
+    # BootROM finds nothing to boot, the PC reads back as 0 and J-Link reports
+    #   PC of target system has unexpected value after erasing chip. (PC = 0x0)
+    #   ERROR: Erase returned with error code -5.
+    # for an erase that in fact completed -- and -exitonerror 1 then skips the
+    # read-back below, so the script calls a successful erase a failure. Naming
+    # the full range explicitly covers the same flash through the sector-erase
+    # path, which does no such check. Internal-flash parts have neither problem,
+    # so they keep the real mass erase.
+    if ((EXT_NOR)); then
+        ERASE_CMD="erase $FLASH_BASE $FLASH_END"
+    else
+        ERASE_CMD="erase"
+    fi
     VERIFY_ADDR="$FLASH_BASE"
     WHAT="ENTIRE CHIP ($FLASH_BASE .. $FLASH_END) -- DFU bootloader included"
 else
@@ -179,7 +194,7 @@ if ((DRY_RUN)); then
 fi
 
 if [[ "$MODE" == all ]]; then
-    echo ">> after this, the only way back in is ./ozone-debug.sh $TARGET"
+    echo ">> after this, the only way back in is ./tools/ozone-debug.sh $TARGET"
     # `|| reply=` so EOF (Ctrl-D, or stdin redirected) falls through to the abort
     # below instead of tripping set -e and exiting with no explanation.
     read -r -p ">> this removes the DFU bootloader too. Type 'erase' to confirm: " reply || reply=

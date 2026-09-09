@@ -5,13 +5,13 @@
 * no New Project Wizard.
 *
 *   /opt/SEGGER/Ozone_V350a/Ozone ozone/mc02.jdebug
-*   ./ozone-debug.sh mc02
+*   ./tools/ozone-debug.sh mc02
 *
 * Build first:
 *   cmake --build firmware/mc02/build --target mc02_bootloader
 *
 * WHY THE BOOTLOADER AND NOT THE APP. The debugger's job on this board is the
-* bootloader: the application is deployed over DFU (./flash-mc02.sh), while the
+* bootloader: the application is deployed over DFU (./tools/flash.sh mc02), while the
 * bootloader is what you program and step through over SWD. And it can only be
 * debugged from reset -- it runs for a few milliseconds and then jumps into the
 * application, so attaching to a running board lands in app code where these
