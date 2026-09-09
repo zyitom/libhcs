@@ -1,0 +1,47 @@
+/*********************************************************************
+* Ozone project: hpm5321 BOOTLOADER -- JTAG, download-and-reset.
+*
+*   /opt/SEGGER/Ozone_V350a/Ozone ozone/hpm5321.jdebug
+*   ./ozone-debug.sh hpm5321
+*
+* Build first (see ../firmware/hpm_board/BUILD_ENVIRONMENT.md for the
+* toolchain path convention):
+*   export GNURISCV_TOOLCHAIN_PATH=~/3rd_party/hpm/rv32imac_zicsr_zifencei_multilib_b_ext-linux
+*   cmake --preset debug -S firmware/hpm_board -DBOARD=hpm5321
+*   cmake --build firmware/hpm_board/build --target hpm_board_bootloader
+*
+* CM_DOWNLOAD_RESET, same as mc02/c_board: this part's XPI0 NOR now HAS a SEGGER
+* flash loader ("HPM XPI Nor Flash XPI0", built by SEGGER from the HPM SDK's
+* hpm_xpi driver). Older J-Link releases shipped no loader at all, which is why
+* this project used to be attach-only and flash-dual-bootloader.sh drove OpenOCD
+* instead -- that script is now gone, so the download step here is the way to
+* program the bootloader.
+*
+* The bootloader hands off to the app within milliseconds of reset, so to catch
+* the bootloader itself, set a breakpoint on main() and reset the board (Ozone's
+* Reset button, or power-cycle).
+*
+* DEVICE NAME: ../firmware/hpm_board/boards/hpm5321/hpm5321.yaml declares
+* soc=HPM5361, device=HPM5361xEGx -- that is the SDK's build target (register-
+* compatible superset), same relationship as hpm6e8y building against HPM6E80
+* while the physical die is an HPM6E00 (ozone/hpm6e8y.jdebug). The chip
+* actually soldered on this board is marked HPM5321IEG1, so Ozone needs the
+* real silicon's name instead: HPM5321xEGx (confirmed present in SEGGER's
+* device DB). Do not "fix" this back to HPM5361xEGx from the yaml -- that name
+* is for the SDK, not the debugger.
+*
+* To debug the running APPLICATION instead, use:
+*   ./ozone-debug.sh hpm5321 app
+* which points this same attach mode at hpm_board_app_hpm5321.elf.
+**********************************************************************/
+
+void OnProjectLoad (void) {
+  Project.SetDevice ("HPM5321xEGx");
+  Project.SetHostIF ("USB", "0");
+  Project.SetTargetIF ("JTAG");
+  Project.SetTIFSpeed ("4 MHz");
+
+  Debug.SetConnectMode (CM_DOWNLOAD_RESET);
+
+  File.Open ("../firmware/hpm_board/build/bootloader/output/hpm_board_bootloader_hpm5321.elf");
+}

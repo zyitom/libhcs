@@ -1,0 +1,10 @@
+{
+	"selectedCompiler": "/usr/share/MRS2/MRS-linux-x64/resources/app/resources/linux/components/WCH/Toolchain/RISC-V Embedded GCC12/bin/riscv-wch-elf-g++",
+	"selectedTarget": "RISC-V",
+	"compilerArguement": [],
+	"includePaths": [],
+	"defines": [],
+	"c_standard": "gnu23",
+	"cpp_standard": "c++17",
+	"check_flag": true
+}

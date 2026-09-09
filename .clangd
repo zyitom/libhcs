@@ -1,0 +1,66 @@
+Diagnostics:
+  UnusedIncludes: Strict
+  MissingIncludes: Strict
+  Includes:
+    IgnoreHeader:
+      - "bits/.+h" # https://github.com/llvm/llvm-project/issues/68213
+  ClangTidy:
+    FastCheckFilter: Loose
+    Remove:
+      - readability-inconsistent-declaration-parameter-name # Unable to be suppressed by NOLINT
+
+# This repository is not one CMake project but six, each with its own
+# compilation database and its own target (x86, Cortex-M4, Cortex-M7, RISC-V).
+# A single CompilationDatabase would leave every file outside it to clangd's
+# "nearest neighbour" fallback, which silently reuses another board's flags --
+# e.g. parsing the STM32H7 firmware with Cortex-M4/STM32F407 defines, so none of
+# its BSP headers resolve. Each fragment below routes one subtree to the build
+# directory that actually compiled it. Fragments apply in order and later ones
+# win, so the more specific hpm_board/ecat rule follows the general one.
+#
+# A database only exists once its preset has been configured; a board you have
+# never configured on this machine still falls back and still shows noise.
+#
+# Cross-compiled subtrees additionally need clangd to learn the toolchain's own
+# system headers, which is a command-line flag and cannot live in this file:
+#   --query-driver=/opt/arm-gnu-toolchain-*/bin/arm-none-eabi-*,\
+#                  /home/zyi/3rd_party/hpm/*/bin/riscv32-unknown-elf-*,\
+#                  /home/zyi/3rd_party/MRS_Toolchain_*/Toolchain/*/bin/riscv*-wch-elf-*
+# Without it <cstdint> and friends resolve against the host libstdc++ instead of
+# newlib, which produces its own wave of false errors.
+CompileFlags:
+  # Default for core/ and host/: the native build, since core/ is board-agnostic.
+  CompilationDatabase: host/build
+  Add:
+    - "-Wextra-semi"
+
+---
+If:
+  PathMatch: .*firmware/c_board/.*
+CompileFlags:
+  CompilationDatabase: firmware/c_board/build
+
+---
+If:
+  PathMatch: .*firmware/mc02/.*
+CompileFlags:
+  CompilationDatabase: firmware/mc02/build
+
+---
+If:
+  PathMatch: .*firmware/ch32_board/.*
+CompileFlags:
+  CompilationDatabase: firmware/ch32_board/build
+
+---
+If:
+  PathMatch: .*firmware/hpm_board/.*
+CompileFlags:
+  CompilationDatabase: firmware/hpm_board/build
+
+---
+# The EtherCAT bridge is a separate superbuild from the USB firmware above.
+If:
+  PathMatch: .*firmware/hpm_board/ecat/.*
+CompileFlags:
+  CompilationDatabase: firmware/hpm_board/ecat/build

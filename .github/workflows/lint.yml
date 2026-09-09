@@ -1,0 +1,68 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - Dockerfile
+      - .dockerignore
+      - .github/workflows/docker-image.yml
+  pull_request:
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Docker Image CI]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  lint:
+    name: lint
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.DOCKERHUB_USERNAME }}/libhcs-ci:latest
+      credentials:
+        username: ${{ vars.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: recursive
+
+      - name: Configure git safe.directory
+        run: |
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      - name: Run clang-format check
+        run: .scripts/clang-format-check
+
+      - name: Configure host
+        run: cmake --preset linux-debug -S host
+
+      - name: Build host
+        run: cmake --build host/build
+
+      - name: Configure firmware/hpm_board
+        run: cmake --preset debug -S firmware/hpm_board
+
+      - name: Build firmware/hpm_board
+        run: cmake --build firmware/hpm_board/build
+
+      - name: Configure firmware/c_board
+        run: cmake --preset debug -S firmware/c_board
+
+      - name: Build firmware/c_board
+        run: cmake --build firmware/c_board/build --target c_board_app c_board_bootloader
+
+      - name: Configure firmware/ch32_board
+        run: cmake --preset debug -S firmware/ch32_board
+
+      - name: Build firmware/ch32_board
+        run: cmake --build firmware/ch32_board/build
+
+      - name: Run clang-tidy check
+        run: .scripts/clang-tidy-check

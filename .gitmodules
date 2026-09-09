@@ -1,0 +1,24 @@
+[submodule "firmware/bsp/hpm_sdk"]
+	path = firmware/hpm_board/bsp/hpm_sdk
+	url = https://github.com/zyitom/hpm_sdk.git
+[submodule "firmware/c_board/bsp/tinyusb"]
+	path = firmware/c_board/bsp/tinyusb
+	url = https://github.com/zyitom/tinyusb.git
+[submodule "firmware/c_board/bsp/cmsis-device-f4"]
+	path = firmware/c_board/bsp/cmsis-device-f4
+	url = https://github.com/STMicroelectronics/cmsis-device-f4.git
+[submodule "firmware/c_board/bsp/stm32f4xx-hal-driver"]
+	path = firmware/c_board/bsp/stm32f4xx-hal-driver
+	url = https://github.com/STMicroelectronics/stm32f4xx-hal-driver.git
+[submodule "firmware/c_board/bsp/cmsis-core"]
+	path = firmware/c_board/bsp/cmsis-core
+	url = https://github.com/STMicroelectronics/cmsis-core.git
+[submodule "firmware/mc02/bsp/stm32h7xx-hal-driver"]
+	path = firmware/mc02/bsp/stm32h7xx-hal-driver
+	url = https://github.com/STMicroelectronics/stm32h7xx-hal-driver.git
+[submodule "firmware/mc02/bsp/cmsis-device-h7"]
+	path = firmware/mc02/bsp/cmsis-device-h7
+	url = https://github.com/STMicroelectronics/cmsis-device-h7.git
+[submodule "firmware/ch32_board/bsp/ch32h417-evt"]
+	path = firmware/ch32_board/bsp/ch32h417-evt
+	url = https://github.com/zyitom/ch32h417-evt.git

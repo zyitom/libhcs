@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "deny": [
+      "Edit(firmware/*/bsp/cubemx/Core/**)",
+      "Write(firmware/*/bsp/cubemx/Core/**)",
+      "Edit(firmware/*/bsp/cubemx/cmake/**)",
+      "Write(firmware/*/bsp/cubemx/cmake/**)",
+      "Edit(firmware/*/bsp/cubemx/USB_DEVICE/**)",
+      "Write(firmware/*/bsp/cubemx/USB_DEVICE/**)"
+    ]
+  }
+}

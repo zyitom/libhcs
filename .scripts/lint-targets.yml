@@ -1,0 +1,43 @@
+exclude:
+  - bsp
+  - build
+
+host:
+  cmake: host/CMakeLists.txt
+  folders:
+    - core/src
+    - core/include
+    - host/src
+    - host/include
+
+hpm_board:
+  cmake: firmware/hpm_board/CMakeLists.txt
+  folders:
+    - core/src
+    - core/include
+    - firmware/hpm_board/app/src
+    - firmware/hpm_board/app/include
+    - firmware/hpm_board/bootloader/src
+    - firmware/hpm_board/bootloader/include
+
+c_board:
+  cmake: firmware/c_board/CMakeLists.txt
+  folders:
+    - core/src
+    - core/include
+    - firmware/c_board/app/src
+    - firmware/c_board/app/include
+    - firmware/c_board/bootloader/src
+    - firmware/c_board/bootloader/include
+
+ch32_board:
+  cmake: firmware/ch32_board/CMakeLists.txt
+  # Keep formatting and build checks enabled. clang-tidy currently reports
+  # WCH vendor macros at their project-owned expansion sites as errors, so it
+  # cannot provide a stable signal for this target yet.
+  clang_tidy: false
+  folders:
+    - core/src
+    - core/include
+    - firmware/ch32_board/app/src
+    - firmware/ch32_board/boot/src

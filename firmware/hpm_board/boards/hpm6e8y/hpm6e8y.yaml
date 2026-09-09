@@ -1,0 +1,11 @@
+# HCS EtherCAT bridge board "hpm6e8y" — HPM6E80 firmware on HPM6E00 chip,
+# hpm6e00evk-equivalent hardware. XPI NOR option-1 FCFG (0xfcf90002).
+# Same BSP as hpm6e80ivm1; only the flash pin-config option differs.
+board:
+    soc: HPM6E80
+    device: HPM6E80xVMx
+    openocd-soc: hpm6e80-dual-core
+    openocd-probe: ft2232
+    on-board-flash:
+      type: qspi-nor-flash
+      size: 4M

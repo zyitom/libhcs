@@ -1,0 +1,54 @@
+FROM zyi024424/libhcs-ci AS build
+
+SHELL ["/bin/bash", "-c"]
+
+ARG WITH_SOURCE=true
+
+COPY <<EOF /src/CMakeLists.txt
+cmake_minimum_required(VERSION 3.28)
+project(libhcs_wrapper VERSION 3 LANGUAGES C CXX)
+set(libhcs_PROJECT_VERSION "__libhcs_PROJECT_VERSION_PLACEHOLDER__")
+set(libhcs_DEBIAN_VERSION "__libhcs_DEBIAN_VERSION_PLACEHOLDER__")
+add_subdirectory(host)
+EOF
+
+COPY <<EOF /src/CMakePresets.json
+{
+    "version": 4,
+    "include": [
+        "host/CMakePresets.json"
+    ]
+}
+EOF
+
+WORKDIR /src-full
+RUN --mount=type=bind,target=/src-full,source=.,readonly \
+    libhcs_PROJECT_VERSION=$(.scripts/generate_version) \
+    && libhcs_DEBIAN_VERSION=$(.scripts/generate_version --format debian) \
+    && echo "libhcs_PROJECT_VERSION=${libhcs_PROJECT_VERSION}" >> /env.sh \
+    && echo "libhcs_DEBIAN_VERSION=${libhcs_DEBIAN_VERSION}" >> /env.sh \
+    && cp -r core host LICENSE /src \
+    && sed -i "s/__libhcs_PROJECT_VERSION_PLACEHOLDER__/${libhcs_PROJECT_VERSION}/g" \
+        /src/CMakeLists.txt \
+    && sed -i "s/__libhcs_DEBIAN_VERSION_PLACEHOLDER__/${libhcs_DEBIAN_VERSION}/g" \
+        /src/CMakeLists.txt
+
+WORKDIR /output
+
+RUN source /env.sh \
+    && if [ "${WITH_SOURCE}" = "true" ]; then \
+        SDK_SRC_NAME=libhcs-sdk-src-${libhcs_PROJECT_VERSION}; \
+        cp -r /src ${SDK_SRC_NAME}; \
+        zip -r ${SDK_SRC_NAME}.zip ${SDK_SRC_NAME}; \
+        rm -rf ${SDK_SRC_NAME}; \
+    fi
+
+RUN source /env.sh \
+    && cmake --preset linux-release -DBUILD_STATIC_libhcs=OFF -B build /src \
+    && cmake --build build \
+    && cd build && cpack -G DEB && cd .. \
+    && mv build/*.deb . \
+    && rm -rf build*
+
+FROM scratch AS output
+COPY --from=build /output/ /

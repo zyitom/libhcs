@@ -1,0 +1,11 @@
+services:
+  libhcs-develop:
+    image: zyi024424/libhcs-develop:latest
+    network_mode: host
+    init: true
+    command: /bin/sh -c "while sleep 1000; do :; done"
+    working_dir: /home/ubuntu
+    volumes:
+      - type: bind
+        source: ..
+        target: /workspaces/libhcs

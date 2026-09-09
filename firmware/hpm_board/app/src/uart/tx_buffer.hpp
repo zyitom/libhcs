@@ -1,0 +1,253 @@
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <span>
+#include <type_traits>
+
+#include <hpm_common.h>
+#include <hpm_dma_mgr.h>
+#include <hpm_dmav2_drv.h>
+#include <hpm_dmav2_regs.h>
+#include <hpm_soc_feature.h>
+#include <hpm_uart_drv.h>
+#include <hpm_uart_regs.h>
+
+#include "core/include/libhcs/data/datas.hpp"
+#include "core/src/utility/assert.hpp"
+#include "firmware/hpm_board/app/src/utility/ring_buffer.hpp"
+
+namespace libhcs::firmware::uart {
+
+class TxBuffer {
+public:
+    static constexpr size_t kBufferSize = 2048;
+    static constexpr size_t kBufferMask = kBufferSize - 1;
+    static_assert((kBufferSize & (kBufferSize - 1)) == 0);
+
+    using BufferIndexType = uint16_t;
+    static_assert(kBufferSize <= std::numeric_limits<uint16_t>::max());
+
+    static constexpr size_t kMaxIdleCount = 256;
+
+    TxBuffer(
+        UART_Type* uart_base, uint32_t dmamux_src, std::byte* data_buffer,
+        dma_mgr_linked_descriptor_t* linked_descriptor)
+        : uart_base_(uart_base)
+        , data_buffer_(data_buffer)
+        , linked_descriptor_(linked_descriptor) {
+        init_dma(dmamux_src);
+    }
+
+    bool try_enqueue(const data::UartDataView& data_view) {
+        const auto in = in_.load(std::memory_order::relaxed);
+        const auto out = out_.load(std::memory_order::acquire);
+
+        const auto writable =
+            kBufferSize - static_cast<size_t>(static_cast<BufferIndexType>(in - out));
+
+        const auto size = data_view.uart_data.size();
+        if (size > writable)
+            return false;
+
+        if (data_view.idle_delimited) {
+            const auto begin_idle = in;
+            const auto end_idle =
+                static_cast<BufferIndexType>(in + static_cast<BufferIndexType>(size));
+
+            if (idle_boundary_before_in_) {
+                if (size) {
+                    if (!idle_checkpoints_.push_back(end_idle))
+                        return false;
+                }
+            } else {
+                if (size) {
+                    if (idle_checkpoints_.push_back_n(
+                            [&, i = 0]() mutable noexcept {
+                                return (i++ == 0) ? begin_idle : end_idle;
+                            },
+                            2, true)
+                        != 2) {
+                        return false;
+                    }
+                } else {
+                    if (!idle_checkpoints_.push_back(begin_idle))
+                        return false;
+                }
+            }
+        }
+
+        if (size) {
+            auto offset = in & kBufferMask;
+            auto slice = std::min(size, kBufferSize - offset);
+            std::memcpy(data_buffer_ + offset, data_view.uart_data.data(), slice);
+            std::memcpy(data_buffer_, data_view.uart_data.data() + slice, size - slice);
+
+            in_.store(
+                static_cast<BufferIndexType>(in + static_cast<BufferIndexType>(size)),
+                std::memory_order::release);
+
+            idle_boundary_before_in_ = data_view.idle_delimited;
+        } else {
+            idle_boundary_before_in_ |= data_view.idle_delimited;
+        }
+
+        return true;
+    }
+
+    // Stop an in-flight TX DMA immediately. Used before a baudrate switch, for
+    // two reasons: bytes still queued would otherwise be clocked out at the new
+    // rate and arrive as garbage, and -- because DLL aliases THR while LCR.DLAB
+    // is set -- a DMA write landing inside the switch window would overwrite the
+    // divisor latch itself. The caller relies on TX being provably stopped, not
+    // merely likely to be idle.
+    //
+    // The queued data itself is left alone: out_ does not move, so try_dequeue()
+    // re-triggers from the same position on the next poll. Bytes the DMA had
+    // already pushed into the FIFO are re-sent rather than dropped, which can
+    // duplicate a partially shifted-out character across the switch. That is
+    // within the documented contract for handle_config -- the host is expected to
+    // quiesce the link first -- and is the safer of the two failure modes.
+    void abort_transmit() {
+        // CHABORT before disabling: its register documentation states writes are
+        // ignored for channels that are not currently enabled, so clearing
+        // CTRL.ENABLE first would silently skip the abort and leave the channel's
+        // handshake with the UART half-completed. Aborting also raises
+        // INTABORTSTS, cleared below so the next transfer starts from clean
+        // status flags.
+        if (dma_channel_is_enable(dma_.base, dma_.channel))
+            dma_abort_channel(dma_.base, 1U << dma_.channel);
+        core::utility::assert_always(dma_mgr_disable_channel(&dma_) == status_success);
+        dma_clear_transfer_status(dma_.base, dma_.channel);
+        tx_triggered_ = false;
+        // Aborting discards the bytes the channel was mid-way through, so the
+        // pending count must go with it. Leaving it set let the next
+        // try_dequeue() advance out_ past data the DMA never actually sent,
+        // permanently desynchronising the ring so that every subsequent byte came
+        // from the wrong offset. Independent of the divisor-latch corruption that
+        // caused the silent-TX symptom -- this one only ever fired after a
+        // baudrate switch, and corrupted the stream rather than stopping it.
+        in_flight_ = 0;
+    }
+
+    bool try_dequeue() {
+        if (dma_channel_is_enable(dma_.base, dma_.channel))
+            return false;
+        auto out = out_.load(std::memory_order::relaxed);
+        if (in_flight_) {
+            out = static_cast<BufferIndexType>(out + in_flight_);
+            out_.store(out, std::memory_order::release);
+            in_flight_ = 0;
+        }
+
+        const auto in = in_.load(std::memory_order::acquire);
+        const auto readable = static_cast<size_t>(static_cast<BufferIndexType>(in - out));
+        if (!readable)
+            return false;
+
+        const auto offset = out & kBufferMask;
+
+        size_t size;
+        do {
+            size = readable;
+            if (auto* idle = idle_checkpoints_.peek_front()) {
+                const auto distance =
+                    static_cast<size_t>(static_cast<BufferIndexType>(*idle - out));
+                core::utility::assert_debug(distance <= readable);
+                size = distance;
+            }
+
+            if (size)
+                break;
+
+            if (tx_triggered_ && !uart_is_txline_idle(uart_base_))
+                return false;
+
+            idle_checkpoints_.pop_front([](const BufferIndexType&) noexcept {});
+        } while (true);
+        tx_triggered_ = true;
+        uart_clear_txline_idle_flag(uart_base_);
+
+        const auto slice = std::min(size, kBufferSize - offset);
+        if (slice == size)
+            trigger_dma(data_buffer_ + offset, slice, nullptr, 0);
+        else
+            trigger_dma(data_buffer_ + offset, slice, data_buffer_, size - slice);
+
+        in_flight_ = static_cast<BufferIndexType>(size);
+
+        return true;
+    }
+
+private:
+    void init_dma(uint32_t dmamux_src) {
+        dma_mgr_chn_conf_t config;
+        dma_mgr_get_default_chn_config(&config);
+
+        config.en_dmamux = true;
+        config.dmamux_src = dmamux_src;
+        config.priority = DMA_MGR_CHANNEL_PRIORITY_LOW;
+        config.src_addr = 0;
+        config.dst_addr = reinterpret_cast<uint32_t>(&uart_base_->THR);
+        config.src_width = DMA_MGR_TRANSFER_WIDTH_BYTE;
+        config.dst_width = DMA_MGR_TRANSFER_WIDTH_BYTE;
+        config.src_addr_ctrl = DMA_MGR_ADDRESS_CONTROL_INCREMENT;
+        config.dst_addr_ctrl = DMA_MGR_ADDRESS_CONTROL_FIXED;
+        config.src_mode = DMA_MGR_HANDSHAKE_MODE_NORMAL;
+        config.dst_mode = DMA_MGR_HANDSHAKE_MODE_HANDSHAKE;
+        // Same constraint as the RX side: the TX request fires at
+        // uart_tx_fifo_trg_not_full, which guarantees exactly one free slot, so
+        // a burst of 8 could push 8 bytes at a FIFO with room for one and drop
+        // the remainder. The RX corruption this mirrors was observed directly;
+        // this side is corrected by the same rule rather than left to depend on
+        // the FIFO happening to drain faster than the DMA fills it.
+        config.src_burst_size = DMA_MGR_NUM_TRANSFER_PER_BURST_1T;
+
+        core::utility::assert_always(
+            dma_mgr_request_resource(&dma_) == status_success
+            && dma_mgr_setup_channel(&dma_, &config) == status_success
+            && dma_mgr_config_linked_descriptor(&dma_, &config, linked_descriptor_)
+                   == status_success);
+        // No cache flush: descriptor in AHB SRAM.
+    }
+
+    void trigger_dma(const std::byte* src, size_t size, const std::byte* src2, size_t size2) {
+        core::utility::assert_debug(src);
+        // No cache flush: buffers in AHB SRAM.
+        auto& ctrl = dma_.base->CHCTRL[dma_.channel];
+        ctrl.SRCADDR = reinterpret_cast<uintptr_t>(src);
+        ctrl.TRANSIZE = size;
+
+        if (src2) {
+            auto* raw_desc = reinterpret_cast<dma_linked_descriptor_t*>(linked_descriptor_);
+            raw_desc->src_addr = reinterpret_cast<uintptr_t>(src2);
+            raw_desc->trans_size = size2;
+            ctrl.LLPOINTER = reinterpret_cast<uintptr_t>(linked_descriptor_);
+        } else {
+            ctrl.LLPOINTER = 0;
+        }
+
+        ctrl.CTRL |= DMAV2_CHCTRL_CTRL_ENABLE_MASK;
+    }
+
+    UART_Type* uart_base_;
+    // Placed in AHB SRAM by the caller — naturally non-cached.
+    std::byte* data_buffer_;
+    dma_mgr_linked_descriptor_t* linked_descriptor_;
+    dma_resource_t dma_;
+
+    std::atomic<BufferIndexType> in_{0}, out_{0};
+    static_assert(std::atomic<BufferIndexType>::is_always_lock_free);
+    BufferIndexType in_flight_ = 0;
+
+    bool idle_boundary_before_in_ = false;
+    bool tx_triggered_ = false;
+    utility::RingBuffer<BufferIndexType, kMaxIdleCount> idle_checkpoints_;
+};
+
+} // namespace libhcs::firmware::uart

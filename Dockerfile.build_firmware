@@ -1,0 +1,42 @@
+FROM zyi024424/libhcs-ci AS build
+
+SHELL ["/bin/bash", "-c"]
+
+WORKDIR /src
+RUN --mount=type=bind,target=/src,source=.,readonly \
+    set -euo pipefail; \
+    mkdir -p /output; \
+    libhcs_PROJECT_VERSION="$(.scripts/generate_version)"; \
+    for board in hpm_board; do \
+        variant=hpm5321; \
+        build_dir="/tmp/build-${board}-${variant}"; \
+        artifact_name="${board}-${variant}"; \
+        cmake --preset release -S "firmware/${board}" -B "${build_dir}" -DBOARD="${variant}"; \
+        cmake --build "${build_dir}"; \
+        cp "${build_dir}/bootloader/output/hpm_board_bootloader_${variant}.elf" \
+            "/output/libhcs-bootloader-${artifact_name}.elf"; \
+        cp "${build_dir}/app/output/hpm_board_app_${variant}.dfu" \
+            "/output/libhcs-firmware-${artifact_name}-${libhcs_PROJECT_VERSION}.dfu"; \
+    done; \
+    for board in c_board; do \
+        build_dir="/tmp/build-${board}"; \
+        cmake --preset release -S "firmware/${board}" -B "${build_dir}"; \
+        cmake --build "${build_dir}"; \
+        cp "${build_dir}/bootloader/${board}_bootloader.elf" \
+            "/output/libhcs-bootloader-${board}.elf"; \
+        cp "${build_dir}/app/${board}_app.dfu" \
+            "/output/libhcs-firmware-${board}-${libhcs_PROJECT_VERSION}.dfu"; \
+    done; \
+    board=ch32_board; \
+    build_dir="/tmp/build-${board}"; \
+    cmake --preset release -S "firmware/${board}" -B "${build_dir}"; \
+    cmake --build "${build_dir}"; \
+    cp "${build_dir}/${board}_boot.elf" \
+        "/output/libhcs-bootloader-${board}.elf"; \
+    cp "${build_dir}/${board}_app.dfu" \
+        "/output/libhcs-firmware-${board}-${libhcs_PROJECT_VERSION}.dfu"; \
+    cp "${build_dir}/${board}_merged.hex" \
+        "/output/libhcs-firmware-${board}-${libhcs_PROJECT_VERSION}.hex"
+
+FROM scratch AS output
+COPY --from=build /output/ /

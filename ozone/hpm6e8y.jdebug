@@ -1,0 +1,49 @@
+/*********************************************************************
+* Ozone project: hpm6e8y BOOTLOADER -- JTAG.
+*
+*   /opt/SEGGER/Ozone_V350a/Ozone ozone/hpm6e8y.jdebug
+*   ./ozone-debug.sh hpm6e8y
+*
+* Build first:
+*   export PATH=~/3rd_party/rv32imac_zicsr_zifencei_multilib_b_ext-linux/bin:$PATH
+*   cmake --preset release -S firmware/hpm_board -DBOARD=hpm6e8y
+*   cmake --build firmware/hpm_board/build --target hpm_board_bootloader
+*
+* Bootloader rather than the EtherCAT application, and download-and-reset rather
+* than attach: same reasoning as ozone/mc02.jdebug -- the bootloader is only
+* observable from reset because it hands over within milliseconds.
+*
+* DEVICE NAME: HPM6E8YxGNx is what the New Project Wizard offers for this part
+* (register set RV32IFD, one QSPI flash bank at 0x80000000). SEGGER also ships
+* HPM6E8YxVMx -- the other package -- and the HPM SDK's own EVK profile is
+* HPM6E80xVMx. If a connection fails, that suffix is the first thing to change.
+*
+* NOTE ON THIS PART: the XPI0 NOR at 0x80000000 is not AHB-mapped embedded flash,
+* it looks like external QSPI flash to J-Link and needs its flash loader
+* (firmware/hpm_board/boards/hpm6e8y/README.md, "HPM6E00 的 Flash 对 J-Link
+* 来说是 QSPI"). The J-Link now ships that loader ("HPM XPI Nor Flash XPI0"), so
+* CM_DOWNLOAD_RESET programs the bootloader directly. The old
+* flash-ecat-bootloader.sh (HPM Boot ROM manufacturing tool) is gone.
+*
+* To debug the RUNNING APPLICATION on core0 instead (USB + CAN + protocol stack +
+* the MBX1 flash RPC server), change File.Open to
+* ../firmware/hpm_board/build_hpm6e8y_swap/app/output/hpm_board_app_hpm6e8y.elf
+* AND the connect mode to CM_ATTACH_HALT.
+*
+* PATHS UPDATED 2026-08-14: both ELF paths used to point into
+* firmware/hpm_board/ecat/build/, which is the RETIRED core0=SSC layout. The
+* mainline is the core-swap build (flash-ecat-swap.sh -> build_hpm6e8y_swap/),
+* and the bootloader now comes from the plain superbuild. The old paths no
+* longer exist, so this project failed to load any symbols at all.
+**********************************************************************/
+
+void OnProjectLoad (void) {
+  Project.SetDevice ("HPM6E8YxGNx");
+  Project.SetHostIF ("USB", "0");
+  Project.SetTargetIF ("JTAG");
+  Project.SetTIFSpeed ("4 MHz");
+
+  Debug.SetConnectMode (CM_DOWNLOAD_RESET);
+
+  File.Open ("../firmware/hpm_board/build/bootloader/output/hpm_board_bootloader_hpm6e8y.elf");
+}

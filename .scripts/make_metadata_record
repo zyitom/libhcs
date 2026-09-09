@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Emit the bootloader's "image ready" metadata record for an application image.
+
+The bootloader will only leave DFU if flash holds a metadata slot marking the
+application as ready (firmware/*/bootloader/src/flash/metadata.hpp). That slot is
+normally written by the DFU download path, so an application programmed over
+SWD/JTAG -- by Ozone, by `gdb load`, by JLinkExe -- never boots no matter how
+valid the image is: nothing wrote the record. This script produces the record so
+a debug probe can program it alongside the image.
+
+The record is one STM32H7 flash word (32 bytes), laid out to match DataSlot:
+
+    magic       "HCS1"  0x48435331
+    image_state "IMRD"  0x494D5244
+    image_size  size of the hash-suffixed image, in bytes
+    reserved    erased (the retired CRC32 word)
+    pad[16]     erased
+
+INPUT must be the image the bootloader actually validates, i.e. the raw binary
+with the 36-byte ImageHash suffix already appended by append_image_hash -- the
+same bytes dfu-util downloads. Passing a .dfu file is accepted: its 16-byte DFU
+suffix is stripped first.
+
+Usage:
+    .scripts/make_metadata_record -o metadata.bin firmware/mc02/build/app/mc02_app.dfu
+"""
+
+import argparse
+import struct
+import sys
+
+SLOT_SIZE = 32
+ERASED = 0xFFFFFFFF
+METADATA_MAGIC = 0x48435331  # "HCS1"
+IMAGE_STATE_READY = 0x494D5244  # "IMRD"
+IMAGE_HASH_MAGIC = 0x48415348  # "HASH"
+IMAGE_HASH_SUFFIX_SIZE = 4 + 32
+DFU_SUFFIX_SIZE = 16
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Emit a 32-byte bootloader metadata record for an application image."
+    )
+    parser.add_argument("input", help="Hash-suffixed application image (.bin or .dfu)")
+    parser.add_argument("-o", "--output", required=True, help="Output record file")
+    args = parser.parse_args()
+
+    with open(args.input, "rb") as f:
+        image = f.read()
+
+    # dfu-suffix appends 16 bytes that dfu-util strips before downloading, so
+    # they are not part of what the bootloader hashes or records.
+    if args.input.endswith(".dfu"):
+        if len(image) <= DFU_SUFFIX_SIZE:
+            sys.exit(f"error: {args.input} is too small to carry a DFU suffix")
+        image = image[:-DFU_SUFFIX_SIZE]
+
+    # Refuse to record a size the bootloader would then reject: without the
+    # ImageHash suffix validate_candidate_image() fails and the board silently
+    # stays in DFU, which is the exact failure this script exists to avoid.
+    if len(image) <= IMAGE_HASH_SUFFIX_SIZE:
+        sys.exit(f"error: {args.input} is too small to carry an ImageHash suffix")
+
+    suffix_magic = struct.unpack_from("<I", image, len(image) - IMAGE_HASH_SUFFIX_SIZE)[0]
+    if suffix_magic != IMAGE_HASH_MAGIC:
+        sys.exit(
+            f"error: {args.input} has no ImageHash suffix "
+            f"(found 0x{suffix_magic:08X}, want 0x{IMAGE_HASH_MAGIC:08X}). "
+            "Pass the append_image_hash output, not the bare objcopy binary."
+        )
+
+    record = struct.pack(
+        "<IIII", METADATA_MAGIC, IMAGE_STATE_READY, len(image), ERASED
+    ) + b"\xFF" * 16
+    assert len(record) == SLOT_SIZE
+
+    with open(args.output, "wb") as f:
+        f.write(record)
+
+    print(f"metadata record: image_size={len(image)} (0x{len(image):X}) -> {args.output}")
+
+
+if __name__ == "__main__":
+    main()

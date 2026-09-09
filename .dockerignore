@@ -1,0 +1,11 @@
+.vscode/
+.cache/
+
+__pycache__/
+
+build/
+compile_commands.json
+**/build/
+**/compile_commands.json
+
+.devcontainer/.zsh_history

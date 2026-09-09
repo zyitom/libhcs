@@ -1,0 +1,21 @@
+.vscode/
+.idea/
+.cache/
+
+__pycache__/
+
+build/
+build_*/
+# Hyphenated variants too: a scratch tree named build-<something> is the natural
+# thing to type when comparing two configurations side by side, and it used to
+# slip past the two rules above and get swept up by `git add -A`.
+# firmware/ch32_board/build-docker/ is already tracked, so this does not affect
+# it -- gitignore only ever applies to untracked paths.
+build-*/
+compile_commands.json
+
+# Claude Code: track shared project policy (.claude/settings.json),
+# ignore personal local overrides.
+.claude/settings.local.json
+.claude/worktrees/
+*.jdebug.user

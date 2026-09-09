@@ -1,0 +1,20 @@
+# Copyright (c) 2023,2024 HPMicro
+# SPDX-License-Identifier: BSD-3-Clause
+
+# `soc` is a directory lookup key, not a label: hpm_sdk resolves it by globbing
+# soc/*/<soc> (cmake/application.cmake). The SDK ships one support package per
+# sub-family, and for HPM5300 that package is HPM5361 -- there is no HPM5321
+# directory anywhere in the SDK. This board carries a real HPM5321IEG1, which is
+# a reduced member of the same family, so it builds against the HPM5361 package
+# and simply does not bring up what it lacks. Do NOT "fix" this to HPM5321 to
+# match the board directory name: `hpm5321` here is the repo's board name, which
+# is unrelated to the SDK's SoC name. `device` below is the debugger/flash part
+# name and does name the real die.
+board:
+    soc: HPM5361
+    device: HPM5321xEGx
+    openocd-soc: hpm5300
+    openocd-probe: ft2232
+    on-board-flash:
+      type: qspi-nor-flash
+      size: 1M

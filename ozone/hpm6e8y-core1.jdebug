@@ -1,0 +1,35 @@
+/*********************************************************************
+* Ozone project: hpm6e8y core1 -- EtherCAT stack (SSC + ESC + FoE), JTAG.
+*
+*   /opt/SEGGER/Ozone_V350a/Ozone ozone/hpm6e8y-core1.jdebug
+*   ../ozone-debug.sh hpm6e8y-core1
+*
+* WHAT RUNS HERE (changed with the core swap, 2026-08-14): core1 is the EtherCAT
+* core -- Beckhoff SSC, the ESC port layer, the FoE handler and the MBX1 flash
+* RPC client. It is NOT the CAN/UART fieldbus application any more; that moved to
+* core0 together with USB and the protocol stack. The header used to say
+* otherwise, and the ELF path still pointed into the retired ecat/ superbuild.
+*
+* This is the one target here that debugs an application rather than a
+* bootloader, because core1 has none: it is not a boot core and never runs from
+* flash. Hence attach rather than download-and-reset.
+*
+* BOOT ORDER MATTERS. Core1 has no image of its own in flash: core0 copies it
+* out of sec_core_img and then releases the hart. Attaching before the bridge
+* has booted finds a hart still held in reset, which reads as a dead target.
+* Let the board run first, then connect.
+*
+* Same package-suffix caveat as ozone/hpm6e8y.jdebug; this is the _CPU1 variant
+* of the same device, which is how SEGGER exposes the second core.
+**********************************************************************/
+
+void OnProjectLoad (void) {
+  Project.SetDevice ("HPM6E8YxGNx_CPU1");
+  Project.SetHostIF ("USB", "0");
+  Project.SetTargetIF ("JTAG");
+  Project.SetTIFSpeed ("4 MHz");
+
+  Debug.SetConnectMode (CM_ATTACH_HALT);
+
+  File.Open ("../firmware/hpm_board/build_hpm6e8y_swap/ecat/core1_ecat/output/demo.elf");
+}

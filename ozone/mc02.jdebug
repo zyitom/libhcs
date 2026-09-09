@@ -1,0 +1,41 @@
+/*********************************************************************
+* Ozone project: mc02 BOOTLOADER -- STM32H723VGT6, SWD.
+*
+* Open it and the device, interface, speed and program file are already set;
+* no New Project Wizard.
+*
+*   /opt/SEGGER/Ozone_V350a/Ozone ozone/mc02.jdebug
+*   ./ozone-debug.sh mc02
+*
+* Build first:
+*   cmake --build firmware/mc02/build --target mc02_bootloader
+*
+* WHY THE BOOTLOADER AND NOT THE APP. The debugger's job on this board is the
+* bootloader: the application is deployed over DFU (./flash-mc02.sh), while the
+* bootloader is what you program and step through over SWD. And it can only be
+* debugged from reset -- it runs for a few milliseconds and then jumps into the
+* application, so attaching to a running board lands in app code where these
+* symbols mean nothing.
+*
+* Hence CM_DOWNLOAD_RESET: connect, program, reset, break at main. That programs
+* the bootloader, which is safe -- it occupies flash sector 0 only, leaving the
+* metadata record (sector 1) and the application (sectors 2-7) untouched. Do NOT
+* point this at mc02_app.elf and keep this mode: programming the app without
+* refreshing its SHA-256 metadata record makes the bootloader reject the image
+* on the next cold boot (firmware/mc02/bootloader/src/flash/validation.hpp).
+*
+* To debug the running APPLICATION instead, change File.Open to
+* ../firmware/mc02/build/app/mc02_app.elf AND the connect mode to CM_ATTACH_HALT.
+**********************************************************************/
+
+void OnProjectLoad (void) {
+  Project.SetDevice ("STM32H723VGTx");
+  Project.SetHostIF ("USB", "0");
+  Project.SetTargetIF ("SWD");
+  Project.SetTIFSpeed ("4 MHz");
+
+  Debug.SetConnectMode (CM_DOWNLOAD_RESET);
+
+  // Relative to this project file's directory, so the checkout can live anywhere.
+  File.Open ("../firmware/mc02/build/bootloader/mc02_bootloader.elf");
+}
