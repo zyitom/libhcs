@@ -56,6 +56,8 @@ arm-none-eabi-nm firmware/mc02/build/app/mc02_app.elf | grep -c bmi088   # IMU: 
 | `libhcs_APP_RS485_ENABLE` | ON | USART2 / USART3（丝印 UART2 / UART3）初始化、D2 对象与主循环 poll。OFF 时不调 `MX_USARTx_UART_Init`，省约 1.8 KB D2 SRAM 和每圈两次 NDTR 读。DataId 仍是 `kUart2` / `kUart3` |
 | `libhcs_APP_USB_RX_XFER_SIZE` | 1024 | 一次 bulk OUT 传输请求的字节数（64 的倍数）。1024 是实测拐点，比旧的 64 高 59% |
 | `libhcs_APP_LOOP_BALLAST_CYCLES` | 0 | 每圈主循环插入的纯忙等周期数，**只是测量仪器**，出厂镜像永远是 0 |
+| `libhcs_APP_DEBUG_KNOBS` | OFF | 暴露调试器可写的调优旋钮（`diag/knobs`），配合 Ozone / J-Link 在线改参 |
+| `libhcs_APP_TIME_SYNC` | OFF | 运行共享 USB-SOF 时间基准做跨板对时，机制与实测见 [../hpm_board/SOF_TIMEBASE.md](../hpm_board/SOF_TIMEBASE.md) |
 | `libhcs_APP_USB_RX_HIST` * | OFF | 相邻两次 bulk OUT 完成的间隔直方图（DWT）在 kUart0 上输出 |
 | `libhcs_APP_LOOP_PROFILE` * | OFF | 主循环分段耗时（DWT）在 kUart0 上以 ASCII 输出 |
 | `libhcs_APP_CAN_DIAG` * | OFF | CAN 遥测记录在 kUart0 上输出 |
@@ -82,6 +84,11 @@ arm-none-eabi-nm firmware/mc02/build/app/mc02_app.elf | grep -c bmi088   # IMU: 
   **3 条一起跑满时才卡在 USB**（894 KB/s > 800）。分界点约 2.7 条总线，即聚合 53000 帧/s。
   `[推断，基于 800 KB/s 与 19870 帧/s 两项实测]`
 - CAN：FDCAN1/2/3 常驻 FD+BRS，逐帧按 host `is_fdcan` 切换，不做 INIT 重配。
+- **CAN 的协议与速率由电机硬件决定，不是可调参数**：仲裁段 1 Mbit/s / 数据段
+  5 Mbit/s 的上限、能否上 FD，都由总线对端电机固件决定，本仓库**无法修改**
+  `[硬件事实，用户确认 2026-09-12]`。吞吐/延迟优化**不要**以「升级 CAN-FD /
+  提高波特率 / 改采样点」为建议方向；可行杠杆在成帧、软件路径与主机侧（见上方
+  「瓶颈」分析与 [PACKET_RATE_LOG.md](PACKET_RATE_LOG.md)）。
 - **下行 CAN 帧直写硬件 FIFO，只有 FIFO 满了才进队列** [2026-08-24 修复]。
   `handle_downlink` 由 `tud_vendor_rx_cb` 在 `tud_task()` 里调用，与 `try_transmit()`
   同线程，所以直写是安全的（队列非空时必须让路，否则会插队）。
@@ -114,7 +121,10 @@ arm-none-eabi-nm firmware/mc02/build/app/mc02_app.elf | grep -c bmi088   # IMU: 
 - **未做**：hpm_board 那套下行流控（`transmit_queue_depth()` 决定是否再 arm OUT 包）
   没有移植。所以队列真被打满时，mc02 仍然是静默丢弃 + 点 LED，主机无感——
   `diag::note_tx_fail()` 在默认构建下是空实现（`libhcs_APP_CAN_DIAG` 默认 OFF）。
-- 热路径 `Can::handle_uplink/handle_downlink/try_transmit` 等放 `.itcm`，启动时从 FLASH 拷入。
+- 热路径 `Can::handle_uplink/handle_downlink` 与排空发送队列的
+  `drain_transmit_queue`/`drain_pending_transmits_slow` 等放 `.itcm`，启动时从 FLASH 拷入；
+  `try_transmit()` 已改为头文件内联的空队列快测，主循环入口是 `drain_pending_transmits()`。
+  `[代码核对 main 1022f3e，2026-09-12]`
 - UART：六个口（USART1 / USART2 / USART3 / UART7 / USART10 / UART5-DBUS）各一条**永不停的整环 circular DMA**，写指针由主循环读 `NDTR` 推导，不由中断维护。端口对象（含 DMA 环）放 `.d2_sram`，启动时从 FLASH 拷入，MPU region 1 在 `app.cpp` 里设为非缓存。**不要给 UART 的 DMA 开 FIFO/burst**——`NDTR` 只统计到 DMA FIFO，写指针会算错。DataId 就是丝印号：UART1/2/3/7/10 加 DBUS。USART2 / USART3 受 `libhcs_APP_RS485_ENABLE` 控制（默认 ON）。
 - UART 错误策略：`CR3.OVRDIS=1`、**`CR3.DDRE=0`**、`CR3.EIE=0`。`DDRE` 是"出错时禁用 DMA"，**置 1 会让一个坏字符永久杀死端口**——细节见 [UART_RING_LOG.md](UART_RING_LOG.md) 第 1 章。
 - 实测吞吐天花板约 **800 KB/s 聚合**（USB Full-Speed 决定），781 KB/s 时零丢失；主循环在满过载下仍有约 10 倍余量。

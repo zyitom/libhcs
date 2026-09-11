@@ -71,6 +71,13 @@ config.canfd_samplepoint_min = 875U;   config.canfd_samplepoint_max = 875U;
 真实电机（DJI、达妙 MIT、瓴控）全是 87.5%。为什么必须对齐总线而不是推荐表、
 判读与自查方法见 [PITFALLS.md](PITFALLS.md) 第 3 节。
 
+**更一般的硬约束**：本板 CAN 的协议（classic / FD）、仲裁与数据段速率、采样点，上限
+全部由总线对端的**电机硬件**决定（DJI、达妙 MIT、瓴控的电机固件在仓库之外，无法
+修改）`[硬件事实，用户确认 2026-09-12]`。吞吐/延迟优化**不要**以「升级 CAN-FD /
+提高波特率 / 改采样点」为建议方向——总线参数没有可动的余地；可行杠杆在主机侧协议、
+成帧与软件路径，见 [USB_OPTIMIZATION_LOG.md](USB_OPTIMIZATION_LOG.md) 与
+[HOST_TUNING.md](../../HOST_TUNING.md)。
+
 ## UART 运行时改波特率：快照，不回读 [实测 2026-08-05]
 
 读 `DLL`/`DLM` **必须在 TX DMA 停稳之后**（DLAB=1 时 `DLL` 与 `THR` 共址，回读动作本身
