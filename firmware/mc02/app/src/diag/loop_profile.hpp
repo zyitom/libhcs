@@ -30,7 +30,7 @@ inline constexpr bool kEnabled = true;
 enum class Section : std::uint8_t {
     kTudTask, // TinyUSB device task: the USB stack's own processing
     kUsb,     // usb::vendor->try_transmit(), all seven interleaved calls
-    kCan,     // can1/2/3 try_transmit()
+    kCan,     // Can::drain_pending_transmits(): all three CAN queues
     kUart,    // uart1/2/3/dbus try_transmit(): RX dequeue plus TX dequeue
     kImu,     // BMI088 probe and pending-read servicing
     kLed,     // session state plus WS2812 refresh

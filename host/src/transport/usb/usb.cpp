@@ -388,6 +388,46 @@ public:
         return acted || restored != 0;
     }
 
+    // The keepalive is the one thread whose starvation silently ends the link:
+    // the board drops the session after its 1 s lease, and nothing is logged,
+    // because the thread that would log it is the one not running. Measured
+    // 2026-09-11: a latency tool busy-waiting at SCHED_FIFO 70 on CPU 6, with
+    // sched_rt_runtime_us=-1, starved a keepalive that had started on CPU 6
+    // (its timed wait never fired), and every round trip after the first
+    // second timed out. So it follows the event thread -- whatever pinning and
+    // policy the caller gave that thread, directly or through thread_setup --
+    // one RT priority step below it, so it never delays a completion.
+    //
+    // Applied to the thread from outside, not by the thread to itself: a thread
+    // that configures itself first has to be scheduled once on the CPU it
+    // inherited, which is exactly what the busy-wait prevents. Measured: that
+    // version still hung whenever the keepalive started on the busy core.
+    void configure_session_thread(std::thread& thread) noexcept override {
+        const pthread_t keepalive = thread.native_handle();
+        (void)pthread_setname_np(keepalive, "hcs-keepalive");
+        if (!event_thread_.joinable())
+            return;
+        const pthread_t io_thread = event_thread_.native_handle();
+
+        cpu_set_t cpus;
+        CPU_ZERO(&cpus);
+        if (pthread_getaffinity_np(io_thread, sizeof(cpus), &cpus) == 0)
+            (void)pthread_setaffinity_np(keepalive, sizeof(cpus), &cpus);
+
+        int policy = SCHED_OTHER;
+        sched_param param{};
+        if (pthread_getschedparam(io_thread, &policy, &param) != 0
+            || (policy != SCHED_FIFO && policy != SCHED_RR))
+            return;
+        param.sched_priority =
+            std::max(param.sched_priority - 1, sched_get_priority_min(policy));
+        if (const int ret = pthread_setschedparam(keepalive, policy, &param); ret != 0) {
+            logger_.warn(
+                "could not give the session keepalive thread RT priority {}: {}",
+                param.sched_priority, ret);
+        }
+    }
+
     bool link_faulted() const noexcept override {
         return link_faulted_.load(std::memory_order::relaxed);
     }

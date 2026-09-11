@@ -59,28 +59,38 @@ SECTIONS
         /* Leaf calls of the CAN RX ISR. Left in FLASH they cost, per frame, a
          * long-branch veneer (ITCM at 0x0 is far outside the BL reach of FLASH
          * at 0x08040000) plus an I-cache-dependent fetch. Matched on the mangled
-         * class prefix, so member signatures may change freely; a class rename
-         * would silently stop matching, and the only consequence is that the
-         * veneers come back -- slower, still correct. */
-        *(.text._ZN7libhcs4core8protocol10Serializer*)         /* write_can + size helpers  */
-        *(.text._ZN7libhcs4core7utility8Bitfield*)             /* protocol header bit packing */
-        *(.text._ZN7libhcs8firmware3usb19InterruptSafeBuffer*) /* uplink batch allocation   */
-        *(.text._ZN7libhcs8firmware7utility10RingBuffer*)      /* CAN transmit ring         */
-        *(.text._ZZN7libhcs8firmware3can3Can*)                 /* out-of-line Can lambdas   */
-        *(.text._ZN7libhcs8firmware3usb14get_serializerEv)
+         * class prefix, so member signatures may change freely; a namespace or
+         * class rename silently stops matching, and the only consequence is that
+         * the veneers come back -- slower, still correct. Every name component is
+         * length-prefixed: `libhcs` is 6 characters, so the prefix is _ZN6libhcs.
+         * These rules said _ZN7libhcs until 2026-09-11 and matched nothing at all;
+         * the ASSERT right after this section now makes that a link error. */
+        *(.text._ZN6libhcs4core8protocol10Serializer*)         /* write_can + size helpers  */
+        *(.text._ZN6libhcs4core7utility8Bitfield*)             /* protocol header bit packing */
+        *(.text._ZN6libhcs8firmware3usb19InterruptSafeBuffer*) /* uplink batch allocation   */
+        *(.text._ZN6libhcs8firmware7utility10RingBuffer*)      /* CAN transmit ring         */
+        *(.text._ZZN6libhcs8firmware3can3Can*)                 /* out-of-line Can lambdas   */
+        *(.text._ZN6libhcs8firmware3usb14get_serializerEv)
 
         /* Lazy accessors reached once per ISR entry. Full mangled names, since a
          * utility::Lazy wildcard would also catch Lazy<App>::init(), which main()
          * calls before the ITCM image exists. Template arguments are part of the
          * name, so these are best-effort: if a constructor signature changes the
          * match is lost and the call reverts to a veneer. */
-        *(.text._ZN7libhcs8firmware7utility4LazyINS0_3can3CanEJP19FDCAN_HandleTypeDefmEE3getEv)
-        *(.text._ZN7libhcs8firmware7utility4LazyINS0_3led3LedEJEEptEv)
-        *(.text._ZN7libhcs8firmware7utility4LazyINS0_3usb6VendorEJEEptEv)
+        *(.text._ZN6libhcs8firmware7utility4LazyINS0_3can3CanEJP19FDCAN_HandleTypeDefmEE3getEv)
+        *(.text._ZN6libhcs8firmware7utility4LazyINS0_3led3LedEJEEptEv)
+        *(.text._ZN6libhcs8firmware7utility4LazyINS0_3usb6VendorEJEEptEv)
 
         . = ALIGN(4);
         _eitcm = .;
     } >ITCMRAM AT> FLASH
+
+    /* Tripwire for the mangled-name rules above. InterruptSafeBuffer::allocate is
+     * virtual, so every build type emits it out of line: if it is not in ITCM, the
+     * rules no longer match what the compiler emits. */
+    ASSERT(
+        _ZN6libhcs8firmware3usb19InterruptSafeBuffer8allocateEj < ORIGIN(ITCMRAM) + LENGTH(ITCMRAM),
+        ".itcm name rules matched nothing: InterruptSafeBuffer::allocate is outside ITCM. Recheck the mangled prefixes there against arm-none-eabi-nm.")
 
     .text :
     {

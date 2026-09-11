@@ -3,26 +3,49 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
-#include <cstdint>
 #include <limits>
 #include <memory>
 #include <new>
-#include <type_traits>
 #include <utility>
 
 namespace libhcs::firmware::utility {
 
 // Lock-free Single-Producer/Single-Consumer (SPSC) ring buffer
 // Inspired by Linux kfifo.
+//
+// Memory orders. This header is built only by the firmware's GCC cross toolchains
+// (Cortex-M7, RV32), and every queue is used from a single core; the host SDK has its
+// own class. On these parts a memory order is two things at once:
+//
+//   - A barrier instruction for other cores (DMB / FENCE). With one core it
+//     synchronizes nothing and costs one instruction per load or store that asks
+//     for it.
+//   - A constraint on the optimizer, and that is the part this queue needs. The
+//     producer and the consumer may be an interrupt and the code it preempted,
+//     so the emitted code must keep the order the algorithm relies on:
+//       * load the other side's index before touching the slots it guards --
+//         acquire, so nothing after the load is hoisted in front of it;
+//       * finish the slot writes (producer) or reads (consumer) before
+//         publishing this side's index -- release, so nothing before the store
+//         is sunk behind it.
+//     Each side is the only writer of its own index, so that load is relaxed.
+//     GCC -O3 does use the freedom a relaxed order grants: on both boards it
+//     deletes a write that an interrupt could observe between two stores.
+//
+// std::atomic_signal_fence() could carry the store-side constraint without the
+// instruction, but a separate fence is not documented to pin a relaxed load in
+// place, so both sides keep the per-operation orders and pay the two barriers.
+//
+// Indices are size_t, the native word. They run free and wrap modulo 2^32, a
+// multiple of every power-of-two capacity, so `in - out` is always the fill level.
+// A narrower index saves a few bytes per queue but promotes to int on subtraction
+// and needs a zero-extension after every one; and a uint32_t index is
+// `unsigned long` on these toolchains while size_t is `unsigned int`, which made
+// std::min() fail to compile for capacities of 65536 and above.
 template <typename T, size_t max_size>
 class RingBuffer {
 public:
-    using IndexType = std::conditional_t<
-        (max_size <= std::numeric_limits<uint8_t>::max()), uint8_t,
-        std::conditional_t<
-            (max_size <= std::numeric_limits<uint16_t>::max()), uint16_t,
-            std::conditional_t<
-                (max_size <= std::numeric_limits<uint32_t>::max()), uint32_t, uint64_t>>>;
+    using IndexType = size_t;
 
     static_assert(max_size >= 2, "RingBuffer size must be at least 2");
     static_assert((max_size & (max_size - 1)) == 0, "RingBuffer size must be a power of two");
@@ -53,7 +76,7 @@ public:
         const auto in = in_.load(std::memory_order::acquire);
         const auto out = out_.load(std::memory_order::relaxed);
 
-        return static_cast<size_t>(static_cast<IndexType>(in - out));
+        return in - out;
     }
 
     /*!
@@ -66,7 +89,7 @@ public:
         const auto in = in_.load(std::memory_order::relaxed);
         const auto out = out_.load(std::memory_order::acquire);
 
-        return kMaxSize - static_cast<size_t>(static_cast<IndexType>(in - out));
+        return kMaxSize - (in - out);
     }
 
     /*!
@@ -96,8 +119,7 @@ public:
         if (in == out_.load(std::memory_order::relaxed))
             return nullptr;
 
-        return std::launder(
-            reinterpret_cast<T*>(storage_[(static_cast<size_t>(in) - 1) & kMask].data));
+        return std::launder(reinterpret_cast<T*>(storage_[(in - 1) & kMask].data));
     }
 
     /*!
@@ -122,8 +144,7 @@ public:
         const auto in = in_.load(std::memory_order::relaxed);
         const auto out = out_.load(std::memory_order::acquire);
 
-        const auto used = static_cast<IndexType>(in - out);
-        const auto writable = kMaxSize - static_cast<size_t>(used);
+        const auto writable = kMaxSize - (in - out);
 
         if (count > writable)
             count = fail_fast ? 0 : writable;
@@ -138,8 +159,7 @@ public:
         for (size_t i = 0; i < count - slice; i++)
             construct_functor(storage_[i].data);
 
-        const auto count_index = static_cast<IndexType>(count);
-        in_.store(static_cast<IndexType>(in + count_index), std::memory_order::release);
+        in_.store(in + count, std::memory_order::release);
 
         return count;
     }
@@ -214,7 +234,7 @@ public:
         const auto in = in_.load(std::memory_order::acquire);
         const auto out = out_.load(std::memory_order::relaxed);
 
-        const auto readable = static_cast<size_t>(static_cast<IndexType>(in - out));
+        const auto readable = in - out;
         count = std::min(count, readable);
         if (!count)
             return 0;
@@ -232,8 +252,7 @@ public:
         for (size_t i = 0; i < count - slice; i++)
             process(storage_[i].data);
 
-        const auto count_index = static_cast<IndexType>(count);
-        out_.store(static_cast<IndexType>(out + count_index), std::memory_order::release);
+        out_.store(out + count, std::memory_order::release);
 
         return count;
     }

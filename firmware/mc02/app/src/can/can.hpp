@@ -33,9 +33,47 @@ public:
     // 必须 out-of-line: inline/COMDAT 函数体放自定义 section 会触发 GCC section 类型冲突。
     void handle_downlink(const data::CanDataView& data);
     void handle_uplink(data::DataId field_id, core::protocol::Serializer& serializer);
-    bool try_transmit();
+
+    // Drain this controller's software queue into the hardware Tx FIFO. The
+    // queue only fills when the FIFO was full, so it is almost always empty, and
+    // the test is inline so an empty queue costs no call. The main loop uses
+    // drain_pending_transmits() instead; this per-bus form stays for callers
+    // that want a single controller.
+    bool try_transmit() {
+        if (transmit_buffer_.readable() == 0) [[likely]]
+            return false;
+        return drain_transmit_queue();
+    }
+
+    // Main-loop entry for all three controllers. transmit_pending_mask_ has one
+    // bit per controller whose queue may hold frames, so a pass with nothing
+    // queued on any bus -- nearly every pass -- is one load and one branch.
+    //
+    // The mask is plain data rather than an atomic because every reader and
+    // writer runs in the main loop: handle_downlink is reached only from
+    // tud_task() (the TinyUSB vendor class registers no xfer_isr, so
+    // tud_vendor_rx_cb never runs in the USB interrupt), and the drains run from
+    // here. Invariant: a controller's bit is set whenever its queue is
+    // non-empty. handle_downlink sets it after every enqueue attempt, and
+    // drain_transmit_queue clears it only after finding the queue empty. Debug
+    // builds check the invariant on the idle path.
+    static void drain_pending_transmits() {
+        if (transmit_pending_mask_ == 0) [[likely]] {
+            core::utility::assert_debug_lazy([]() noexcept { return transmit_queues_empty(); });
+            return;
+        }
+        drain_pending_transmits_slow();
+    }
 
 private:
+    bool drain_transmit_queue();
+    static void drain_pending_transmits_slow();
+    static bool transmit_queues_empty();
+
+    // Bit diag_index() set while that controller's queue may hold frames, in
+    // zero-wait DTCM next to the controllers. See drain_pending_transmits().
+    [[gnu::section(".dtcm")]] static inline constinit uint32_t transmit_pending_mask_ = 0;
+
     void config_can(uint32_t hal_filter_index) {
         FDCAN_FilterTypeDef filter_config;
 

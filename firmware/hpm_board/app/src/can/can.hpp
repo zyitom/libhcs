@@ -284,10 +284,37 @@ public:
     // for the failure it repairs and the evidence behind it.
     void poll();
 
-    // Drain the software transmit queue into the MCAN TX FIFO. Called every
-    // main-loop pass; two loads and a return when the queue is empty. See
-    // handle_downlink in can.cpp for why the queue exists.
-    void try_transmit();
+    // Drain this controller's software transmit queue into the MCAN TX FIFO.
+    // The queue only fills when the hardware FIFO was full (see handle_downlink
+    // in can.cpp), so it is almost always empty, and the test is inline so an
+    // empty queue costs no call. Kept for main loops that still walk the
+    // controllers one by one (hpm6e8y); hpm5321 calls drain_pending_transmits().
+    void try_transmit() {
+        if (transmit_buffer_.readable() == 0) [[likely]]
+            return;
+        drain_transmit_queue();
+    }
+
+    // Main-loop entry for every controller at once. transmit_pending_mask_ has
+    // one bit per controller whose queue may hold frames, so a pass with nothing
+    // queued on any bus -- nearly every pass -- is one load and one branch,
+    // however many buses the board has.
+    //
+    // The mask is plain data rather than an atomic because every reader and
+    // writer runs in the main loop: handle_downlink is reached only from
+    // tud_task() (the TinyUSB vendor class registers no xfer_isr, so
+    // tud_vendor_rx_cb never runs in the USB interrupt), and the drains run from
+    // here. Invariant: a controller's bit is set whenever its queue is
+    // non-empty. handle_downlink sets it after every enqueue attempt, and
+    // drain_transmit_queue clears it only after finding the queue empty. Debug
+    // builds check the invariant on the idle path.
+    static void drain_pending_transmits() {
+        if (transmit_pending_mask_ == 0) [[likely]] {
+            core::utility::assert_debug_lazy([]() noexcept { return transmit_queues_empty(); });
+            return;
+        }
+        drain_pending_transmits_slow();
+    }
 
     // How many frames are waiting in the software transmit queue. The USB
     // downlink arming policy reads this to decide whether accepting another OUT
@@ -302,6 +329,20 @@ public:
     void handle_interrupt_flags(uint32_t flags);
 
 private:
+    // Out-of-line body of try_transmit(), placed in .fast (can.cpp). Clears this
+    // controller's bit in transmit_pending_mask_ once it finds the queue empty.
+    void drain_transmit_queue();
+
+    // Out-of-line half of drain_pending_transmits(), placed in .fast (can.cpp).
+    static void drain_pending_transmits_slow();
+
+    // Debug-build invariant check behind drain_pending_transmits() (can.cpp).
+    static bool transmit_queues_empty();
+
+    // Bit board_can_index set while that controller's queue may hold frames. See
+    // drain_pending_transmits() for the invariant.
+    static inline constinit uint32_t transmit_pending_mask_ = 0;
+
     // Position of this controller in board::kCanPorts. Stored rather than
     // derived from data_id: 6E8Y uses kCan0..kCan3 while 5321 uses kCan1..
     // kCan2, so subtracting kCan1 is not a board index.

@@ -15,10 +15,16 @@
 // I-cache-misses, so this removes FLASH-XIP fetch jitter from the worst-case
 // forwarding latency. Out-of-line (not inline-in-class) is deliberate: an
 // inline/COMDAT function placed in .fast collides with the plain .fast
-// functions here (a GCC "section type conflict"). Leaf calls into the MCAN
-// driver (mcan_read_rxfifo) and the shared serializer (write_can) stay in
-// FLASH -- they are SDK/core code -- so the win is on our glue plus the inlined
-// MCAN register helpers, not the whole path.
+// functions here (a GCC "section type conflict").
+//
+// On HPM5321 the board linker script also pulls part of what this glue calls
+// into ILM by name: mcan_read_rxfifo, the uplink batch allocator that write_can
+// (inlined here) allocates through, and the downlink deserializer. Still in
+// FLASH and reached per frame: mcan_get_timestamp_from_received_message and
+// memcpy on receive, mcan_transmit_via_txfifo_nonblocking on transmit. Moving
+// those too, together with memset/memmove, the HostSession callbacks and the
+// uplink accessors, was measured on 2026-09-11 and changed nothing: CAN round
+// trip p50 99.7 us, p99 ~122 us, p99.9 ~126 us either way over 8+8 runs.
 
 namespace libhcs::firmware::can {
 
@@ -81,10 +87,13 @@ void Can::handle_downlink(const data::CanDataView& data) {
         led::led->downlink_buffer_full();
         diag::note_tx_fail(can_index());
     }
+    // Whether or not the push succeeded: a refused push means the queue is full,
+    // so it is non-empty either way. See Can::drain_pending_transmits().
+    transmit_pending_mask_ |= 1U << can_index();
 }
 
 ATTR_PLACE_AT(".fast")
-void Can::try_transmit() {
+void Can::drain_transmit_queue() {
     while (const QueuedFrame* queued = transmit_buffer_.peek_front()) {
         // Rebuild the SDK frame from the compressed record. Zero-initialized so
         // the data words above the 8 bytes this protocol can carry are defined,
@@ -93,14 +102,34 @@ void Can::try_transmit() {
         std::memcpy(&frame, queued->header, sizeof(queued->header));
         std::memcpy(frame.data_8, queued->data, sizeof(queued->data));
 
+        // FIFO full: the rest stays queued for the next pass, and so does this
+        // controller's pending bit.
         if (mcan_transmit_via_txfifo_nonblocking(can_base_, &frame, nullptr) != status_success)
-            return; // FIFO full; the rest stays queued for the next pass
+            return;
         // The queue API transfers ownership to the callback; discarding the
         // completed frame intentionally does not require moving from it.
         // NOLINTNEXTLINE(cppcoreguidelines-rvalue-reference-param-not-moved)
         transmit_buffer_.pop_front([](QueuedFrame&&) noexcept {});
     }
+    // Only reached once peek_front() has found the queue empty.
+    transmit_pending_mask_ &= ~(1U << can_index());
 }
+
+// Out-of-line half of Can::drain_pending_transmits(): only reached when some
+// controller's hardware FIFO overflowed into its software queue. Bits are only
+// ever set by controllers this PCB has, so the index never reaches an
+// unconstructed slot of can_array.
+ATTR_PLACE_AT(".fast")
+void Can::drain_pending_transmits_slow() {
+    uint32_t pending = transmit_pending_mask_;
+    for (size_t index = 0; pending != 0; ++index, pending >>= 1U) {
+        if ((pending & 1U) != 0U)
+            can_array[index]->drain_transmit_queue();
+    }
+}
+
+// Debug-build invariant check behind Can::drain_pending_transmits().
+bool Can::transmit_queues_empty() { return max_transmit_queue_depth() == 0; }
 
 ATTR_PLACE_AT(".fast")
 bool Can::read_uplink(data::CanDataView& data, uint8_t storage[8], bool& valid) {

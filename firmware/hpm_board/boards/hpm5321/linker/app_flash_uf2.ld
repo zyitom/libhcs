@@ -45,17 +45,29 @@ SECTIONS
          * from zero-wait ILM to keep FLASH-XIP I-cache misses out of the
          * worst-case ISR latency. These input specs must sit BEFORE the .text
          * catch-all below (linker matches in script order), and inside this
-         * section they ride the existing __vector_ram_* startup copy. */
-        *(.text._ZN7libhcs4core8protocol*)
-        *(.text._ZNK7libhcs4core8protocol*)
-        *(.text._ZN7libhcs4core9coroutine*)
-        *(.text._ZNK7libhcs4core9coroutine*)
-        *(.text._ZN7libhcs8firmware4link19InterruptSafeBuffer*)
-        *(.text._ZNK7libhcs8firmware4link19InterruptSafeBuffer*)
+         * section they ride the existing __vector_ram_* startup copy.
+         *
+         * Every mangled name component is length-prefixed: `libhcs` is 6
+         * characters, so the prefix is _ZN6libhcs. These rules said _ZN7libhcs
+         * until 2026-09-11 and matched nothing at all; the ASSERT right after this
+         * section now makes that a link error. */
+        *(.text._ZN6libhcs4core8protocol*)
+        *(.text._ZNK6libhcs4core8protocol*)
+        *(.text._ZN6libhcs4core9coroutine*)
+        *(.text._ZNK6libhcs4core9coroutine*)
+        *(.text._ZN6libhcs8firmware4link19InterruptSafeBuffer*)
+        *(.text._ZNK6libhcs8firmware4link19InterruptSafeBuffer*)
         *(.text.mcan_read_rxfifo*)
         . = ALIGN(8);
         __vector_ram_end__ = .;
     } > ILM
+
+    /* Tripwire for the mangled-name rules above. InterruptSafeBuffer::allocate is
+     * virtual, so every build type emits it out of line: if it is not in ILM, the
+     * rules no longer match what the compiler emits. */
+    ASSERT(
+        _ZN6libhcs8firmware4link19InterruptSafeBuffer8allocateEj < ORIGIN(ILM) + LENGTH(ILM),
+        "ILM name rules in .vectors matched nothing: InterruptSafeBuffer::allocate is outside ILM. Recheck the mangled prefixes there against riscv32-unknown-elf-nm.")
 
     .text (__vector_load_addr__ + SIZEOF(.vectors)): {
         . = ALIGN(8);

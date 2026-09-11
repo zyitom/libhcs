@@ -48,6 +48,12 @@ public:
      * any USB-side tuning available on this hardware. Prefer a core that the
      * kernel has been told to leave alone (isolcpus / nohz_full); pinning to a
      * core the scheduler still uses buys much less.
+     *
+     * The session keepalive thread follows this thread: same CPUs, and one RT
+     * priority step below it when it runs SCHED_FIFO/RR. That also covers
+     * pinning done inside thread_setup. Leave both unset and the keepalive is
+     * an ordinary thread that an RT busy-wait on its core can starve, which
+     * ends the session after one second.
      */
     int io_thread_cpu = -1;
 

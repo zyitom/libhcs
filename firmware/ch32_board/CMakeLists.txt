@@ -37,12 +37,21 @@ if(NOT EXISTS "${CH32_WCH_ROOT}/Core/core_riscv.c")
 endif()
 
 # CH32H417 is a dual-core part: the V3F core boots at flash 0x0 and wakes the
-# V5F core at 0x10000. Both cores are the same Qingke family (RV32IMAFC + F), so
-# they share one arch flag set; they differ only in startup, linker script and
-# the Core_* define. See boot/src/main.cpp for the wake/handshake sequence.
+# V5F core at 0x10000. Both cores are the same Qingke family, so they share one
+# arch flag set; they differ only in startup, linker script and the Core_*
+# define. See boot/src/main.cpp for the wake/handshake sequence.
+#
+# Soft-float on purpose (was rv32imafc / ilp32f): the firmware and core use no
+# floating point anywhere, yet GCC's __attribute__((interrupt)) with a hard-
+# float ABI saves caller-saved FP registers on EVERY interrupt. Qingke HPE
+# (intsyscr=0x0F in the vendor startup) already pushes GPRs; the FP stores are
+# extra. Without F, __riscv_flen is undefined and that prologue vanishes. The
+# vendor startup still writes mstatus FS=Dirty (0x6088); that is submodule code
+# and unused FPU enable is harmless. Revert if on-board float math is needed.
+# Keep in sync with WCH_ARCH_FLAGS in cmake/toolchain-wch-riscv.cmake.
 set(CH32_ARCH_FLAGS
-    -march=rv32imafc_zicsr_zifencei
-    -mabi=ilp32f
+    -march=rv32imac_zicsr_zifencei
+    -mabi=ilp32
     -mcmodel=medany
 )
 
@@ -78,8 +87,9 @@ file(GLOB CH32_USB_SOURCES CONFIGURE_DEPENDS "${CH32_BSP_ROOT}/usb/*.c")
 # USB SuperSpeed bulk benchmark build. OFF by default and it must stay that way
 # for anything but a measurement run: it hands EP1 to app/src/usb/bench.cpp,
 # which bypasses the deserializer, the session and the framing entirely, so the
-# board no longer speaks the libhcs protocol. Use Release (the Debug image is
-# already at ~96% of the 128 KB slot):
+# board no longer speaks the libhcs protocol. Use Release (Debug used to sit at
+# ~96% of the 128 KB slot when it was unoptimized -g; it is -Og now, but the
+# bench image still does not belong in a Debug slot):
 #   cmake --preset release -S firmware/ch32_board -Dlibhcs_CH32_USB_BENCH=ON
 option(libhcs_CH32_USB_BENCH "Build the V5F app in USB SS bulk benchmark mode" OFF)
 
@@ -119,9 +129,13 @@ set(CH32_COMMON_COMPILE_OPTIONS
     # Only rewrites 'interrupt' when it is followed by '(' -- the argument-less
     # __attribute__((interrupt)) used by our own ISRs is left untouched.
     -Dinterrupt\(x\)=interrupt
+    -fvisibility=hidden
     $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>
     $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>
     $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-unwind-tables>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-asynchronous-unwind-tables>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-threadsafe-statics>
     $<$<COMPILE_LANGUAGE:CXX>:-fno-use-cxa-atexit>
 )
 

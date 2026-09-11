@@ -6,6 +6,7 @@
 #include <memory>
 #include <span>
 #include <string_view>
+#include <thread>
 
 #include "core/src/protocol/constant.hpp"
 #include "libhcs/board/common.hpp"
@@ -171,6 +172,18 @@ public:
      * back. Transports that cannot fail this way keep the default.
      */
     virtual bool link_faulted() const noexcept { return false; }
+
+    /**
+     * @brief Configures the protocol's session keepalive thread.
+     *
+     * Called once by the protocol right after creating that thread, from the
+     * creating thread, while the new thread is still parked on an untimed wait.
+     * A transport that owns an I/O thread gives the keepalive the same CPU
+     * placement and scheduling, so the session lease stays alive exactly as long
+     * as I/O itself can run -- an application thread busy-waiting elsewhere can
+     * no longer starve it. Transports without such a thread keep the default.
+     */
+    virtual void configure_session_thread(std::thread& thread) noexcept { (void)thread; }
 
     //------------------------------------------------------------------
 

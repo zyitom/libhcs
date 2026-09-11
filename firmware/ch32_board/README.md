@@ -123,7 +123,7 @@ CH372 demo 把数据当成**纯硬件 DMA 回环**转发：EP1-OUT 直接链到 
 
 ```
 firmware/ch32_board/
-  cmake/toolchain-wch-riscv.cmake  # 裸机 RV32IMAFC/ilp32f，不启用 WCH 的 'xw'
+  cmake/toolchain-wch-riscv.cmake  # 裸机 RV32IMAC/ilp32 软浮点，不启用 F、不启用 WCH 的 'xw'
   cmake/merge_hex.cmake            # V3F@0x0 + V5F@0x10000 -> 合成单个 .hex
   bsp/ch32h417-evt/                # submodule: WCH 标准外设库（零改动，见 bsp/PROVENANCE.md）
   bsp/usb/                         # vendored CH372Device USBSS 设备栈（有本地 patch）
@@ -158,9 +158,11 @@ target：`ch32_board_app`、`ch32_board_boot`、`ch32_board_merged`（默认全�
 
 ## 关键移植决策
 
-- **使用 WCH GCC15，但不启用 `xw`。** Qingke V5F 实现的是 RV32IMAFC 加上 WCH 私有的
-  `xw` 压缩扩展。我们仍按 `-march=rv32imafc_zicsr_zifencei -mabi=ilp32f` 构建，避免
-  让仓库代码依赖私有 ISA；编译器来源与 ISA 选择是两件独立的事。
+- **使用 WCH GCC15，但不启用 `xw`，也不启用 F。** Qingke V5F 实现的是 RV32IMAFC 加上 WCH 私有的
+  `xw` 压缩扩展。我们按 `-march=rv32imac_zicsr_zifencei -mabi=ilp32` 构建：不依赖私有 ISA，
+  也不给 `__attribute__((interrupt))` 硬浮点 ABI——否则每个 ISR 都会在软件里再存一遍
+  caller-saved FP 寄存器，而 Qingke HPE（`intsyscr=0x0F`）已经压过 GPR。固件里没有浮点运算。
+  编译器来源与 ISA 选择是两件独立的事。
 - **双核，USB 放在 V5F 上。** `-DRun_Core=Run_Core_V3FandV5F`；两个镜像合并成一个 flash
   产物（`ch32_board_merged.hex`，V3F 在 `0x0`、V5F 在 `0x10000`）。V3F 是启动核：它拥有
   时钟树（它的 `SystemInit` 会使能 HSE，而 V5F 那份 `system_ch32h417.c` **不会**），

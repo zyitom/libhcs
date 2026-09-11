@@ -100,6 +100,9 @@ void Can::handle_downlink(const data::CanDataView& data) {
         led::led->downlink_buffer_full();
         diag::note_tx_fail(diag_index());
     }
+    // Whether or not the push succeeded: a refused push means the queue is full,
+    // so it is non-empty either way. See Can::drain_pending_transmits() in can.hpp.
+    transmit_pending_mask_ |= 1U << diag_index();
 }
 
 libhcs_ITCM
@@ -195,7 +198,7 @@ void Can::handle_uplink(data::DataId field_id, core::protocol::Serializer& seria
 }
 
 libhcs_ITCM
-bool Can::try_transmit() {
+bool Can::drain_transmit_queue() {
     core::utility::assert_always(hal_can_handle_->State == HAL_FDCAN_STATE_BUSY);
 
     // 现在只有撞上 FIFO 满的帧才会进队列, 常见情况是队列为空。所以要在
@@ -203,14 +206,41 @@ bool Can::try_transmit() {
     // 会导致每次都读 TXFQS, 无论有没有东西要发 -- 那是一次 D2 域(USB 所在域)的外设读,
     // 按主循环频率乘总线数发生。hpm_board 的 Can::try_transmit 用 peek_front() 循环,
     // 没有这个问题。
-    if (transmit_buffer_.readable() == 0)
-        return false;
+    size_t sent = 0;
+    if (transmit_buffer_.readable() != 0) {
+        sent = transmit_buffer_.pop_front_n(
+            [this](const TransmitMailboxData& mailbox_data) noexcept {
+                push_to_hardware(mailbox_data);
+            },
+            hardware_free_slots());
+    }
 
-    return transmit_buffer_.pop_front_n(
-        [this](const TransmitMailboxData& mailbox_data) noexcept {
-            push_to_hardware(mailbox_data);
-        },
-        hardware_free_slots());
+    // Clear this controller's pending bit only once its queue is really empty. A
+    // FIFO that filled first leaves both the frames and the bit for the next
+    // pass. See Can::drain_pending_transmits() in can.hpp.
+    if (transmit_buffer_.readable() == 0)
+        transmit_pending_mask_ &= ~(1U << diag_index());
+
+    return sent != 0;
+}
+
+// Out-of-line half of Can::drain_pending_transmits(): only reached when some
+// controller's hardware FIFO overflowed into its software queue.
+libhcs_ITCM
+void Can::drain_pending_transmits_slow() {
+    const uint32_t pending = transmit_pending_mask_;
+    if ((pending & (1U << 0U)) != 0U)
+        can1->drain_transmit_queue();
+    if ((pending & (1U << 1U)) != 0U)
+        can2->drain_transmit_queue();
+    if ((pending & (1U << 2U)) != 0U)
+        can3->drain_transmit_queue();
+}
+
+// Debug-build invariant check behind Can::drain_pending_transmits().
+bool Can::transmit_queues_empty() {
+    return can1->transmit_buffer_.readable() == 0 && can2->transmit_buffer_.readable() == 0
+        && can3->transmit_buffer_.readable() == 0;
 }
 
 extern "C" libhcs_ITCM void HAL_FDCAN_RxFifo0Callback(

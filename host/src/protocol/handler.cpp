@@ -110,7 +110,20 @@ public:
     // board never acknowledges.
     void start() {
         establish_session();
-        keepalive_thread_ = std::thread{[this] { keepalive_loop(); }};
+        // Created from the caller's thread, so it inherits that thread's
+        // placement -- possibly a core the caller is about to busy-wait on. It
+        // parks on an untimed wait until the transport has moved it: a timed
+        // wait armed on the inherited core would expire through that core's
+        // timer thread, which the busy-wait starves.
+        // See Transport::configure_session_thread().
+        auto configured = std::make_shared<std::atomic<bool>>(false);
+        keepalive_thread_ = std::thread{[this, configured] {
+            configured->wait(false, std::memory_order_acquire);
+            keepalive_loop();
+        }};
+        transport_->configure_session_thread(keepalive_thread_);
+        configured->store(true, std::memory_order_release);
+        configured->notify_one();
     }
 
     // Re-run the caller's out-of-band handshake before re-opening a session.
@@ -342,22 +355,43 @@ public:
     }
 
 private:
-    static constexpr size_t kSessionStartAckSize = sizeof(core::protocol::FieldHeaderExtended)
-                                                 + sizeof(core::protocol::SessionHeader)
-                                                 - sizeof(core::protocol::FieldHeader);
+    // kSession (14) fits the short field header, whose id nibble shares the
+    // first byte with SessionHeader, so the whole field is one SessionHeader.
+    // make_session_start_ack() checks this against the serializer itself.
+    static constexpr size_t kSessionStartAckSize = sizeof(core::protocol::SessionHeader);
 
+    // The exact bytes the board sends for this Handler's kStart. They come from
+    // the same Serializer the board runs rather than being assembled here: until
+    // 2026-09-11 this hand-built an extended field header, 6 bytes that the
+    // board's 5-byte ack never matched, and every session start timed out.
     static std::array<std::byte, kSessionStartAckSize> make_session_start_ack(uint32_t nonce) {
-        std::array<std::byte, kSessionStartAckSize> ack{};
-        core::protocol::FieldHeaderExtended::Ref field{ack.data()};
-        field.set<core::protocol::FieldHeaderExtended::Id>(core::protocol::FieldId::kExtend);
-        field.set<core::protocol::FieldHeaderExtended::IdExtended>(
-            core::protocol::FieldId::kSession);
+        class FixedBuffer final : public core::protocol::SerializeBuffer {
+        public:
+            explicit FixedBuffer(std::span<std::byte> storage) noexcept
+                : storage_(storage) {}
 
-        core::protocol::SessionHeader::Ref session{
-            ack.data() + sizeof(core::protocol::FieldHeaderExtended)
-            - sizeof(core::protocol::FieldHeader)};
-        session.set<core::protocol::SessionHeader::Type>(data::SessionType::kStartAck);
-        session.set<core::protocol::SessionHeader::Nonce>(nonce);
+            std::span<std::byte> allocate(std::size_t size) noexcept override {
+                if (size > storage_.size() - used_)
+                    return {};
+                const std::span<std::byte> region = storage_.subspan(used_, size);
+                used_ += size;
+                return region;
+            }
+
+            [[nodiscard]] std::size_t used() const noexcept { return used_; }
+
+        private:
+            std::span<std::byte> storage_;
+            std::size_t used_ = 0;
+        };
+
+        std::array<std::byte, kSessionStartAckSize> ack{};
+        FixedBuffer buffer{ack};
+        const auto result = core::protocol::Serializer{buffer}.write_session_control(
+            {.type = data::SessionType::kStartAck, .nonce = nonce});
+        core::utility::assert_always(
+            result == core::protocol::Serializer::SerializeResult::kSuccess
+            && buffer.used() == ack.size());
         return ack;
     }
 

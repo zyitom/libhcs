@@ -24,9 +24,11 @@ constexpr uint32_t kDfuRuntimeResetDelayMs = 50U;
 
 // Bulk endpoint size, refreshed at mount. tud_vendor_rx_cb() below needs it to
 // decide whether a packet is short (and therefore ends the transfer), and that
-// callback runs inside the USB ISR once per downlink packet -- which made
-// tud_speed_get() a jal/ret around one byte load on the hottest path there is.
-// It lives in usbd.c, so the call could not be inlined away.
+// callback runs once per downlink packet, which made tud_speed_get() a jal/ret
+// around one byte load on the hottest path there is. It lives in usbd.c, so the
+// call could not be inlined away. The callback runs from tud_task() on the main
+// loop, not in the USB interrupt: the vendor class driver registers no xfer_isr
+// in usbd.c, so its xfer_cb is always deferred. can.hpp relies on that.
 //
 // Mount is the right place and session activation is NOT: the session-open
 // packet arrives through tud_vendor_rx_cb itself, so a value refreshed on
@@ -72,8 +74,9 @@ extern "C" {
 SDK_DECLARE_EXT_ISR_M(IRQn_USB0, hcs_usb0_isr)
 void hcs_usb0_isr(void) {
     // Ahead of the device stack, because the whole point of the SOF probe is to
-    // read FRINDEX at the earliest instant software can. A no-op that the
-    // compiler removes entirely unless libhcs_APP_SOF_DIAG is set.
+    // read FRINDEX at the earliest instant software can. Its body is empty
+    // unless libhcs_APP_SOF_DIAG is set, but it is defined out of line in
+    // sof.cpp, so without LTO the call itself remains -- a jal to a bare ret.
     sync::sof_isr_entry();
     dcd_int_handler(0);
 }

@@ -101,9 +101,10 @@ bool host_session_established() {
         // Drain the CAN software transmit queues immediately after tud_task(),
         // which is where TinyUSB delivers this pass's downlink frames. Placing
         // it later -- after the 1 kHz LED/telemetry block -- would put that
-        // block's work between a frame arriving and reaching the wire.
-        for (size_t i = 0; i < can::can_count(); ++i)
-            can::can_array[i]->try_transmit();
+        // block's work between a frame arriving and reaching the wire. One load
+        // and a branch when no controller has frames queued, which is nearly
+        // every pass; see Can::drain_pending_transmits().
+        can::Can::drain_pending_transmits();
 
         // Settle any USB bulk OUT arm still owed. The steady-state re-arm rides
         // on the receive completion callback instead; this only covers the first

@@ -337,15 +337,14 @@ App::App() {
         diag::profile::mark(diag::profile::Section::kUsb);
         usb::vendor->try_transmit();
         diag::profile::mark(diag::profile::Section::kCan);
-        can::can1->try_transmit();
+        // All three CAN transmit queues at once: one load and a branch when none
+        // has frames queued, which is nearly every pass. The USB calls around it
+        // keep the count they had when each bus was polled on its own.
+        can::Can::drain_pending_transmits();
         diag::profile::mark(diag::profile::Section::kUsb);
         usb::vendor->try_transmit();
-        diag::profile::mark(diag::profile::Section::kCan);
-        can::can2->try_transmit();
         diag::profile::mark(diag::profile::Section::kUsb);
         usb::vendor->try_transmit();
-        diag::profile::mark(diag::profile::Section::kCan);
-        can::can3->try_transmit();
         diag::profile::mark(diag::profile::Section::kUsb);
         usb::vendor->try_transmit();
         diag::profile::mark(diag::profile::Section::kUart);

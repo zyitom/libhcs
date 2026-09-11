@@ -82,11 +82,27 @@ endif()
 
 message(STATUS "ch32_board RISC-V toolchain: ${CMAKE_C_COMPILER}")
 
-set(WCH_ARCH_FLAGS "-march=rv32imafc_zicsr_zifencei -mabi=ilp32f -mcmodel=medany")
+# Soft-float on purpose (was rv32imafc / ilp32f). The firmware uses no floating
+# point, but GCC's __attribute__((interrupt)) with a hard-float ABI saves the
+# caller-saved FP registers in software on every ISR. Qingke HPE (intsyscr=0x0F)
+# already pushes GPRs; the extra FP stores are pure forwarding latency. Without
+# F, __riscv_flen is undefined and that prologue vanishes. Revert if on-board
+# float math ever becomes necessary. Keep this string in sync with
+# CH32_ARCH_FLAGS in CMakeLists.txt.
+set(WCH_ARCH_FLAGS "-march=rv32imac_zicsr_zifencei -mabi=ilp32 -mcmodel=medany")
 
 set(CMAKE_C_FLAGS_INIT   "${WCH_ARCH_FLAGS}")
 set(CMAKE_CXX_FLAGS_INIT "${WCH_ARCH_FLAGS}")
 set(CMAKE_ASM_FLAGS_INIT "${WCH_ARCH_FLAGS} -x assembler-with-cpp")
+
+# CMake's Debug default is -g with no -O. The V5F app slot is 128 KB; an
+# unoptimized Debug image already sat at ~96% FLASH. -Og keeps it debuggable
+# and is what the other boards use. Release keeps -g: DWARF is not PT_LOAD, so
+# the flashed bytes stay identical to -g0 while crash dumps remain symbolizable.
+set(CMAKE_C_FLAGS_DEBUG "-Og -g3")
+set(CMAKE_CXX_FLAGS_DEBUG "-Og -g3")
+set(CMAKE_C_FLAGS_RELEASE "-O3 -g")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g")
 
 # Do not try to link a full hosted test program during compiler detection.
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)

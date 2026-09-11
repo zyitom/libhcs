@@ -62,15 +62,25 @@ Full-Speed，**转发吞吐的杠杆在 CAN 侧（CAN-FD），不在 USB 侧**�
   由 `Vendor::Vendor()` 显式设置：TinyUSB 的 `dcd_int_enable` 只调 `NVIC_EnableIRQ`
   不设优先级，而会设优先级的 CubeMX `HAL_PCD_MspInit` 属于 ST 的设备栈、本固件不链接
   它——不显式钉住的话 OTG_HS 会停在复位值 0，反压在 FDCAN 之上。
-- **ITCM 热路径**：整条 CAN 转发路径都在 `.itcm`，启动时（`App::App()`）从 FLASH
-  拷进零等待 ITCM，把 I-cache/XIP 取指抖动从最坏情况里去掉。除 `can.cpp` 的四个函数
-  外，链接脚本还按 mangled name 收进了每帧都会调到的叶子函数：`Serializer`、
-  `Bitfield`、`InterruptSafeBuffer`、`RingBuffer`、`get_serializer` 和几个 `Lazy`
-  取值器——否则它们留在 FLASH，每次调用都要走一条长跳 veneer（ITCM 在 0x0，FLASH 在
-  0x08040000，远超 BL 的跳转范围）。目前 ISR 路径只剩 `memcpy` 和 assert 失败路径
-  仍在 FLASH。占用约 5.6 KB / 64 KB。见 `bsp/linker/STM32H723VGTx_APP.ld`——那里的
-  注释说明了为什么 `.itcm` 必须排在 `.text` 前面，以及哪些东西**不能**收进去
-  （启动期就会执行的代码，例如 `Lazy<App>::init`）。
+- **ITCM 热路径**：`can.cpp` 里标了 `libhcs_ITCM` 的 CAN 转发函数，启动时（`App::App()`）
+  从 FLASH 拷进零等待 ITCM，把 I-cache/XIP 取指抖动从最坏情况里去掉。链接脚本另按
+  mangled name 收进每帧都会调到的叶子函数：`Serializer`、`Bitfield`、
+  `InterruptSafeBuffer`、`RingBuffer`、`get_serializer` 和几个 `Lazy` 取值器——否则它们
+  留在 FLASH，每次调用都要走一条长跳 veneer（ITCM 在 0x0，FLASH 在 0x08040000，远超 BL
+  的跳转范围）。`release`(-O3) 下其中只有 `InterruptSafeBuffer::allocate` 和
+  `get_serializer` 是独立函数，其余全被内联，这些规则主要在 `debug`(-Og) 下起作用。
+  见 `bsp/linker/STM32H723VGTx_APP.ld`——那里的注释说明了为什么 `.itcm` 必须排在
+  `.text` 前面，以及哪些东西**不能**收进去（启动期就会执行的代码，例如
+  `Lazy<App>::init`）。`[实测 2026-09-11，arm-none-eabi-nm]`
+  - **2026-09-11 更正**：这些名字规则原先写的前缀是 `_ZN7libhcs`，但 `libhcs` 只有 6 个
+    字符，实际符号是 `_ZN6libhcs...`，所以**一条都没有匹配上**。本条原先"ISR 路径只剩
+    `memcpy` 和 assert 失败路径在 FLASH、占用约 5.6 KB"的说法对当前代码也不成立：修正前
+    `release` 的 `.itcm` 只有 1792 B，`allocate` 与 `get_serializer` 都在 FLASH。修正后
+    `.itcm` 为 1960 B（`debug` 为 7408 B），并在 `.itcm` 之后加了一条 ASSERT：名字规则再
+    失配就直接链接失败。`[实测 2026-09-11]`
+  - **仍在 FLASH、每帧都经过的**：CAN 接收中断入口 `FDCAN1/2/3_IT0_IRQHandler` 与
+    `HAL_FDCAN_IRQHandler`（合计 960 B；到 `HAL_FDCAN_RxFifo0Callback` 才进入 ITCM），
+    以及 `memcpy`（`.itcm` 内 3 处静态调用走 veneer）。`[实测 2026-09-11]`
 - **UART 接收 = 一条永不停的环形 DMA**：每个口一条 circular DMA 盖住整个 2048 字节环，
   `CR3.DMAR` 从初始化到掉电一直置位，**没有任何窗口是关着接收的**。写指针不由中断维护，
   消费者在主循环里读 `NDTR` 推导（`2048 - NDTR`）。中断只剩 IDLE（一条

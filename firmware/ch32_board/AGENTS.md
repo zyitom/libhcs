@@ -41,8 +41,7 @@ ch32_board 是四块板里**最容易把自己弄进死胡同**的一块，原�
 ## 芯片与工具链
 - MCU：**WCH CH32H417**，RISC-V **双核**（V3F boot/offload + V5F 转发快路径）；
   卖点是片上 **USB 3.0 SuperSpeed（5 Gbps）** 设备控制器。
-- ISA/工具链：RISC-V bare-metal，`cmake/toolchain-wch-riscv.cmake`（RV32IMAFC/ilp32f，
-  **不启用** WCH 私有 `xw` 扩展）。正式构建使用 MounRiver `MRS_Toolchain_*` 随附的
+- ISA/工具链：RISC-V bare-metal，`cmake/toolchain-wch-riscv.cmake`（RV32IMAC/ilp32 软浮点，**不启用** F 也**不启用** WCH 私有 `xw` 扩展）。正式构建使用 MounRiver `MRS_Toolchain_*` 随附的
   **RISC-V Embedded GCC15**（不是 ARM，也不是 HPM GCC）。
 - **工具链隔离是硬约束**：`ch32_board` 只读取独立的 `WCH_TOOLCHAIN_PATH`，不得把
   `GNURISCV_TOOLCHAIN_PATH`、`~/3rd_party/hpm` 或 `/opt/riscv32-none-elf` 当作本板的正式
@@ -62,10 +61,11 @@ ch32_board 是四块板里**最容易把自己弄进死胡同**的一块，原�
   export WCH_TOOLCHAIN_PATH="$HOME/3rd_party/MRS_Toolchain_Linux_X64_V240/Toolchain/RISC-V Embedded GCC15"
   export WCH_TOOLCHAIN_PREFIX=riscv32-wch-elf-
   ```
-- **代码尺寸约束**：MRS GCC15 的 Debug app 当前使用 125332 B，FLASH 占用 **95.62%**
-  （区域只有 128 KB）；Release app 使用 49124 B / **37.48%**。早期 HPM GCC13 Debug
-  构建为 113364 B / 86.5%。选择官方工具链后接受 Debug 体积代价，但每次构建仍必须检查
-  链接器的 FLASH 占用，避免静默越界。[Docker 实测 2026-08-05]
+- **代码尺寸约束**：MRS GCC15 的 Debug app 在 2026-08-05 测过 125332 B / FLASH **95.62%**
+  （128 KB 槽；当时 Debug 是 CMake 默认的 `-g`、没有 `-O`）；Release 49124 B / **37.48%**。
+  早期 HPM GCC13 Debug 为 113364 B / 86.5%。现在 Debug 显式 `-Og -g3`，占用会低于那次
+  95.62%，但每次构建仍必须看链接器的 FLASH 占用，避免静默越界。[Docker 实测 2026-08-05；
+  `-Og` 后的新数字尚未重测]
 - **Docker / CI 现状**：`libhcs-ci` 已把 MounRiver V240 的 GCC15 安装到独立目录
   `/opt/wch-gcc15`，并设置 `WCH_TOOLCHAIN_PATH` / `WCH_TOOLCHAIN_PREFIX`。镜像固定为
   `linux/amd64`；Docker 构建从官网 API 取得临时签名地址，并校验固定的资源 ID、文件大小
