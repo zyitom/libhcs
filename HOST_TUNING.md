@@ -1023,7 +1023,7 @@ p90 126.3——绝大多数落在一个微帧上，偶尔赶上早一班就是 9
   1kHz 控制环下值 16-18us（1.2）。**先确认占空比，再看结论。**
 - **另一条改板级 p50 的路是减少板端周转时间**，让回复赶上早一个微帧。这同样是全有全无的
   一档（25us），已知办法是不释放 core1（单核镜像 p50 99.8）。见
-  [firmware/hpm_board/AGENTS.md](firmware/hpm_board/AGENTS.md) 的选型表。
+  [firmware/hpm_board/PITFALLS.md](firmware/hpm_board/PITFALLS.md) 第 1 节的选型实测。
 
 ---
 
