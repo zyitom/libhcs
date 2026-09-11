@@ -7,8 +7,8 @@
 
 ## 摘要
 
-本文记录全仓库构建依赖，以及只在宿主机安装的硬件调试工具；当前机器实际已安装的工具
-以根 `AGENTS.md` 的“开发机环境路径约定”为准。`ch32_board` 的正式构建要求独立的
+本文记录全仓库构建依赖、宿主机调试工具，以及**当前机器实际已安装工具的唯一权威清单**
+（见下方「本机实际安装状态」）。`ch32_board` 的正式构建要求独立的
 MounRiver WCH GCC15，当前机器和 `libhcs-ci` 镜像均已安装。
 
 > **本文不含任何内核调优。** 跑起来之后的主机侧设置——CPU governor、C-state / PM QoS、
@@ -21,11 +21,29 @@ MounRiver WCH GCC15，当前机器和 `libhcs-ci` 镜像均已安装。
 
 | 章节 | 内容 |
 |---|---|
+| [本机实际安装状态](#本机实际安装状态) | 当前机器已装工具与位置（**机器状态的唯一权威**） |
 | [版本要求](#版本要求) | 编译器、构建工具和基础依赖 |
 | [Docker 构建环境](#docker-构建环境) | CI / Dev Container 的工具链和职责边界 |
 | [宿主机调试工具](#宿主机调试工具可选不进-docker) | J-Link、Ozone 与 WCH-LinkE 的安装边界 |
 | [LLVM 20](#llvm-20clangd--clang-format--clang-tidy) | 本机与 CI 共用的编辑器、格式和静态分析工具 |
 | [构建命令](#构建命令) | host SDK 与 CH32 的常用命令 |
+
+## 本机实际安装状态
+
+**机器相关状态只在这一节维护**，其他文档（根 `AGENTS.md`、各板文档）一律引用这里，
+不要复制。下表 2026-09-11 逐条 `ls` 复核。
+
+| 工具 | 本机位置 | 状态 |
+|---|---|---|
+| ARM GCC | `/opt/arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi`（**15.2.rel1**，非上方版本表要求的 15.3.rel1；不在 PATH，要手工加） | 已装 |
+| RISC-V GCC（HPM）13.2.0 | `~/3rd_party/hpm/rv32imac_zicsr_zifencei_multilib_b_ext-linux`（含 `bin/` 的工具链根，`GNURISCV_TOOLCHAIN_PATH` 指向它） | 已装 |
+| HPM OpenOCD | `~/3rd_party/hpm/openocd-linux-x86_64`（同目录还有 `openocd-build`、`openocd-src` 和一份 `hpm_sdk` 副本） | 已装 |
+| RISC-V GCC（WCH）15.2.0 | `~/3rd_party/MRS_Toolchain_Linux_X64_V240/Toolchain/RISC-V Embedded GCC15`；同包 `OpenOCD/OpenOCD` 是 WCH OpenOCD | 已装，**`ch32_board` 本机可编可烧** |
+| SEGGER | `/opt/SEGGER/JLink`（→ `JLink_V948`）、`/opt/SEGGER/Ozone_V340j` | 已装（J-Link V9.48 / Ozone V3.40j） |
+| 其他 | `~/3rd_party/Xuantie-900-*`（T-Head GCC）、`~/3rd_party/soem-1.4.0`（EtherCAT 归档遗留）、`nvtop` | 与仓库固件流程无关 |
+
+> 换机器后本表必然过期：按上文各节重装，然后**只更新本表**，不要往别的文档里写
+> 机器状态。
 
 ## 版本要求
 
@@ -159,9 +177,10 @@ dpkg-query -W jlink ozone
 > 或无人值守 CI**——原因不是技术上做不到，而是许可接受需要有一个确定的责任人。
 > J-Link 软件本身免费，但授权范围限于配正版 SEGGER 探针使用。
 
-Ozone 是依赖实体 J-Link 的 GUI 调试器，同样只在宿主机安装。本机当前版本
-`jlink 9.68.0` / `ozone 3.501`，二进制落在 `/usr/bin/JLinkExe`、`/usr/bin/JLinkGDBServer`、
-`/usr/bin/ozone`，`.deb` 安装时会自动装 udev 规则。`[实测 2026-08-14]`
+Ozone 是依赖实体 J-Link 的 GUI 调试器，同样只在宿主机安装。本机当前为
+J-Link **V9.48** / Ozone **V3.40j**（以 `/opt/SEGGER/` 实际目录为准，见
+「本机实际安装状态」），二进制落在 `/usr/bin/JLinkExe`、`/usr/bin/JLinkGDBServer`、
+`/usr/bin/ozone`，`.deb` 安装时会自动装 udev 规则。`[实测 2026-08-14 安装方式；版本 2026-09-11 复核]`
 
 安装后，`./tools/jlink-debug.sh` 提供命令行 J-Link GDB Server 流程，`./tools/ozone-debug.sh` 打开
 仓库中预设的 Ozone 工程；可用 `--list` 查看目标。它们用于 `c_board`、`mc02` 和

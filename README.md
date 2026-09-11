@@ -237,8 +237,8 @@ cmake --preset debug -S firmware/ch32_board && cmake --build firmware/ch32_board
 | 板子 | 入口文档 | 深入阅读 |
 |---|---|---|
 | `c_board`（STM32F407） | [firmware/c_board/AGENTS.md](firmware/c_board/AGENTS.md) | — |
-| `mc02`（STM32H723） | [firmware/mc02/AGENTS.md](firmware/mc02/AGENTS.md) | [README.md](firmware/mc02/README.md)（外设与低延迟设计） |
+| `mc02`（STM32H723） | [firmware/mc02/AGENTS.md](firmware/mc02/AGENTS.md) | [README.md](firmware/mc02/README.md)（外设与低延迟设计） · [PACKET_RATE_LOG.md](firmware/mc02/PACKET_RATE_LOG.md)（包率实测） |
 | `ch32_board`（CH32H417） | [firmware/ch32_board/AGENTS.md](firmware/ch32_board/AGENTS.md) | [README.md](firmware/ch32_board/README.md) · [PITFALLS.md](firmware/ch32_board/PITFALLS.md)（上板前必读） · [PROGRESS.md](firmware/ch32_board/PROGRESS.md) |
-| `hpm_board`（HPM6E8Y/5321） | [firmware/hpm_board/AGENTS.md](firmware/hpm_board/AGENTS.md) | [BUILD_ENVIRONMENT.md](firmware/hpm_board/BUILD_ENVIRONMENT.md) |
+| `hpm_board`（HPM6E8Y/5321） | [firmware/hpm_board/AGENTS.md](firmware/hpm_board/AGENTS.md) | [BUILD_ENVIRONMENT.md](firmware/hpm_board/BUILD_ENVIRONMENT.md) · [PITFALLS.md](firmware/hpm_board/PITFALLS.md)（选型与踩坑） · [USB_OPTIMIZATION_LOG.md](firmware/hpm_board/USB_OPTIMIZATION_LOG.md)（USB 调优） |
 
-完整文档清单见 [AGENTS.md 的文档地图](AGENTS.md#文档地图)。
+完整文档清单见上表与各板 `AGENTS.md` 的「相关文档」一节。

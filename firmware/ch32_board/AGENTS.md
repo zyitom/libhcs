@@ -66,12 +66,11 @@ ch32_board 是四块板里**最容易把自己弄进死胡同**的一块，原�
   早期 HPM GCC13 Debug 为 113364 B / 86.5%。现在 Debug 显式 `-Og -g3`，占用会低于那次
   95.62%，但每次构建仍必须看链接器的 FLASH 占用，避免静默越界。[Docker 实测 2026-08-05；
   `-Og` 后的新数字尚未重测]
-- **Docker / CI 现状**：`libhcs-ci` 已把 MounRiver V240 的 GCC15 安装到独立目录
-  `/opt/wch-gcc15`，并设置 `WCH_TOOLCHAIN_PATH` / `WCH_TOOLCHAIN_PREFIX`。镜像固定为
-  `linux/amd64`；Docker 构建从官网 API 取得临时签名地址，并校验固定的资源 ID、文件大小
-  和 SHA-256。Lint 和 Release 都会实际构建 `ch32_board`，由 HPM 编译器生成的产物仍不
-  作为正式结果。CH32 当前纳入 clang-format，但 clang-tidy 因 WCH 厂商宏误报而在
-  `.scripts/lint-targets.yml` 中显式禁用。[官网与 Docker 实测 2026-08-05]
+- **Docker / CI 现状**：`libhcs-ci` 镜像已把 GCC15 装到独立目录 `/opt/wch-gcc15` 并设好
+  上述两个变量（容器内无需手动 `export`）；镜像的获取与校验细节见
+  [../../ENV.md](../../ENV.md)「Docker 构建环境」。CH32 当前纳入 clang-format，但
+  clang-tidy 因 WCH 厂商宏误报而在 `.scripts/lint-targets.yml` 中显式禁用。
+  [官网与 Docker 实测 2026-08-05]
 
 ## 构建
 ```bash
