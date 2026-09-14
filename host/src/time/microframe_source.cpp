@@ -74,13 +74,13 @@ constexpr std::chrono::nanoseconds kGuardIncrease{16'000};
 
 std::int64_t raw_now_ns() noexcept {
     timespec ts{};
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    (void)clock_gettime(CLOCK_MONOTONIC_RAW, &ts); // cannot fail for a valid clock id
     return (ts.tv_sec * 1'000'000'000LL) + ts.tv_nsec;
 }
 
 std::int64_t monotonic_now_ns() noexcept {
     timespec ts{};
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts); // cannot fail for a valid clock id
     return (ts.tv_sec * 1'000'000'000LL) + ts.tv_nsec;
 }
 
@@ -127,6 +127,7 @@ struct MicroframeSource::Impl {
     // closes. A validation failure is the expected path, not the rare one.
     ~Impl() {
         if (bar != nullptr)
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast): munmap needs it
             munmap(const_cast<std::uint8_t*>(bar), kWindowSize);
         if (fd >= 0)
             close(fd);
@@ -213,10 +214,9 @@ struct MicroframeSource::Impl {
         // 15/16-of-span jump, i.e. a confidently wrong kCounterStopped.
         const std::uint32_t raw_delta = (raw - last_raw) & (modulus - 1);
 
-        double wraps =
-            std::round((predicted - static_cast<double>(raw_delta)) / static_cast<double>(modulus));
-        if (wraps < 0.0)
-            wraps = 0.0;
+        const double wraps = std::max(
+            std::round((predicted - static_cast<double>(raw_delta)) / static_cast<double>(modulus)),
+            0.0);
         const std::uint64_t delta = raw_delta + (static_cast<std::uint64_t>(wraps) * modulus);
 
         const double residual = std::fabs(predicted - static_cast<double>(delta));
@@ -271,7 +271,7 @@ std::string pci_device_for_usb_bus(int bus_number) {
     const std::filesystem::path resolved = std::filesystem::canonical(link, error);
     if (error)
         return {};
-    const std::string parent = resolved.parent_path().filename().string();
+    std::string parent = resolved.parent_path().filename().string();
     if (!looks_like_pci_address(parent))
         return {};
     if (!std::filesystem::exists("/sys/bus/pci/devices/" + parent, error))
@@ -335,10 +335,12 @@ std::expected<MicroframeSource, MicroframeSource::Error>
     // Read-only if the kernel allows it. Some sysfs resource mappings insist on
     // a writable descriptor even for PROT_READ; falling back keeps those
     // working without ever asking for PROT_WRITE.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): POSIX open() is variadic.
     impl->fd = open(path.c_str(), O_RDONLY | O_SYNC);
     if (impl->fd < 0 && (errno == EACCES || errno == EPERM))
         return std::unexpected{Error::kPermissionDenied};
     if (impl->fd < 0)
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): POSIX open() is variadic.
         impl->fd = open(path.c_str(), O_RDWR | O_SYNC);
     if (impl->fd < 0)
         return std::unexpected{
@@ -348,6 +350,7 @@ std::expected<MicroframeSource, MicroframeSource::Error>
     if (mapped == MAP_FAILED) {
         // A read-only descriptor is refused by some kernels for MAP_SHARED.
         close(impl->fd);
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): POSIX open() is variadic.
         impl->fd = open(path.c_str(), O_RDWR | O_SYNC);
         if (impl->fd < 0)
             return std::unexpected{Error::kPermissionDenied};
@@ -385,8 +388,8 @@ std::expected<MicroframeSource, MicroframeSource::Error>
     // (2400 counts). Every way of being otherwise wrong -- wrong register,
     // suspended, all-ones, a stopped counter -- fails the per-interval
     // consistency and rate checks below.
-    constexpr std::chrono::milliseconds kDetectionWindow{300};
-    constexpr std::chrono::milliseconds kDetectionInterval{30};
+    static constexpr std::chrono::milliseconds kDetectionWindow{300};
+    static constexpr std::chrono::milliseconds kDetectionInterval{30};
 
     struct DetectionSample {
         std::int64_t gap_ns;
@@ -419,10 +422,11 @@ std::expected<MicroframeSource, MicroframeSource::Error>
     for (const DetectionSample& interval : detection) {
         const double predicted = static_cast<double>(interval.gap_ns)
                                / static_cast<double>(MicroframeSource::kMicroframePeriod.count());
-        double wraps = std::round(
-            (predicted - static_cast<double>(interval.delta)) / static_cast<double>(impl->modulus));
-        if (wraps < 0.0)
-            wraps = 0.0;
+        const double wraps = std::max(
+            std::round(
+                (predicted - static_cast<double>(interval.delta))
+                / static_cast<double>(impl->modulus)),
+            0.0);
         const double advanced =
             static_cast<double>(interval.delta) + (wraps * static_cast<double>(impl->modulus));
         const double tolerance = std::max(kConsistencyFloor, predicted * kConsistencyFraction);
@@ -444,8 +448,8 @@ std::expected<MicroframeSource, MicroframeSource::Error>
     // single-read timing would need do not land inside the number. What a
     // caller pays per sample() is this plus those two, which is why sample()
     // costs a little more than read_cost() reports.
-    constexpr int kCostBatches = 32;
-    constexpr int kCostReadsPerBatch = 64;
+    static constexpr int kCostBatches = 32;
+    static constexpr int kCostReadsPerBatch = 64;
     std::vector<std::int64_t> costs;
     costs.reserve(kCostBatches);
     for (int batch = 0; batch < kCostBatches; ++batch) {
@@ -606,7 +610,7 @@ std::optional<MicroframeSource::Edge> MicroframeSource::sample_edge() {
     if (predicted) {
         const std::int64_t wake_error_ns = poll_start_ns - requested_wake_ns;
         impl_->wake_error_high =
-            std::max(wake_error_ns, impl_->wake_error_high - impl_->wake_error_high / 64);
+            std::max(wake_error_ns, impl_->wake_error_high - (impl_->wake_error_high / 64));
         impl_->stats.wake_error_high = std::chrono::nanoseconds{impl_->wake_error_high};
         impl_->stats.wake_error_total += std::chrono::nanoseconds{wake_error_ns};
         ++impl_->stats.wake_samples;

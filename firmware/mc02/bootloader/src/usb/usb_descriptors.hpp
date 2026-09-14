@@ -21,11 +21,11 @@ namespace libhcs::firmware::usb {
 // `dfu-util -l` 即可看到, 无需任何厂商自定义协议: bootloader 没有厂商接口, 且
 // DFU 状态码无法描述主机接入之前就已作出的决定。
 enum class DfuEntryReason : uint8_t {
-    kUnknown,       // 尚未设置
-    kUserKey,       // 复位时按住 KEY -- 无条件恢复路径
-    kHostRequest,   // 应用经 boot mailbox 请求进入 DFU
-    kNoValidApp,    // 无应用镜像, 或校验失败
-    kInterrupted,   // 上次下载中途掉电
+    kUnknown,     // 尚未设置
+    kUserKey,     // 复位时按住 KEY -- 无条件恢复路径
+    kHostRequest, // 应用经 boot mailbox 请求进入 DFU
+    kNoValidApp,  // 无应用镜像, 或校验失败
+    kInterrupted, // 上次下载中途掉电
 };
 
 class UsbDescriptors {

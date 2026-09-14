@@ -20,25 +20,24 @@
 
 namespace libhcs::firmware::can {
 
-libhcs_ITCM
-uint32_t Can::hardware_free_slots() const noexcept {
+libhcs_ITCM uint32_t Can::hardware_free_slots() const noexcept {
     return hal_can_handle_->Instance->TXFQS & FDCAN_TXFQS_TFFL;
 }
 
 // 在控制器当前的 put index 处写入一个 Tx 元素并请求发送。调用方必须先查
 // hardware_free_slots(): FIFO 满时 TFQPI 仍会读出一个待发送的槽位, 直接写会覆盖未发出的帧。
-libhcs_ITCM
-void Can::push_to_hardware(const TransmitMailboxData& mailbox_data) noexcept {
+libhcs_ITCM void Can::push_to_hardware(const TransmitMailboxData& mailbox_data) noexcept {
     auto* hcan = hal_can_handle_;
-    const auto put_index =
-        (hcan->Instance->TXFQS & FDCAN_TXFQS_TFQPI) >> FDCAN_TXFQS_TFQPI_Pos;
+    const auto put_index = (hcan->Instance->TXFQS & FDCAN_TXFQS_TFQPI) >> FDCAN_TXFQS_TFQPI_Pos;
 
+    // NOLINTBEGIN(readability-identifier-naming): mirrors the message RAM word names.
     struct TxMailbox {
         uint32_t TIR;
         uint32_t TDTR;
         uint32_t TDLR;
         uint32_t TDHR;
     };
+    // NOLINTEND(readability-identifier-naming)
     auto* target_mailbox = reinterpret_cast<TxMailbox*>(
         hcan->msgRam.TxBufferSA + (put_index * hcan->Init.TxElmtSize * 4U));
 
@@ -51,8 +50,7 @@ void Can::push_to_hardware(const TransmitMailboxData& mailbox_data) noexcept {
     hcan->LatestTxFifoQRequest = (1UL << put_index);
 }
 
-libhcs_ITCM
-void Can::handle_downlink(const data::CanDataView& data) {
+libhcs_ITCM void Can::handle_downlink(const data::CanDataView& data) {
     TransmitMailboxData mailbox{};
 
     if (data.is_extended_can_id) {
@@ -95,7 +93,7 @@ void Can::handle_downlink(const data::CanDataView& data) {
     }
 
     const auto copy = [&mailbox](std::byte* storage) noexcept {
-        *new (storage) TransmitMailboxData{mailbox};
+        new (storage) TransmitMailboxData{mailbox};
     };
     if (!transmit_buffer_.emplace_back_n(copy, 1)) {
         led::led->downlink_buffer_full();
@@ -106,17 +104,18 @@ void Can::handle_downlink(const data::CanDataView& data) {
     transmit_pending_mask_ |= 1U << diag_index();
 }
 
-libhcs_ITCM
-void Can::handle_uplink(data::DataId field_id, core::protocol::Serializer& serializer) {
+libhcs_ITCM void Can::handle_uplink(data::DataId field_id, core::protocol::Serializer& serializer) {
     core::utility::assert_always(hal_can_handle_->State == HAL_FDCAN_STATE_BUSY);
     auto* hal_can_instance = hal_can_handle_->Instance;
 
+    // NOLINTBEGIN(readability-identifier-naming): mirrors the message RAM word names.
     struct RxMailbox {
         uint32_t RIR;
         uint32_t RDTR;
         uint32_t RDLR;
         uint32_t RDHR;
     };
+    // NOLINTEND(readability-identifier-naming)
 
     // 在这一次中断内排空整个 RX FIFO0: 把已排队的报文全部处理掉, 而不是每条报文再进
     // 一次中断。这不会增加延迟 -- 中断仍在第一条新报文时触发, 第一条处理得同样快;
@@ -150,7 +149,7 @@ void Can::handle_uplink(data::DataId field_id, core::protocol::Serializer& seria
         // 每个上行帧省 4 字节。若要恢复, 除取消下面这行注释和 config_can() 里的
         // FDCAN_TIMESTAMP_* 配置外, 还要先把值加宽(例如叠加自由运行的 TIM5 微秒计数器),
         // 上位机才能继续用普通的 32 位回绕差值。
-        
+
         // 帧起始时刻捕获的 16 位硬件时间戳(R1 bits[15:0])。内部计数器每个标称位时间
         // 走一格, 在 1 Mbit/s 仲裁速率(预分频 1)下即 1 us, 所以数值本身就是微秒。
         // can_data.timestamp_us = static_cast<uint32_t>(rdtr & 0x0000FFFFU);
@@ -208,10 +207,10 @@ void Can::handle_uplink(data::DataId field_id, core::protocol::Serializer& seria
 // 无需任何转换即可进负载。tx_occurred/tx_cancelled 读 TXBTO/TXBCF: 由于
 // AutoRetransmission 已被 .ioc 关闭, 二者分别明确表示"已上总线"与"已放弃"。
 Can::Status Can::status() const {
-    FDCAN_ProtocolStatusTypeDef protocol_status {};
+    FDCAN_ProtocolStatusTypeDef protocol_status{};
     core::utility::assert_always(
         HAL_FDCAN_GetProtocolStatus(hal_can_handle_, &protocol_status) == HAL_OK);
-    FDCAN_ErrorCountersTypeDef error_counters {};
+    FDCAN_ErrorCountersTypeDef error_counters{};
     core::utility::assert_always(
         HAL_FDCAN_GetErrorCounters(hal_can_handle_, &error_counters) == HAL_OK);
 
@@ -235,8 +234,7 @@ Can::Status Can::status() const {
     };
 }
 
-libhcs_ITCM
-bool Can::drain_transmit_queue() {
+libhcs_ITCM bool Can::drain_transmit_queue() {
     core::utility::assert_always(hal_can_handle_->State == HAL_FDCAN_STATE_BUSY);
 
     // 现在只有撞上 FIFO 满的帧才会进队列, 常见情况是队列为空。所以要在
@@ -263,8 +261,7 @@ bool Can::drain_transmit_queue() {
 
 // Can::drain_pending_transmits() 的 out-of-line 一半: 仅当某个控制器的硬件 FIFO
 // 溢出进软件队列时才会到达。
-libhcs_ITCM
-void Can::drain_pending_transmits_slow() {
+libhcs_ITCM void Can::drain_pending_transmits_slow() {
     const uint32_t pending = transmit_pending_mask_;
     if ((pending & (1U << 0U)) != 0U)
         can1->drain_transmit_queue();
@@ -322,8 +319,8 @@ void Can::recover_stuck_transmits() {
     diag::note_tx_fail(diag_index());
 }
 
-extern "C" libhcs_ITCM void HAL_FDCAN_RxFifo0Callback(
-    FDCAN_HandleTypeDef* hfdcan, uint32_t rx_fifo0_its) {
+extern "C" libhcs_ITCM void
+    HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef* hfdcan, uint32_t rx_fifo0_its) {
     (void)rx_fifo0_its;
 
     Can* can;
@@ -353,8 +350,8 @@ extern "C" libhcs_ITCM void HAL_FDCAN_RxFifo0Callback(
     can->handle_uplink(field_id, usb::get_serializer());
 }
 
-extern "C" void HAL_FDCAN_ErrorStatusCallback(
-    FDCAN_HandleTypeDef* hfdcan, uint32_t error_status_its) {
+extern "C" void
+    HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef* hfdcan, uint32_t error_status_its) {
     if (!(error_status_its & FDCAN_IT_BUS_OFF))
         return;
 

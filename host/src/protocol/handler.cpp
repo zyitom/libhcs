@@ -170,7 +170,7 @@ public:
     static std::invoke_result_t<Callable> guard_callback(Callable&& callable) noexcept {
         using Result = std::invoke_result_t<Callable>;
         try {
-            return callable();
+            return std::forward<Callable>(callable)();
         } catch (const std::exception& exception) {
             note_application_callback_exception(exception.what());
         } catch (...) {
@@ -676,7 +676,7 @@ private:
     uint64_t session_keepalive_ack_count_ = 0;
     uint32_t expected_session_nonce_ = 0;
     bool time_sync_enabled_ = false;
-    std::atomic<time::Timeline::Clock::time_point> time_anchor_sent_at_{};
+    std::atomic<time::Timeline::Clock::time_point> time_anchor_sent_at_;
     std::array<std::byte, kSessionStartAckSize> expected_session_start_ack_{};
     std::array<std::byte, kSessionStartAckSize> session_start_ack_window_{};
     size_t session_start_ack_window_size_ = 0;

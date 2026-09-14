@@ -135,7 +135,7 @@ public:
 
     // SET_CONFIGURATION(挂载)/拆除(suspend、umount)时由 TinyUSB 回调设置。
     // 流控的端点寄存器写只发生在挂载窗口内。
-    void set_vendor_mounted(bool mounted) {
+    void set_vendor_mounted([[maybe_unused]] bool mounted) {
 #if CFG_TUD_VENDOR_RX_MANUAL_XFER
         vendor_mounted_ = mounted;
 #endif

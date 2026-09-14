@@ -1,3 +1,5 @@
+#include "core/include/libhcs/protocol/vendor_control.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -6,7 +8,6 @@
 #include <common/tusb_types.h>
 #include <device/usbd.h>
 
-#include "core/include/libhcs/protocol/vendor_control.hpp"
 #include "firmware/mc02/app/src/can/can.hpp"
 #include "firmware/mc02/app/src/uart/uart.hpp"
 #include "firmware/mc02/app/src/usb/vendor.hpp"
@@ -44,12 +45,21 @@ struct LastConfigError {
     uint32_t value;
 };
 
-LastConfigError g_last_config_error{0, static_cast<uint8_t>(vc::ConfigErrorReason::kConfigErrorNone), 0, 0};
+LastConfigError g_last_config_error{
+    .request = 0,
+    .reason = static_cast<uint8_t>(vc::ConfigErrorReason::kConfigErrorNone),
+    .index = 0,
+    .value = 0,
+};
 
-void record_config_error(vc::Request request, uint16_t index, vc::ConfigErrorReason reason,
-                         uint32_t value = 0) {
-    g_last_config_error = {static_cast<uint8_t>(request), static_cast<uint8_t>(reason), index,
-                           value};
+void record_config_error(
+    vc::Request request, uint16_t index, vc::ConfigErrorReason reason, uint32_t value = 0) {
+    g_last_config_error = {
+        .request = static_cast<uint8_t>(request),
+        .reason = static_cast<uint8_t>(reason),
+        .index = index,
+        .value = value,
+    };
 }
 
 // EP0 的 UART 下标顺序即板端描述符表(core/include/libhcs/spec/mc02/uart.hpp):
@@ -179,79 +189,87 @@ bool handle_setup(uint8_t rhport, const tusb_control_request_t* request) {
 
     case vc::Request::kGetCanConfig: {
         if (request->bmRequestType != vc::kRequestTypeIn || !can_index_valid(index)) {
-            record_config_error(vc::Request::kGetCanConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorBadIndex);
+            record_config_error(
+                vc::Request::kGetCanConfig, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
             return false;
         }
-        return reply(rhport, request, vc::CanConfigPayload{
-            .mode = static_cast<uint8_t>(can_mode(index)),
-            .control = 0,
-            .reserved0 = 0,
-            .arbitration_baudrate = can_arbitration_baudrate(index),
-            .data_baudrate = can_data_baudrate(index),
-            .nominal_sample_point = static_cast<uint16_t>(can_arbitration_sample_point(index)),
-            .data_sample_point = static_cast<uint16_t>(can_data_sample_point(index)),
-            .reserved1 = 0,
-        });
+        return reply(
+            rhport, request,
+            vc::CanConfigPayload{
+                .mode = static_cast<uint8_t>(can_mode(index)),
+                .control = 0,
+                .reserved0 = 0,
+                .arbitration_baudrate = can_arbitration_baudrate(index),
+                .data_baudrate = can_data_baudrate(index),
+                .nominal_sample_point = static_cast<uint16_t>(can_arbitration_sample_point(index)),
+                .data_sample_point = static_cast<uint16_t>(can_data_sample_point(index)),
+                .reserved1 = 0,
+            });
     }
 
     case vc::Request::kGetCanStatus: {
         if (request->bmRequestType != vc::kRequestTypeIn || !can_index_valid(index)) {
-            record_config_error(vc::Request::kGetCanStatus, index,
-                                vc::ConfigErrorReason::kConfigErrorBadIndex);
+            record_config_error(
+                vc::Request::kGetCanStatus, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
             return false;
         }
         const can::Can* bus = can::can_by_index(index);
         if (bus == nullptr)
             return false;
         const auto s = bus->status();
-        return reply(rhport, request, vc::CanStatusPayload{
-            .tec = s.tec,
-            .rec = s.rec,
-            .last_error = s.last_error,
-            .data_last_error = s.data_last_error,
-            .flags = s.flags,
-            .reserved = {},
-            .tx_occurred = s.tx_occurred,
-            .tx_cancelled = s.tx_cancelled,
-            .rx_frames = s.rx_frames,
-            .rx_fifo_level = s.rx_fifo_level,
-        });
+        return reply(
+            rhport, request,
+            vc::CanStatusPayload{
+                .tec = s.tec,
+                .rec = s.rec,
+                .last_error = s.last_error,
+                .data_last_error = s.data_last_error,
+                .flags = s.flags,
+                .reserved = {},
+                .tx_occurred = s.tx_occurred,
+                .tx_cancelled = s.tx_cancelled,
+                .rx_frames = s.rx_frames,
+                .rx_fifo_level = s.rx_fifo_level,
+            });
     }
 
     case vc::Request::kGetUartConfig: {
         if (request->bmRequestType != vc::kRequestTypeIn || index >= kUartIndexCount) {
-            record_config_error(vc::Request::kGetUartConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorBadIndex);
+            record_config_error(
+                vc::Request::kGetUartConfig, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
             return false;
         }
         const uart::UartCommon* port = uart_by_index(index);
         if (port == nullptr) {
-            record_config_error(vc::Request::kGetUartConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorBadIndex);
+            record_config_error(
+                vc::Request::kGetUartConfig, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
             return false;
         }
         // 硬件事实而非"上次请求": 波特率从实际编程的分频器重构, 帧格式从活
         // 寄存器解码; control 恒为 0。
-        return reply(rhport, request, vc::UartConfigPayload{
-            .baudrate = port->effective_baudrate(),
-            .word_length = static_cast<uint8_t>(port->word_length()),
-            .parity = static_cast<uint8_t>(port->parity()),
-            .stop_bits = static_cast<uint8_t>(port->stop_bits()),
-            .control = 0,
-        });
+        return reply(
+            rhport, request,
+            vc::UartConfigPayload{
+                .baudrate = port->effective_baudrate(),
+                .word_length = static_cast<uint8_t>(port->word_length()),
+                .parity = static_cast<uint8_t>(port->parity()),
+                .stop_bits = static_cast<uint8_t>(port->stop_bits()),
+                .control = 0,
+            });
     }
 
     case vc::Request::kGetLastConfigError: {
         if (request->bmRequestType != vc::kRequestTypeIn || index != 0)
             return false;
-        return reply(rhport, request, vc::LastConfigErrorPayload{
-            .request = g_last_config_error.request,
-            .reason = g_last_config_error.reason,
-            .index = g_last_config_error.index,
-            .value = g_last_config_error.value,
-            .reserved = 0,
-        });
+        return reply(
+            rhport, request,
+            vc::LastConfigErrorPayload{
+                .request = g_last_config_error.request,
+                .reason = g_last_config_error.reason,
+                .index = g_last_config_error.index,
+                .value = g_last_config_error.value,
+                .reserved = 0,
+            });
     }
 
     case vc::Request::kSetCanConfig:
@@ -264,13 +282,13 @@ bool handle_setup(uint8_t rhport, const tusb_control_request_t* request) {
     case vc::Request::kSetUartConfig:
         if (request->bmRequestType != vc::kRequestTypeOut || index >= kUartIndexCount
             || request->wLength != sizeof(vc::UartConfigPayload)) {
-            record_config_error(vc::Request::kSetUartConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorBadIndex);
+            record_config_error(
+                vc::Request::kSetUartConfig, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
             return false;
         }
         if (uart_by_index(index) == nullptr) {
-            record_config_error(vc::Request::kSetUartConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorBadIndex);
+            record_config_error(
+                vc::Request::kSetUartConfig, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
             return false;
         }
         return tud_control_xfer(rhport, request, g_control_buffer, request->wLength);
@@ -343,16 +361,17 @@ bool handle_data(const tusb_control_request_t* request) {
         // 状态一致 -- 波特率用 5% 容差(与主机读回同一约定), 帧格式精确比对。
         uint32_t brr = 0;
         if (payload.baudrate != 0U && !port->solve_brr(payload.baudrate, brr)) {
-            record_config_error(vc::Request::kSetUartConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorRateUnrepresentable,
-                                payload.baudrate);
+            record_config_error(
+                vc::Request::kSetUartConfig, index,
+                vc::ConfigErrorReason::kConfigErrorRateUnrepresentable, payload.baudrate);
             return false;
         }
 
         if ((payload.control & vc::kUartConfigApply) != 0U) {
             if (!port->set_framing(payload.word_length, payload.parity, payload.stop_bits)) {
-                record_config_error(vc::Request::kSetUartConfig, index,
-                                    vc::ConfigErrorReason::kConfigErrorFramingUnsupported);
+                record_config_error(
+                    vc::Request::kSetUartConfig, index,
+                    vc::ConfigErrorReason::kConfigErrorFramingUnsupported);
                 return false;
             }
             if (payload.baudrate != 0U)
@@ -362,25 +381,27 @@ bool handle_data(const tusb_control_request_t* request) {
 
         if (payload.baudrate != 0U) {
             const uint32_t effective = port->effective_baudrate();
-            const uint64_t error = effective > payload.baudrate
-                                     ? effective - payload.baudrate
-                                     : payload.baudrate - effective;
+            const uint64_t error = effective > payload.baudrate ? effective - payload.baudrate
+                                                                : payload.baudrate - effective;
             if (error * 100U > static_cast<uint64_t>(payload.baudrate) * 5U)
                 return false;
         }
         if (payload.word_length != 0U && payload.word_length != port->word_length()) {
-            record_config_error(vc::Request::kSetUartConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorFramingUnsupported);
+            record_config_error(
+                vc::Request::kSetUartConfig, index,
+                vc::ConfigErrorReason::kConfigErrorFramingUnsupported);
             return false;
         }
         if (payload.parity != 0U && payload.parity != port->parity()) {
-            record_config_error(vc::Request::kSetUartConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorFramingUnsupported);
+            record_config_error(
+                vc::Request::kSetUartConfig, index,
+                vc::ConfigErrorReason::kConfigErrorFramingUnsupported);
             return false;
         }
         if (payload.stop_bits != 0U && payload.stop_bits != port->stop_bits()) {
-            record_config_error(vc::Request::kSetUartConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorFramingUnsupported);
+            record_config_error(
+                vc::Request::kSetUartConfig, index,
+                vc::ConfigErrorReason::kConfigErrorFramingUnsupported);
             return false;
         }
         return true;

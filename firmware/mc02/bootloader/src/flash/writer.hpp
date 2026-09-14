@@ -163,11 +163,11 @@ private:
 
     static bool erase_sector(size_t index) {
         FLASH_EraseInitTypeDef erase{};
-        erase.TypeErase    = FLASH_TYPEERASE_SECTORS;
-        erase.Banks        = FLASH_BANK_1;
+        erase.TypeErase = FLASH_TYPEERASE_SECTORS;
+        erase.Banks = FLASH_BANK_1;
         erase.VoltageRange = FLASH_VOLTAGE_RANGE_3;
-        erase.Sector       = kAppSectors[index].sector;
-        erase.NbSectors    = 1;
+        erase.Sector = kAppSectors[index].sector;
+        erase.NbSectors = 1;
 
         uint32_t sector_error = 0U;
         // bootloader 无缓存运行(见 main.cpp), 此处既不需要也不允许 D-cache

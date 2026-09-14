@@ -157,7 +157,8 @@ private:
         const auto message =
             std::format_to_n(prefix.out, remaining, fmt, std::forward<Args>(args)...);
         *message.out = '\n';
-        std::fwrite(
+        // A failed write to stderr has nowhere left to be reported.
+        (void)std::fwrite(
             line.data(), 1, static_cast<std::size_t>(message.out - line.data()) + 1, stderr);
     }
 

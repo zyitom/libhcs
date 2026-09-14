@@ -161,7 +161,7 @@ public:
             return not_before + (not_after - not_before) / 2;
         }
         [[nodiscard]] std::int64_t raw_midpoint_ns() const noexcept {
-            return raw_not_before_ns + (raw_not_after_ns - raw_not_before_ns) / 2;
+            return raw_not_before_ns + ((raw_not_after_ns - raw_not_before_ns) / 2);
         }
     };
 

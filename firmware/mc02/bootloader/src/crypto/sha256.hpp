@@ -152,8 +152,7 @@ inline void sha256_update(Sha256Ctx* ctx, const uint8_t* data, size_t len) {
 
     // 先补齐上次调用残留的半满缓冲区。
     if (ctx->datalen != 0U) {
-        const size_t fill =
-            std::min(static_cast<size_t>(detail::kChunkBytes - ctx->datalen), len);
+        const size_t fill = std::min(static_cast<size_t>(detail::kChunkBytes - ctx->datalen), len);
         std::memcpy(ctx->data.data() + ctx->datalen, data, fill);
         ctx->datalen += static_cast<uint32_t>(fill);
         offset += fill;

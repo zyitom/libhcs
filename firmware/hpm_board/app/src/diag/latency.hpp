@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 
 #include <hpm_csr_drv.h>
@@ -35,8 +36,7 @@ struct Segment {
     void note(uint32_t cycles) {
         if (count == 0 || cycles < min_cycles)
             min_cycles = cycles;
-        if (cycles > max_cycles)
-            max_cycles = cycles;
+        max_cycles = std::max(max_cycles, cycles);
         sum_cycles += cycles;
         ++count;
     }

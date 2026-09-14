@@ -219,7 +219,7 @@ private:
     // 链路, 比丢弃发往该总线的帧糟糕得多。队列在释放水位之上停留这么久后, 停止
     // 扣住端点。健康总线按实测约 19.8k 帧/s 排空全部 64 槽约需 3.2 ms, 20 ms 只在
     // 总线真正卡死时才会耗尽; 会话租期 1000 ms, 余量充分。
-    static constexpr uint64_t kThrottleDeadlineQuarterUs = 20'000U * 4U;
+    static constexpr uint64_t kThrottleDeadlineQuarterUs = 20'000ULL * 4U;
 
     bool downlink_throttled() {
         const size_t depth = can::max_transmit_queue_depth();

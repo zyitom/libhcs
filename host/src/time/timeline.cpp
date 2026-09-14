@@ -59,8 +59,8 @@ void Timeline::observe(uint64_t microframe, Clock::time_point sampled_at) {
     if (fitted_) {
         const double predicted_ns =
             fit_reference_ns_
-            + static_cast<double>(static_cast<int64_t>(microframe - fit_reference_microframe_))
-                  * fit_period_ns_;
+            + (static_cast<double>(static_cast<int64_t>(microframe - fit_reference_microframe_))
+               * fit_period_ns_);
         const double error_ns = static_cast<double>(to_ns(sampled_at)) - predicted_ns;
         if (std::fabs(error_ns) > 1e9) {
             // Treat it as a restart of the axis rather than an outlier to drop:
@@ -79,7 +79,7 @@ void Timeline::observe(uint64_t microframe, Clock::time_point sampled_at) {
         microframe_timebase_->observe_board(microframe, sampled_at);
 
     samples_[(sample_head_ + sample_count_) % kSampleCapacity] =
-        Sample{microframe, to_ns(sampled_at)};
+        Sample{.microframe = microframe, .host_ns = to_ns(sampled_at)};
     if (sample_count_ < kSampleCapacity) {
         sample_count_++;
     } else {
@@ -114,7 +114,7 @@ void Timeline::refit_locked() {
         sum_xy += x * y;
     }
     const auto count = static_cast<double>(sample_count_);
-    const double denominator = count * sum_xx - sum_x * sum_x;
+    const double denominator = (count * sum_xx) - (sum_x * sum_x);
     if (denominator <= 0.0)
         return;
 
@@ -159,8 +159,8 @@ Timeline::Clock::time_point Timeline::host_time_of_locked(uint64_t microframe) c
     }
     const double ns =
         fit_reference_ns_
-        + static_cast<double>(static_cast<int64_t>(microframe - fit_reference_microframe_))
-              * fit_period_ns_;
+        + (static_cast<double>(static_cast<int64_t>(microframe - fit_reference_microframe_))
+           * fit_period_ns_);
     return Clock::time_point{std::chrono::nanoseconds{static_cast<int64_t>(std::llround(ns))}};
 }
 

@@ -105,7 +105,8 @@ public:
 
     // 纯校验, 不碰寄存器: 供 EP0 处理器在 set_baudrate() 之前排除非法组合,
     // 保证任一字段非法时 STALL 严格等于"什么都没改"。
-    [[nodiscard]] bool check_framing(uint32_t word_length, uint32_t parity, uint32_t stop_bits) {
+    [[nodiscard]] bool
+        check_framing(uint32_t word_length, uint32_t parity, uint32_t stop_bits) const {
         if (word_length != 0U && word_length != 7U && word_length != 8U)
             return false;
         if (parity != 0U && (parity < 1U || parity > 3U))
@@ -114,11 +115,8 @@ public:
             return false;
         // 2 个停止位要求字长 >= 6(与 uart_init() 同一约束); 字长与停止位同改时
         // 以新字长计。
-        const uint32_t effective_word =
-            word_length != 0U ? word_length : this->word_length();
-        if (stop_bits == 2U && effective_word < 6U)
-            return false;
-        return true;
+        const uint32_t effective_word = word_length != 0U ? word_length : this->word_length();
+        return stop_bits != 2U || effective_word >= 6U;
     }
 
     // 提交 check_framing() 已通过的帧格式。0 = 保持不变; 只改请求了的字段。
@@ -156,7 +154,7 @@ public:
     [[nodiscard]] uint32_t parity() const {
         const uint32_t lcr = uart_base_->LCR;
         if ((lcr & UART_LCR_PEN_MASK) == 0U)
-            return 1U; // 无校验
+            return 1U;                                    // 无校验
         return (lcr & UART_LCR_EPS_MASK) != 0U ? 2U : 3U; // 偶 : 奇
     }
 

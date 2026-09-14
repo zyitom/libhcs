@@ -148,8 +148,8 @@ public:
     // callback after the restart can consume it. Handler marks the restart
     // here and performs the actual protocol reset on the receive thread, the
     // one thread its deserializer may be touched from.
+    // NOLINTNEXTLINE(performance-unnecessary-value-param): overrides take ownership.
     virtual void on_link_restart(std::function<void()> callback) { (void)callback; }
-    // NOLINTEND(performance-unnecessary-value-param)
 
     /**
      * @brief Optional link-level recovery, attempted before giving up on a session.

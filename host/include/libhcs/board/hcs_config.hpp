@@ -4,13 +4,12 @@
 #include <cstdint>
 #include <format>
 #include <optional>
-#include <string>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 #include <libhcs/protocol/handler.hpp>
 #include <libhcs/protocol/vendor_control.hpp>
-
 
 // Construction-time channel configuration for the hpm_board family, over EP0.
 //
@@ -185,8 +184,8 @@ inline uint32_t read_uart_baudrate(host::protocol::Handler& handler, std::size_t
 // The rate tolerance is the board's own: its divisor solver accepts a rate
 // within 3%, so 3000000 comes back as 3076923 and is correct. Comparing for
 // equality here would reject a switch that actually worked.
-inline void configure_uart(
-    host::protocol::Handler& handler, std::size_t port, const UartSetting& setting) {
+inline void
+    configure_uart(host::protocol::Handler& handler, std::size_t port, const UartSetting& setting) {
     const vc::UartConfigPayload payload{
         .baudrate = setting.baudrate,
         .word_length = std::to_underlying(setting.word_length),
@@ -222,7 +221,8 @@ inline void configure_uart(
                 port, setting.baudrate, effective.baudrate)};
         }
     }
-    if (setting.word_length != static_cast<vc::UartWordLength>(0)
+    // 0 is the protocol's "leave unchanged", which UartWordLength has no enumerator for.
+    if (std::to_underlying(setting.word_length) != 0
         && effective.word_length != setting.word_length) {
         throw std::runtime_error{std::format(
             "UART{}: word length was not applied (reads back {}).", port,
@@ -396,25 +396,27 @@ inline Interface apply(host::protocol::Handler& handler, const Configuration& co
     const Interface interface = read_interface(handler);
 
     for (std::size_t bus = 0; bus < std::size(configuration.can_fd); ++bus) {
-        if (!configuration.can_fd[bus].has_value())
+        const auto& can_fd = configuration.can_fd[bus];
+        if (!can_fd.has_value())
             continue;
         if (bus >= interface.can_count) {
             throw std::runtime_error{std::format(
                 "CAN{} was configured but this board reports only {} CAN bus(es).", bus + 1,
                 interface.can_count)};
         }
-        request_can_mode(handler, bus, *configuration.can_fd[bus], interface.can_mode_settable);
+        request_can_mode(handler, bus, *can_fd, interface.can_mode_settable);
     }
 
     for (std::size_t port = 0; port < std::size(configuration.uart_baudrate); ++port) {
-        if (!configuration.uart_baudrate[port].has_value())
+        const auto& baudrate = configuration.uart_baudrate[port];
+        if (!baudrate.has_value())
             continue;
         if (port >= interface.uart_count) {
             throw std::runtime_error{std::format(
                 "UART{} was configured but this board reports only {} UART port(s).", port,
                 interface.uart_count)};
         }
-        configure_uart(handler, port, *configuration.uart_baudrate[port]);
+        configure_uart(handler, port, *baudrate);
     }
 
     return interface;

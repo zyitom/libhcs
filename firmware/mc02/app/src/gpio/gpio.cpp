@@ -39,12 +39,16 @@ extern "C" void HAL_GPIO_EXTI_Callback(uint16_t gpio_pin) {
 // CubeMX 不知道它们兼作输入, 也就不为这些线生成 handler。EXTI15_10 在 .ioc 中
 // 已关闭 Generate IRQ handler(NVIC > Code generation), 只去掉生成 handler 一项;
 // MX_GPIO_Init 仍会使能该线并设置优先级。
+// NOLINTNEXTLINE(readability-identifier-naming): vector table symbol name.
 extern "C" void EXTI0_IRQHandler(void) { HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_0); }
+// NOLINTNEXTLINE(readability-identifier-naming): vector table symbol name.
 extern "C" void EXTI2_IRQHandler(void) { HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_2); }
+// NOLINTNEXTLINE(readability-identifier-naming): vector table symbol name.
 extern "C" void EXTI9_5_IRQHandler(void) { HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_9); }
 
 // PE10(INT1_ACC)、PE12(INT1_GYRO)与 PE13(PWM 通道 4)都在这条线上, 故它须
 // 同时服务 IMU 与 GPIO 驱动。
+// NOLINTNEXTLINE(readability-identifier-naming): vector table symbol name.
 extern "C" void EXTI15_10_IRQHandler(void) {
     HAL_GPIO_EXTI_IRQHandler(INT1_ACC_Pin);
     HAL_GPIO_EXTI_IRQHandler(INT1_GYRO_Pin);

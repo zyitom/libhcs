@@ -50,8 +50,7 @@ public:
 
     void transmit_receive(SpiModule& module, size_t size) {
         core::utility::assert_debug(0 < size && size <= kMaxTransferSize);
-        core::utility::assert_debug_lazy(
-            [&]() noexcept { return is_locked() && hal_ready(); });
+        core::utility::assert_debug_lazy([&]() noexcept { return is_locked() && hal_ready(); });
 
         begin_transfer(module, size);
 
@@ -66,8 +65,7 @@ public:
     // DMA 模式; 完成经 SPI2 的 DMA 流中断通知。
     void transmit_receive_async(SpiModule& module, size_t size) {
         core::utility::assert_debug(0 < size && size <= kMaxTransferSize);
-        core::utility::assert_debug_lazy(
-            [&]() noexcept { return is_locked() && hal_ready(); });
+        core::utility::assert_debug_lazy([&]() noexcept { return is_locked() && hal_ready(); });
 
         begin_transfer(module, size);
 

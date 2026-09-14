@@ -2,16 +2,16 @@
 
 #if defined(libhcs_APP_CAN_DIAG) && libhcs_APP_CAN_DIAG
 
-#include <atomic>
-#include <cstring>
+# include <atomic>
+# include <cstring>
 
-#include <fdcan.h>
+# include <fdcan.h>
 
-#include "core/include/libhcs/data/datas.hpp"
-#include "core/src/protocol/protocol.hpp"
-#include "core/src/protocol/serializer.hpp"
-#include "firmware/mc02/app/src/timer/timer.hpp"
-#include "firmware/mc02/app/src/usb/helper.hpp"
+# include "core/include/libhcs/data/datas.hpp"
+# include "core/src/protocol/protocol.hpp"
+# include "core/src/protocol/serializer.hpp"
+# include "firmware/mc02/app/src/timer/timer.hpp"
+# include "firmware/mc02/app/src/usb/helper.hpp"
 
 namespace libhcs::firmware::diag {
 namespace {
@@ -73,8 +73,8 @@ void note_main_loop() { main_loop_count++; }
 void poll() {
     // timepoint() 以 1/4 微秒为单位计数(1 MHz 定时器, CNT << 2), 4000 tick 为 1 ms。
     // 约 18 min 回绕; 只使用差值。
-    const auto now_ms = static_cast<std::uint32_t>(
-        timer::timer->timepoint().time_since_epoch().count() / 4000U);
+    const auto now_ms =
+        static_cast<std::uint32_t>(timer::timer->timepoint().time_since_epoch().count() / 4000U);
     if (now_ms - last_emit_ms < kEmitPeriodMs)
         return;
     last_emit_ms = now_ms;
@@ -115,7 +115,11 @@ void poll() {
     // 序号出现空洞本身就是值得上位机看到的症状。
     (void)serializer.write_uart(
         static_cast<core::protocol::FieldId>(data::DataId::kUart0),
-        {.uart_data = {record, kRecordSize}, .idle_delimited = true}, {});
+        {
+            .uart_data = {record, kRecordSize},
+              .idle_delimited = true
+    },
+        {});
 }
 
 } // namespace libhcs::firmware::diag

@@ -58,6 +58,12 @@ jobs:
       - name: Build firmware/c_board
         run: cmake --build firmware/c_board/build --target c_board_app c_board_bootloader
 
+      - name: Configure firmware/mc02
+        run: cmake --preset debug -S firmware/mc02
+
+      - name: Build firmware/mc02
+        run: cmake --build firmware/mc02/build --target mc02_app mc02_bootloader
+
       - name: Configure firmware/ch32_board
         run: cmake --preset debug -S firmware/ch32_board
 

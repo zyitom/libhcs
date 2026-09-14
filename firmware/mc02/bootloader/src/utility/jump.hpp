@@ -25,7 +25,7 @@ inline void jump_to_app(uint32_t app_address) {
 
     SysTick->CTRL = 0;
     SysTick->LOAD = 0;
-    SysTick->VAL  = 0;
+    SysTick->VAL = 0;
 
     for (uint32_t i = 0; i < (sizeof(NVIC->ICER) / sizeof(NVIC->ICER[0])); ++i) {
         NVIC->ICER[i] = 0xFFFFFFFFU;

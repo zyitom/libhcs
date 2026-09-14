@@ -68,11 +68,11 @@ public:
 
 private:
     static bool priority_inheritance_enabled() noexcept {
-        static const bool enabled = [] {
+        static const bool kEnabled = [] {
             const char* const disable = std::getenv("libhcs_USB_PI_MUTEX");
-            return !(disable && disable[0] == '0');
+            return disable == nullptr || disable[0] != '0';
         }();
-        return enabled;
+        return kEnabled;
     }
 
     pthread_mutex_t mutex_;

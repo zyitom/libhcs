@@ -55,7 +55,8 @@ bool capture_enabled = false;
 constexpr std::uint32_t kIsrSigmaCycles = 75;
 constexpr std::uint32_t kCaptureWorthwhileCycles = kIsrSigmaCycles / 3U;
 
-void capture_init() {
+// Only referenced from an if-constexpr branch that TIME_SYNC=OFF discards.
+[[maybe_unused]] void capture_init() {
     if constexpr (!timebase::kEnabled)
         return;
 

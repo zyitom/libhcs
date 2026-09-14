@@ -12,9 +12,11 @@ host:
 
 hpm_board:
   cmake: firmware/hpm_board/CMakeLists.txt
+  # core/ is left to host, c_board and mc02. Most entries in this superbuild's
+  # compilation database are HPM SDK C files without core/include on their
+  # include path, and clang-tidy borrows one of them to parse a core header
+  # ("libhcs/spec/gpio.hpp file not found").
   folders:
-    - core/src
-    - core/include
     - firmware/hpm_board/app/src
     - firmware/hpm_board/app/include
     - firmware/hpm_board/bootloader/src
@@ -29,6 +31,16 @@ c_board:
     - firmware/c_board/app/include
     - firmware/c_board/bootloader/src
     - firmware/c_board/bootloader/include
+
+mc02:
+  cmake: firmware/mc02/CMakeLists.txt
+  folders:
+    - core/src
+    - core/include
+    - firmware/mc02/app/src
+    - firmware/mc02/app/include
+    - firmware/mc02/bootloader/src
+    - firmware/mc02/bootloader/include
 
 ch32_board:
   cmake: firmware/ch32_board/CMakeLists.txt

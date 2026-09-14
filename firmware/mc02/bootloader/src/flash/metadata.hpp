@@ -22,7 +22,7 @@ public:
         return image_metadata;
     }
 
-    bool is_ready()    const { return latest_valid_slot_state_ == DataSlotState::kReady; }
+    bool is_ready() const { return latest_valid_slot_state_ == DataSlotState::kReady; }
     bool is_flashing() const { return latest_valid_slot_state_ == DataSlotState::kFlashing; }
 
     // 构造时锁存, 先于任何可能改写状态的操作: 只有 flashing 标记而没有其后的
@@ -91,11 +91,11 @@ private:
     }
 
     static constexpr uintptr_t kMetadataStartAddress = 0x08020000U; // 扇区 1
-    static constexpr uintptr_t kMetadataEndAddress   = 0x08040000U;
+    static constexpr uintptr_t kMetadataEndAddress = 0x08040000U;
 
-    static constexpr uint32_t kFlashWordErased    = 0xFFFFFFFF;
+    static constexpr uint32_t kFlashWordErased = 0xFFFFFFFF;
     static constexpr uint32_t kImageMetadataMagic = 0x48435331; // "HCS1"
-    static constexpr uint32_t kImageStateReady    = 0x494D5244; // "IMRD"
+    static constexpr uint32_t kImageStateReady = 0x494D5244;    // "IMRD"
 
     enum class DataSlotState : uint8_t { kFatal, kEmpty, kFlashing, kReady };
 
@@ -108,7 +108,7 @@ private:
         // 了维持 flash 上槽布局与步长不变, 旧版 bootloader 写出的扇区仍能正确读回。
         // 该字段保持擦除态。
         uint32_t reserved;
-        uint8_t  pad[16];
+        uint8_t pad[16];
 
         DataSlotState read_state() const {
             switch (magic) {
@@ -123,8 +123,7 @@ private:
                 if (image_state == kImageStateReady && image_size <= kAppMaxImageSize)
                     return DataSlotState::kReady;
                 return DataSlotState::kFatal;
-            default:
-                return DataSlotState::kFatal;
+            default: return DataSlotState::kFatal;
             }
         }
 
@@ -147,10 +146,10 @@ private:
     private:
         bool write_flash_word(uint32_t magic_val, uint32_t state_val, uint32_t size_val) {
             alignas(32) DataSlot buf{};
-            buf.magic       = magic_val;
+            buf.magic = magic_val;
             buf.image_state = state_val;
-            buf.image_size  = size_val;
-            buf.reserved    = kFlashWordErased;
+            buf.image_size = size_val;
+            buf.reserved = kFlashWordErased;
             std::memset(buf.pad, 0xFF, sizeof(buf.pad));
 
             const auto guard = UnlockGuard();
@@ -173,8 +172,7 @@ private:
     }
 
     void scan_latest_valid_slot() {
-        latest_valid_slot_ =
-            reinterpret_cast<DataSlot*>(kMetadataStartAddress);
+        latest_valid_slot_ = reinterpret_cast<DataSlot*>(kMetadataStartAddress);
         latest_valid_slot_state_ = DataSlotState::kEmpty;
 
         for (uintptr_t addr = kMetadataStartAddress; addr < kMetadataEndAddress;
@@ -205,8 +203,8 @@ private:
     bool erase_and_rescan() {
         FLASH_EraseInitTypeDef erase{};
         erase.TypeErase = FLASH_TYPEERASE_SECTORS;
-        erase.Banks     = FLASH_BANK_1;
-        erase.Sector    = FLASH_SECTOR_1;
+        erase.Banks = FLASH_BANK_1;
+        erase.Sector = FLASH_SECTOR_1;
         erase.NbSectors = 1;
 
         uint32_t sector_error = 0U;
@@ -220,13 +218,12 @@ private:
         // bootloader 无缓存运行(见 main.cpp), 无需 D-cache 维护。
 
         scan_latest_valid_slot();
-        return latest_valid_slot_ != nullptr
-            && latest_valid_slot_state_ == DataSlotState::kEmpty;
+        return latest_valid_slot_ != nullptr && latest_valid_slot_state_ == DataSlotState::kEmpty;
     }
 
-    DataSlot*     latest_valid_slot_       = nullptr;
+    DataSlot* latest_valid_slot_ = nullptr;
     DataSlotState latest_valid_slot_state_ = DataSlotState::kFatal;
-    bool          previous_session_interrupted_ = false;
+    bool previous_session_interrupted_ = false;
 };
 
 } // namespace libhcs::firmware::flash

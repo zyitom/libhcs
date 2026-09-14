@@ -43,9 +43,9 @@ struct CanPort {
 // 表序即总线序: 下标 0 对应丝印 CAN1(kCan1), 依此类推, 与
 // core/include/libhcs/spec/mc02/can.hpp 及 can.cpp 的 ISR 分发一致。三处需同步维护。
 inline constexpr CanPort kCanPorts[] = {
-    {&hfdcan1, data::DataId::kCan1, CanMode::kCanFd},
-    {&hfdcan2, data::DataId::kCan2, CanMode::kCanFd},
-    {&hfdcan3, data::DataId::kCan3, CanMode::kCanFd},
+    {.handle = &hfdcan1, .data_id = data::DataId::kCan1, .mode = CanMode::kCanFd},
+    {.handle = &hfdcan2, .data_id = data::DataId::kCan2, .mode = CanMode::kCanFd},
+    {.handle = &hfdcan3, .data_id = data::DataId::kCan3, .mode = CanMode::kCanFd},
 };
 inline constexpr size_t kCanCount = std::size(kCanPorts);
 static_assert(kCanCount == 3);
@@ -214,8 +214,7 @@ private:
 
         core::utility::assert_always(HAL_FDCAN_Start(hal_can_handle_) == ok);
         core::utility::assert_always(
-            HAL_FDCAN_ActivateNotification(
-                hal_can_handle_, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0)
+            HAL_FDCAN_ActivateNotification(hal_can_handle_, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0)
             == ok);
         // 总线关闭恢复: 本板是转发桥, 瞬时线路故障(下游节点拔掉、无 ACK)不能让端口
         // 挂死到重启为止。该通知触发 HAL_FDCAN_ErrorStatusCallback(见 can.cpp),

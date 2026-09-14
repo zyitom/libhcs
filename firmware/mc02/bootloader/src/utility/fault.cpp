@@ -26,6 +26,7 @@ extern "C" void libhcs_fault_recover(void) {}
 //
 // 清除该组全部 6 根线而非仅 .ioc 当前使用的两根, 以防重新生成的 gpio.c 使能
 // 10..15 中的其他引脚时挂死复现。
+// NOLINTNEXTLINE(readability-identifier-naming): vector table symbol name.
 extern "C" void EXTI15_10_IRQHandler(void) {
     __HAL_GPIO_EXTI_CLEAR_IT(
         GPIO_PIN_10 | GPIO_PIN_11 | GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15);

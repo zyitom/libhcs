@@ -24,7 +24,7 @@ int main() {
 
     RCC_PeriphCLKInitTypeDef usb_clk = {};
     usb_clk.PeriphClockSelection = RCC_PERIPHCLK_USB;
-    usb_clk.UsbClockSelection    = RCC_USBCLKSOURCE_HSI48;
+    usb_clk.UsbClockSelection = RCC_USBCLKSOURCE_HSI48;
     libhcs::firmware::utility::assert_always(HAL_RCCEx_PeriphCLKConfig(&usb_clk) == HAL_OK);
     HAL_PWREx_EnableUSBVoltageDetector();
     __HAL_RCC_USB_OTG_HS_CLK_ENABLE();
@@ -50,12 +50,16 @@ int main() {
     // 走到这里即进入 DFU。按上方判定的优先级上报原因: 按键优先于一切, 其次是
     // 主机显式请求, 再次是上次半途而废的会话, 其余情况即镜像不可用。必须在
     // tusb_rhport_init() 之前设置 -- 字符串描述符只在枚举时读取, 此后不再刷新。
-    usb::get_usb_descriptors().set_entry_reason(
-        force_stay ? usb::DfuEntryReason::kUserKey
-        : force_dfu ? usb::DfuEntryReason::kHostRequest
-        : flash::Metadata::get_instance().previous_session_interrupted()
-            ? usb::DfuEntryReason::kInterrupted
-            : usb::DfuEntryReason::kNoValidApp);
+    const auto entry_reason = [&] {
+        if (force_stay)
+            return usb::DfuEntryReason::kUserKey;
+        if (force_dfu)
+            return usb::DfuEntryReason::kHostRequest;
+        if (flash::Metadata::get_instance().previous_session_interrupted())
+            return usb::DfuEntryReason::kInterrupted;
+        return usb::DfuEntryReason::kNoValidApp;
+    }();
+    usb::get_usb_descriptors().set_entry_reason(entry_reason);
 
     utility::assert_always(tusb_rhport_init(0, nullptr));
 

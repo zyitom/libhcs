@@ -55,6 +55,18 @@ constexpr std::string_view transfer_status_name(libusb_transfer_status status) n
     return "UNKNOWN";
 }
 
+// The opt-in diagnostic dumps below write their own line format straight to
+// stderr, bypassing the logger prefix. Formatted into a stack buffer like the
+// logger itself, so a dump from a noexcept teardown path never allocates.
+template <typename... Args>
+void print_to_stderr(std::format_string<Args...> fmt, Args&&... args) noexcept {
+    std::array<char, 256> line;
+    const auto result =
+        std::format_to_n(line.data(), line.size(), fmt, std::forward<Args>(args)...);
+    const auto length = std::min(static_cast<std::size_t>(result.size), line.size());
+    (void)std::fwrite(line.data(), 1, length, stderr);
+}
+
 } // namespace
 
 class Usb : public Transport {
@@ -380,7 +392,8 @@ public:
         if (handle == nullptr) [[unlikely]] {
             logger_.warn(
                 "EP0 vendor request 0x{:02x} (index {}) skipped: device handle is down between "
-                "a fault and a re-open", request, index);
+                "a fault and a re-open",
+                request, index);
             return ControlResult::kFailed;
         }
 
@@ -407,8 +420,8 @@ public:
         if (std::cmp_not_equal(ret, payload.size())) {
             logger_.error(
                 "EP0 vendor request 0x{:02x} (index {}) short transfer: {} of {} bytes -- the "
-                "two sides disagree about the payload layout", request, index, ret,
-                payload.size());
+                "two sides disagree about the payload layout",
+                request, index, ret, payload.size());
             return ControlResult::kFailed;
         }
         return ControlResult::kOk;
@@ -669,9 +682,8 @@ private:
     bool wait_for_board_arrival(std::chrono::milliseconds bound) {
         const uint64_t seen = board_arrivals_.load(std::memory_order::relaxed);
         std::unique_lock guard{board_arrived_mutex_};
-        return board_arrived_cv_.wait_for(guard, bound, [&] {
-            return board_arrivals_.load(std::memory_order::relaxed) != seen;
-        });
+        return board_arrived_cv_.wait_for(
+            guard, bound, [&] { return board_arrivals_.load(std::memory_order::relaxed) != seen; });
     }
 
     // select_device with an arrival-aware second chance: the first scan fails
@@ -1436,9 +1448,8 @@ private:
             libusb_device_handle_ == nullptr
                 ? LIBUSB_ERROR_OTHER
                 : libusb_get_max_packet_size(libusb_get_device(libusb_device_handle_), kInEndpoint);
-        fprintf(
-            stderr, "[rx-histogram] %llu transfers, %llu bytes, mean %.1f B/transfer\n",
-            static_cast<unsigned long long>(total), static_cast<unsigned long long>(bytes),
+        print_to_stderr(
+            "[rx-histogram] {} transfers, {} bytes, mean {:.1f} B/transfer\n", total, bytes,
             static_cast<double>(bytes) / static_cast<double>(total));
         const double marks[] = {0.01, 0.50, 0.90, 0.99, 1.00};
         uint64_t seen = 0;
@@ -1447,12 +1458,12 @@ private:
             seen += rx_length_histogram_[size].load(std::memory_order::relaxed);
             while (mark < 5
                    && static_cast<double>(seen) >= marks[mark] * static_cast<double>(total)) {
-                fprintf(stderr, "[rx-histogram]   p%-3.0f %4zu B", marks[mark] * 100.0, size);
+                print_to_stderr("[rx-histogram]   p{:<3.0f} {:4} B", marks[mark] * 100.0, size);
                 if (mps > 0)
-                    fprintf(
-                        stderr, "  = %.2f x mps(%d), last packet %zu/%d B full",
+                    print_to_stderr(
+                        "  = {:.2f} x mps({}), last packet {}/{} B full",
                         static_cast<double>(size) / mps, mps, size % static_cast<size_t>(mps), mps);
-                fprintf(stderr, "\n");
+                print_to_stderr("\n");
                 mark++;
             }
         }
@@ -1474,10 +1485,9 @@ private:
             if (count == 0)
                 return;
             const auto total = static_cast<double>(stats.total_ns.load(std::memory_order::relaxed));
-            fprintf(
-                stderr, "[cb-timing] %-8s n=%llu  mean %.2f us  max %.2f us  event thread %.2f%%\n",
-                name, static_cast<unsigned long long>(count),
-                total / static_cast<double>(count) / 1000.0,
+            print_to_stderr(
+                "[cb-timing] {:<8} n={}  mean {:.2f} us  max {:.2f} us  event thread {:.2f}%\n",
+                name, count, total / static_cast<double>(count) / 1000.0,
                 static_cast<double>(stats.max_ns.load(std::memory_order::relaxed)) / 1000.0,
                 wall_ns > 0.0 ? total / wall_ns * 100.0 : 0.0);
         };
@@ -1525,7 +1535,7 @@ private:
         return new unsigned char[core::protocol::kProtocolBufferSize];
     }
 
-    void free_transfer_buffer(unsigned char* buf, bool is_dev_mem) noexcept {
+    void free_transfer_buffer(const unsigned char* buf, bool is_dev_mem) noexcept {
         // Slab-backed buffers are not individually unmappable: they are returned
         // wholesale by free_dev_mem_slabs() once nothing can reference them.
         // Counting them back in is what tells that function it is safe to run.
@@ -1686,7 +1696,7 @@ private:
     // buffers on a single-interface board (64 transmit + 16 receive) or 160 with
     // the CAN pair, both exact multiples. A larger slab would round back up --
     // 64 KiB mapped 128 KiB for the same 80 KiB of payload.
-    static constexpr size_t kDevMemSlabSize = 16 * 1024;
+    static constexpr size_t kDevMemSlabSize = size_t{16} * 1024U;
     // Buffers are handed straight to the controller, so give each one its own
     // cache line instead of letting two share the line at a slab boundary.
     static constexpr size_t kDevMemBufferStride =

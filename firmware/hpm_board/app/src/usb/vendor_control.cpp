@@ -48,12 +48,21 @@ struct LastConfigError {
     uint32_t value;
 };
 
-LastConfigError g_last_config_error{0, static_cast<uint8_t>(vc::ConfigErrorReason::kConfigErrorNone), 0, 0};
+LastConfigError g_last_config_error{
+    .request = 0,
+    .reason = static_cast<uint8_t>(vc::ConfigErrorReason::kConfigErrorNone),
+    .index = 0,
+    .value = 0,
+};
 
-void record_config_error(vc::Request request, uint16_t index, vc::ConfigErrorReason reason,
-                         uint32_t value = 0) {
-    g_last_config_error = {static_cast<uint8_t>(request), static_cast<uint8_t>(reason), index,
-                           value};
+void record_config_error(
+    vc::Request request, uint16_t index, vc::ConfigErrorReason reason, uint32_t value = 0) {
+    g_last_config_error = {
+        .request = static_cast<uint8_t>(request),
+        .reason = static_cast<uint8_t>(reason),
+        .index = index,
+        .value = value,
+    };
 }
 
 // 板子对自身的描述, 按请求现场组装而非缓存: hpm5321 镜像服务两块 PCB,
@@ -126,35 +135,40 @@ bool handle_setup(uint8_t rhport, const tusb_control_request_t* request) {
 
     case vc::Request::kGetCanConfig: {
         if (request->bmRequestType != vc::kRequestTypeIn || !can_index_valid(index)) {
-            record_config_error(vc::Request::kGetCanConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorBadIndex);
+            record_config_error(
+                vc::Request::kGetCanConfig, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
             return false;
         }
         // 硬件事实而非"上次请求": 模式即编译期端口表的值; 数据段速率仅在该模式
         // 确实是 FD 时有意义(本板 classic 编译从不出现, 保守返回 0)。
         const bool fd = can_mode(index) == vc::CanMode::kCanFd;
-        return reply(rhport, request, vc::CanConfigPayload{
-            .mode = static_cast<uint8_t>(can_mode(index)),
-            .control = 0,
-            .reserved0 = 0,
-            .arbitration_baudrate = can::Can::kArbitrationBaudrate,
-            .data_baudrate = fd ? can::Can::kCanFdDataBaudrate : 0,
-            .nominal_sample_point = can::Can::kNominalSamplePointPerMille,
-            .data_sample_point = fd ? can::Can::kDataSamplePointPerMille : 0,
-            .reserved1 = 0,
-        });
+        return reply(
+            rhport, request,
+            vc::CanConfigPayload{
+                .mode = static_cast<uint8_t>(can_mode(index)),
+                .control = 0,
+                .reserved0 = 0,
+                .arbitration_baudrate = can::Can::kArbitrationBaudrate,
+                .data_baudrate = fd ? can::Can::kCanFdDataBaudrate : 0,
+                .nominal_sample_point = can::Can::kNominalSamplePointPerMille,
+                .data_sample_point =
+                    static_cast<uint16_t>(fd ? can::Can::kDataSamplePointPerMille : 0),
+                .reserved1 = 0,
+            });
     }
 
     case vc::Request::kGetLastConfigError: {
         if (request->bmRequestType != vc::kRequestTypeIn || index != 0)
             return false;
-        return reply(rhport, request, vc::LastConfigErrorPayload{
-            .request = g_last_config_error.request,
-            .reason = g_last_config_error.reason,
-            .index = g_last_config_error.index,
-            .value = g_last_config_error.value,
-            .reserved = 0,
-        });
+        return reply(
+            rhport, request,
+            vc::LastConfigErrorPayload{
+                .request = g_last_config_error.request,
+                .reason = g_last_config_error.reason,
+                .index = g_last_config_error.index,
+                .value = g_last_config_error.value,
+                .reserved = 0,
+            });
     }
 
     case vc::Request::kGetLatencyBreakdown: {
@@ -208,25 +222,27 @@ bool handle_setup(uint8_t rhport, const tusb_control_request_t* request) {
 
     case vc::Request::kGetUartConfig: {
         if (request->bmRequestType != vc::kRequestTypeIn || !uart_index_valid(index)) {
-            record_config_error(vc::Request::kGetUartConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorBadIndex);
+            record_config_error(
+                vc::Request::kGetUartConfig, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
             return false;
         }
         const uart::Uart* port = uart::uart_array[index].try_get();
         if (port == nullptr) {
-            record_config_error(vc::Request::kGetUartConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorBadIndex);
+            record_config_error(
+                vc::Request::kGetUartConfig, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
             return false;
         }
         // 硬件事实而非"上次请求": 波特率从实际写入的分频器与过采样率重建,
         // 帧格式从 LCR 解码; control 恒为 0。
-        return reply(rhport, request, vc::UartConfigPayload{
-            .baudrate = port->effective_baudrate(),
-            .word_length = static_cast<uint8_t>(port->word_length()),
-            .parity = static_cast<uint8_t>(port->parity()),
-            .stop_bits = static_cast<uint8_t>(port->stop_bits()),
-            .control = 0,
-        });
+        return reply(
+            rhport, request,
+            vc::UartConfigPayload{
+                .baudrate = port->effective_baudrate(),
+                .word_length = static_cast<uint8_t>(port->word_length()),
+                .parity = static_cast<uint8_t>(port->parity()),
+                .stop_bits = static_cast<uint8_t>(port->stop_bits()),
+                .control = 0,
+            });
     }
 
     case vc::Request::kSetCanConfig:
@@ -262,13 +278,15 @@ bool handle_data(const tusb_control_request_t* request) {
     case vc::Request::kSetCanConfig: {
         const auto payload = staged<vc::CanConfigPayload>();
         if (payload.mode > static_cast<uint8_t>(vc::CanMode::kCanFd)) {
-            record_config_error(vc::Request::kSetCanConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorBadRequest, payload.mode);
+            record_config_error(
+                vc::Request::kSetCanConfig, index, vc::ConfigErrorReason::kConfigErrorBadRequest,
+                payload.mode);
             return false;
         }
         if ((payload.control & ~vc::kCanConfigApply) != 0U) {
-            record_config_error(vc::Request::kSetCanConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorBadRequest, payload.control);
+            record_config_error(
+                vc::Request::kSetCanConfig, index, vc::ConfigErrorReason::kConfigErrorBadRequest,
+                payload.control);
             return false;
         }
         // 速率字段是核对不是配置(位时序是本板实测整定的事实): 非零就必须与编译
@@ -277,23 +295,24 @@ bool handle_data(const tusb_control_request_t* request) {
             && payload.arbitration_baudrate != can::Can::kArbitrationBaudrate)
             return false;
         if (payload.data_baudrate != 0 && payload.data_baudrate != can::Can::kCanFdDataBaudrate) {
-            record_config_error(vc::Request::kSetCanConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorRateUnrepresentable,
-                                payload.data_baudrate);
+            record_config_error(
+                vc::Request::kSetCanConfig, index,
+                vc::ConfigErrorReason::kConfigErrorRateUnrepresentable, payload.data_baudrate);
             return false;
         }
         if (payload.nominal_sample_point != 0
             && payload.nominal_sample_point != can::Can::kNominalSamplePointPerMille) {
-            record_config_error(vc::Request::kSetCanConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorRateUnrepresentable,
-                                payload.nominal_sample_point);
+            record_config_error(
+                vc::Request::kSetCanConfig, index,
+                vc::ConfigErrorReason::kConfigErrorRateUnrepresentable,
+                payload.nominal_sample_point);
             return false;
         }
         if (payload.data_sample_point != 0
             && payload.data_sample_point != can::Can::kDataSamplePointPerMille) {
-            record_config_error(vc::Request::kSetCanConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorRateUnrepresentable,
-                                payload.data_sample_point);
+            record_config_error(
+                vc::Request::kSetCanConfig, index,
+                vc::ConfigErrorReason::kConfigErrorRateUnrepresentable, payload.data_sample_point);
             return false;
         }
         // 只校验, 不应用: 本板不设 kCapCanModeSettable 位 -- 控制器以 enable_canfd
@@ -301,8 +320,9 @@ bool handle_data(const tusb_control_request_t* request) {
         // 的采样点/TDC/PTPC 时基全部置于风险之下, 见 CanConfigPayload。kCanConfigApply
         // 位在本板没有语义: 请求与编译期模式一致才 ACK, 否则一律 STALL。
         if (static_cast<vc::CanMode>(payload.mode) != can_mode(index)) {
-            record_config_error(vc::Request::kSetCanConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorModeFixed, payload.mode);
+            record_config_error(
+                vc::Request::kSetCanConfig, index, vc::ConfigErrorReason::kConfigErrorModeFixed,
+                payload.mode);
             return false;
         }
         return true;
@@ -311,14 +331,15 @@ bool handle_data(const tusb_control_request_t* request) {
     case vc::Request::kSetUartConfig: {
         const auto payload = staged<vc::UartConfigPayload>();
         if ((payload.control & ~vc::kUartConfigApply) != 0U) {
-            record_config_error(vc::Request::kSetUartConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorBadRequest, payload.control);
+            record_config_error(
+                vc::Request::kSetUartConfig, index, vc::ConfigErrorReason::kConfigErrorBadRequest,
+                payload.control);
             return false;
         }
         uart::Uart* port = uart::uart_array[index].try_get();
         if (port == nullptr) {
-            record_config_error(vc::Request::kSetUartConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorBadIndex);
+            record_config_error(
+                vc::Request::kSetUartConfig, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
             return false;
         }
 
@@ -328,16 +349,17 @@ bool handle_data(const tusb_control_request_t* request) {
         // 为纯断言: 每个非零字段都必须与端口当前状态一致 -- 波特率用 5% 容差
         // (与主机读回同一约定), 帧格式精确比对。
         if (!port->check_framing(payload.word_length, payload.parity, payload.stop_bits)) {
-            record_config_error(vc::Request::kSetUartConfig, index,
-                                vc::ConfigErrorReason::kConfigErrorFramingUnsupported);
+            record_config_error(
+                vc::Request::kSetUartConfig, index,
+                vc::ConfigErrorReason::kConfigErrorFramingUnsupported);
             return false;
         }
 
         if ((payload.control & vc::kUartConfigApply) != 0U) {
             if (payload.baudrate != 0U && !port->set_baudrate(payload.baudrate)) {
-                record_config_error(vc::Request::kSetUartConfig, index,
-                                    vc::ConfigErrorReason::kConfigErrorRateUnrepresentable,
-                                    payload.baudrate);
+                record_config_error(
+                    vc::Request::kSetUartConfig, index,
+                    vc::ConfigErrorReason::kConfigErrorRateUnrepresentable, payload.baudrate);
                 return false;
             }
             port->commit_framing(payload.word_length, payload.parity, payload.stop_bits);
@@ -346,13 +368,12 @@ bool handle_data(const tusb_control_request_t* request) {
 
         if (payload.baudrate != 0U) {
             const uint32_t effective = port->effective_baudrate();
-            const uint64_t error = effective > payload.baudrate
-                                     ? effective - payload.baudrate
-                                     : payload.baudrate - effective;
+            const uint64_t error = effective > payload.baudrate ? effective - payload.baudrate
+                                                                : payload.baudrate - effective;
             if (error * 100U > static_cast<uint64_t>(payload.baudrate) * 5U) {
-                record_config_error(vc::Request::kSetUartConfig, index,
-                                    vc::ConfigErrorReason::kConfigErrorRateUnrepresentable,
-                                    payload.baudrate);
+                record_config_error(
+                    vc::Request::kSetUartConfig, index,
+                    vc::ConfigErrorReason::kConfigErrorRateUnrepresentable, payload.baudrate);
                 return false;
             }
         }
@@ -360,9 +381,7 @@ bool handle_data(const tusb_control_request_t* request) {
             return false;
         if (payload.parity != 0U && payload.parity != port->parity())
             return false;
-        if (payload.stop_bits != 0U && payload.stop_bits != port->stop_bits())
-            return false;
-        return true;
+        return payload.stop_bits == 0U || payload.stop_bits == port->stop_bits();
     }
 
     default: return false;

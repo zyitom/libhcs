@@ -125,7 +125,18 @@ inline void poll(std::uint32_t) {}
 inline std::uint32_t microframes_per_sof() { return 1; }
 inline std::uint32_t sof_packet_delay_ns() { return 0; }
 inline void apply_anchor(std::uint64_t) {}
-inline Snapshot snapshot() { return {data::TimeState::kInvalid, 0, 0, 0, 0, 0, 0, 0}; }
+inline Snapshot snapshot() {
+    return {
+        .state = data::TimeState::kInvalid,
+        .microframe = 0,
+        .timestamp_quarter_us = 0,
+        .ticks_per_microframe_q16 = 0,
+        .anomaly_count = 0,
+        .residual_mean_q16 = 0,
+        .residual_abs_max_q16 = 0,
+        .residual_count = 0,
+    };
+}
 inline Snapshot report() { return snapshot(); }
 inline bool local_time_of(std::uint64_t, std::uint64_t&) { return false; }
 inline bool microframe_at(std::uint64_t, std::uint64_t&) { return false; }

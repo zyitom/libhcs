@@ -10,9 +10,9 @@
 namespace libhcs::firmware::flash {
 
 inline constexpr uint32_t kDtcmramStart = 0x20000000U;
-inline constexpr uint32_t kDtcmramEnd   = 0x20020000U; // 不含
-inline constexpr uint32_t kAxiSramStart  = 0x24000000U;
-inline constexpr uint32_t kAxiSramEnd    = 0x24020000U; // 不含
+inline constexpr uint32_t kDtcmramEnd = 0x20020000U;                     // 不含
+inline constexpr uint32_t kAxiSramStart = 0x24000000U;
+inline constexpr uint32_t kAxiSramEnd = 0x24020000U;                     // 不含
 inline constexpr uint32_t kImageHashMagic = 0x48415348U;                 // "HASH"
 inline constexpr uint32_t kImageHashSuffixSize =
     sizeof(uint32_t) + static_cast<uint32_t>(crypto::kSha256DigestSize); // 36
@@ -25,7 +25,7 @@ inline bool is_vector_table_valid() {
     // 初始 MSP 允许恰好等于 RAM 区域末尾: Cortex-M 栈向下生长, 复位代码常把 SP
     // 设为最后一个有效 RAM 地址 +1。
     const bool valid_dtcm = (initial_msp >= kDtcmramStart && initial_msp <= kDtcmramEnd);
-    const bool valid_axi  = (initial_msp >= kAxiSramStart  && initial_msp <= kAxiSramEnd);
+    const bool valid_axi = (initial_msp >= kAxiSramStart && initial_msp <= kAxiSramEnd);
     if (!valid_dtcm && !valid_axi)
         return false;
 

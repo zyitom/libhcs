@@ -39,13 +39,10 @@ public:
 
     static constexpr TIM_HandleTypeDef* kTimer = &htim5;
 
-    Timer() {
-        core::utility::assert_always(HAL_TIM_Base_Start(kTimer) == HAL_OK);
-    }
+    Timer() { core::utility::assert_always(HAL_TIM_Base_Start(kTimer) == HAL_OK); }
 
-    TimePoint timepoint() const {
-        return TimePoint{Duration{kTimer->Instance->CNT << 2u}};
-    }
+    // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
+    TimePoint timepoint() const { return TimePoint{Duration{kTimer->Instance->CNT << 2U}}; }
 
     [[nodiscard]] bool check_expired(TimePoint start_point, Duration delay) const {
         core::utility::assert_debug(delay.count() <= kMaxDurationTicks);

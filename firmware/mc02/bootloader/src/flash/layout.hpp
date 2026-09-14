@@ -9,9 +9,9 @@ namespace libhcs::firmware::flash {
 
 // STM32H723 单 bank flash: 8 个扇区, 每扇区 128 KB。
 // 扇区 0: Bootloader | 扇区 1: Metadata | 扇区 2-7: App
-inline constexpr uintptr_t kAppStartAddress  = 0x08040000U;
-inline constexpr uintptr_t kAppEndAddress    = 0x08100000U; // 不含
-inline constexpr size_t    kAppMaxImageSize  = kAppEndAddress - kAppStartAddress;
+inline constexpr uintptr_t kAppStartAddress = 0x08040000U;
+inline constexpr uintptr_t kAppEndAddress = 0x08100000U; // 不含
+inline constexpr size_t kAppMaxImageSize = kAppEndAddress - kAppStartAddress;
 
 struct SectorRange {
     uint32_t start;

@@ -73,9 +73,12 @@ void hcs_usb0_isr(void) {
     dcd_int_handler(0);
 }
 
-void tud_vendor_rx_cb(uint8_t itf, const uint8_t* buffer, uint16_t size) {
+// size 必须与 TinyUSB 0.21 的声明同为 uint32_t: 两份 extern "C" 声明类型不一致时 GCC 不报,
+// 但调用方按 uint32_t 传参。
+void tud_vendor_rx_cb(uint8_t itf, const uint8_t* buffer, uint32_t size) {
     const bool finished = size < g_packet_size;
-    const uint16_t payload_size = std::min<uint16_t>(size, CFG_TUD_VENDOR_EPSIZE);
+    const auto payload_size =
+        static_cast<uint16_t>(std::min<uint32_t>(size, CFG_TUD_VENDOR_EPSIZE));
 
     if (itf != 0) [[unlikely]]
         return;

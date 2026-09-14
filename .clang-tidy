@@ -120,6 +120,9 @@ CheckOptions:
   readability-identifier-naming.EnumConstantCase: CamelCase
   readability-identifier-naming.EnumConstantPrefix: k
   readability-identifier-naming.MacroDefinitionCase: UPPER_CASE
+  # Project macros share the libhcs_ prefix with the CMake options that define
+  # them (libhcs_APP_*, libhcs_PROJECT_VERSION_STRING); keep that spelling.
+  readability-identifier-naming.MacroDefinitionIgnoredRegexp: "^libhcs_[A-Z0-9_]+$"
 
   cppcoreguidelines-special-member-functions.AllowImplicitlyDeletedCopyOrMove: true
   cppcoreguidelines-special-member-functions.AllowMissingMoveFunctionsWhenCopyIsDeleted: true

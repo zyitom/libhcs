@@ -49,7 +49,7 @@ public:
             default: return nullptr;
             }
 
-            constexpr auto kMaxSize = std::min<size_t>(
+            static constexpr auto kMaxSize = std::min<size_t>(
                 std::tuple_size_v<decltype(string_buffer_)> - 1,
                 (std::numeric_limits<uint8_t>::max() - 2) / 2);
 
@@ -58,8 +58,7 @@ public:
                 string_buffer_[i + 1] = static_cast<uint16_t>(str[i]);
         }
 
-        string_buffer_[0] =
-            (TUSB_DESC_STRING << 8) | static_cast<uint16_t>((2u * str_size) + 2u);
+        string_buffer_[0] = (TUSB_DESC_STRING << 8) | static_cast<uint16_t>((2U * str_size) + 2U);
         return string_buffer_.data();
     }
 
@@ -72,7 +71,7 @@ private:
 
         auto* cursor = serial_string_.data() + 3;
         for (const auto& word : uid) {
-            cursor = write_hex_u16(static_cast<uint16_t>(word >> 16u), cursor) + 1;
+            cursor = write_hex_u16(static_cast<uint16_t>(word >> 16U), cursor) + 1;
             cursor = write_hex_u16(static_cast<uint16_t>(word), cursor) + 1;
         }
         core::utility::assert_debug(cursor == serial_string_.data() + serial_string_.size());
@@ -80,19 +79,30 @@ private:
 
     static constexpr void mix_uid_entropy(std::array<uint32_t, 3>& uid) {
         auto& [a, b, c] = uid;
-        const auto mix = [](uint32_t v) { v *= 0x9E3779B9u; return v ^ (v >> 16u); };
-        a ^= mix(b ^ c); b ^= mix(a ^ c); c ^= mix(a ^ b);
-        a ^= mix(b + c); b ^= mix(a + c); c ^= mix(a + b);
-        a ^= mix(b ^ (c >> 5u)); b ^= mix(a ^ (c << 5u)); c ^= mix(a ^ b);
-        a += mix(b); b += mix(c); c += mix(a);
+        const auto mix = [](uint32_t v) {
+            v *= 0x9E3779B9U;
+            return v ^ (v >> 16U);
+        };
+        a ^= mix(b ^ c);
+        b ^= mix(a ^ c);
+        c ^= mix(a ^ b);
+        a ^= mix(b + c);
+        b ^= mix(a + c);
+        c ^= mix(a + b);
+        a ^= mix(b ^ (c >> 5U));
+        b ^= mix(a ^ (c << 5U));
+        c ^= mix(a ^ b);
+        a += mix(b);
+        b += mix(c);
+        c += mix(a);
     }
 
     static char* write_hex_u16(uint16_t value, char* buf) {
         static constexpr char kHex[] = "0123456789ABCDEF";
-        *buf++ = kHex[(value >> 12u) & 0xFu];
-        *buf++ = kHex[(value >> 8u) & 0xFu];
-        *buf++ = kHex[(value >> 4u) & 0xFu];
-        *buf++ = kHex[value & 0xFu];
+        *buf++ = kHex[(value >> 12U) & 0xFU];
+        *buf++ = kHex[(value >> 8U) & 0xFU];
+        *buf++ = kHex[(value >> 4U) & 0xFU];
+        *buf++ = kHex[value & 0xFU];
         return buf;
     }
 
@@ -132,7 +142,7 @@ private: // 配置描述符
 
     // vendor 批量端点号。usb/vendor.hpp 的下行流控审计钩子要读 OUT 端点的
     // 在途状态, 因此公开(与 hpm_board 的 UsbDescriptors 一致)。
-  public:
+public:
     static constexpr uint8_t kEpnumVendorDataOut = 0x01;
     static constexpr uint8_t kEpnumVendorDataIn = 0x81;
 
@@ -148,8 +158,7 @@ private: // 配置描述符
 private: // 字符串描述符
     static constexpr std::array<uint8_t, 2> kLanguageId = {0x09, 0x04};
     static constexpr std::string_view kManufacturerString = "Helios";
-    static constexpr std::string_view kProductString =
-        "HCS Slave v" libhcs_PROJECT_VERSION_STRING;
+    static constexpr std::string_view kProductString = "HCS Slave v" libhcs_PROJECT_VERSION_STRING;
     static constexpr std::string_view kDfuRuntimeString = "DFU Runtime";
     std::array<char, 33> serial_string_{"D4-0000-0000-0000-0000-0000-0000"};
 

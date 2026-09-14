@@ -43,8 +43,8 @@ public:
         if (kernel_clock_hz == 0U) [[unlikely]]
             return false;
 
-        constexpr uint32_t kBrrMin = 0x10U;
-        constexpr uint32_t kBrrMax = 0xFFFFU;
+        static constexpr uint32_t kBrrMin = 0x10U;
+        static constexpr uint32_t kBrrMax = 0xFFFFU;
 
         if (hal_uart_handle_->Init.OverSampling == UART_OVERSAMPLING_8) {
             const uint32_t usartdiv = UART_DIV_SAMPLING8(
@@ -88,8 +88,8 @@ public:
         uint32_t parity_bits = 0;
         if (parity != 0U) {
             switch (parity) {
-            case 1U: parity_bits = 0U; break; // 无校验
-            case 2U: parity_bits = USART_CR1_PCE; break; // 偶
+            case 1U: parity_bits = 0U; break;                           // 无校验
+            case 2U: parity_bits = USART_CR1_PCE; break;                // 偶
             case 3U: parity_bits = USART_CR1_PCE | USART_CR1_PS; break; // 奇
             default: return false;
             }
@@ -132,7 +132,7 @@ public:
     [[nodiscard]] uint32_t parity() const {
         const uint32_t cr1 = hal_uart_handle_->Instance->CR1;
         if ((cr1 & USART_CR1_PCE) == 0U)
-            return 1U; // 无校验
+            return 1U;                               // 无校验
         return (cr1 & USART_CR1_PS) != 0U ? 3U : 2U; // 奇 : 偶
     }
 
@@ -459,6 +459,5 @@ private:
 // R16 在本端装 120R 端接。
 [[gnu::section(".d2_sram")]] inline constinit UartRs485::Lazy uart3{data::DataId::kUart3, &huart3};
 #endif
-
 
 } // namespace libhcs::firmware::uart

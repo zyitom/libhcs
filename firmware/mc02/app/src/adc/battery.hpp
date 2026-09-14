@@ -123,7 +123,9 @@ public:
     // 平均, 与对稳定的窗口取平均同样有意义。无锁、无 cache 维护, 转发循环无需
     // 等待任何东西。
     [[nodiscard]] uint32_t raw() const {
-        if (!started_)
+        // start() asserts sample_count > 0 before setting started_; the analyzer
+        // cannot see that invariant, so the division keeps its own guard.
+        if (!started_ || config_.sample_count == 0)
             return 0;
         uint32_t sum = 0;
         for (std::size_t i = 0; i < config_.sample_count; ++i)

@@ -398,9 +398,8 @@ private:
     void configure_can(std::size_t bus, bool fd) {
         hcs::request_can_mode(handler_, bus, fd, true);
         const uint8_t bit = static_cast<uint8_t>(1U << bus);
-        interface_.can_fd_mask =
-            fd ? static_cast<uint8_t>(interface_.can_fd_mask | bit)
-               : static_cast<uint8_t>(interface_.can_fd_mask & ~bit);
+        interface_.can_fd_mask = fd ? static_cast<uint8_t>(interface_.can_fd_mask | bit)
+                                    : static_cast<uint8_t>(interface_.can_fd_mask & ~bit);
     }
 
     // mc02 uses the shared HCS vendor id (0xA511) and the fixed board-type PID
