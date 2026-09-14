@@ -16,56 +16,28 @@
 
 namespace libhcs::firmware::uart {
 
-// Continuous DMA reception into a power-of-two ring.
+// 2 的幂 ring 上的连续 DMA 接收。单个循环 DMA 传输覆盖整个 ring, 启动后从不
+// 停止或重启: USART_CR3_DMAR 在端口生命周期内保持置位, 由硬件自行回绕。
+// 写位置不经中断维护: NDTR 对整个 ring 倒计数并在回绕时重载, 消费者在
+// try_dequeue() 里直接从它推导位置。由此带来三点:
+//   - 接收服务的截止期从一个 bank (32 字节时间)放宽到一整圈
+//     (kBufferSize 字节时间), 硬件到达前无需任何中断推进缓冲地址;
+//   - RX 中断频率降到 IDLE 事件频率(921600 baud 下每口约 9000 次/秒);
+//   - 消除了唯一一处用全局 __disable_irq() 屏蔽 FDCAN 中断的地方: FDCAN 在
+//     NVIC 优先级 1, 本板的 .itcm/.dtcm 正是花在它的转发路径上。
 //
-// One circular DMA transfer spans the whole ring and is never stopped or
-// re-armed: USART_CR3_DMAR stays set for the entire life of the port and the
-// stream wraps by itself. That is the whole point of this class. The previous
-// mc02 implementation used HAL_UARTEx_ReceiveToIdle_DMA with a one-shot
-// (DMA_NORMAL) stream, and this HAL clears DMAR and aborts the stream *before*
-// invoking the RX event callback -- see UART_DMAReceiveCplt() and the IDLE
-// branch of HAL_UART_IRQHandler in
-// bsp/stm32h7xx-hal-driver/Src/stm32h7xx_hal_uart.c. Reception was therefore off
-// from that abort until the application re-armed it, and because the one-shot
-// buffer was 64 bytes, any stream longer than 64 bytes hit that window once per
-// 64 bytes and lost whatever arrived inside it.
+// 线路错误按吸收而非恢复处理: CR3.DDRE 清零使奇偶/帧/噪声错误不阻塞 DMA
+// 请求, CR3.OVRDIS 置位则完全不再上报溢出; 改这两位前必读
+// configure_rx_error_policy() 的极性说明。F407 无此两位, 勿照搬 c_board 的
+// 拆建重启方案; 本类的重启路径只服务于真正的 DMA 控制器故障, 且用到了
+// c_board 没有的 ICR(不破坏 RDR 即可清粘滞标志)和 RQR.RXFRQ(清空 16 项
+// RXFIFO)。
 //
-// The write position is not maintained by an interrupt. NDTR counts down across
-// the ring and reloads on wrap, so the consumer derives the position from it
-// directly in try_dequeue(). c_board instead runs the stream double-buffered
-// over 32-byte banks and takes an interrupt per bank to re-point the idle bank
-// and publish the position -- an interrupt per 32 bytes whose only product is a
-// number the consumer could have read for itself. Deriving it here has three
-// consequences beyond deleting the bookkeeping:
+// 消费者运行在主循环(try_dequeue), 中断路径只递增计数器、绝不触碰 USB。
 //
-//   - the deadline for servicing the stream widens from one bank (32 byte times)
-//     to a full lap of the ring (kBufferSize byte times), because no bank
-//     address has to be advanced before the hardware reaches it;
-//   - the RX interrupt rate drops to the idle-event rate, from roughly 9000/s
-//     per port at 921600 baud;
-//   - the only place where a UART interrupt masked the FDCAN interrupt goes
-//     away. The bank bookkeeping read and wrote several stream registers, so it
-//     ran under a global __disable_irq(); FDCAN sits at NVIC priority 1 and its
-//     forwarding path is the one this board spends .itcm/.dtcm on.
-//
-// Reception errors are absorbed rather than recovered from. STM32H7 can leave the
-// DMA request unblocked across a line error (CR3.DDRE clear) and can stop raising
-// overruns altogether (CR3.OVRDIS); see configure_rx_error_policy(), and read the
-// polarity note there before touching either bit. STM32F407 has neither, so
-// c_board is forced to tear the stream down and restart it every time a glitch
-// arrives. Restarting is still implemented here for genuine DMA controller
-// faults, and the restart path uses two more registers c_board does not have:
-// ICR to drop sticky flags without a destructive RDR read, and RQR.RXFRQ to
-// empty the 16-entry RXFIFO.
-//
-// The consumer runs in the main loop (try_dequeue), so the interrupt path only
-// bumps a counter and never touches USB.
-// buffer_size is the ring, and what it has to cover is one thing only: the
-// consumer must come back before the DMA laps it. The default suits a port
-// carrying a continuous stream. A port that only ever sees short
-// request/response transactions needs far less, and on this board the ring is
-// charged against a 32 KB region -- see the sizes chosen at the bottom of
-// uart.hpp for the two RS-485 ports.
+// buffer_size 即 ring, 唯一要满足的约束是消费者必须在 DMA 绕完一圈前回来。
+// 默认值适合连续流的端口, 只跑短请求/响应事务的端口可以小得多; 所有 ring 都
+// 从 32 KB 区域里扣除, 两个 RS-485 口的取值见 uart.hpp 末尾。
 template <typename T, size_t buffer_size = 2048>
 class RxBuffer {
     friend T;
@@ -81,31 +53,27 @@ public:
     static constexpr size_t kProtocolMaxPayloadSize =
         core::protocol::kProtocolBufferSize - sizeof(core::protocol::UartHeaderExtended);
     static_assert(0 < kMinFragmentSize && kMinFragmentSize <= kProtocolMaxPayloadSize);
-    // Below this the ring could not even hold the bytes try_dequeue() waits for
-    // before forwarding a non-idle fragment, so it would stall instead of
-    // batching. Half the ring is also where sample_write_position()'s
-    // fallen-behind assert sits, so leave clear room under it.
+    // 低于该值时 ring 连 try_dequeue() 转发非 idle 片段前需凑齐的字节都容不下,
+    // 只会停滞而无法攒批; sample_write_position() 的落后断言也设在半圈处,
+    // 需与其拉开明显距离。
     static_assert(kMinFragmentSize * 4 <= kBufferSize);
 
     bool try_dequeue() {
-        // Sample the idle counter BEFORE the write position. The IDLE interrupt
-        // publishes the counter at the instant the line went quiet, so a counter
-        // read first is always paired with a write position at or after that
-        // instant, and the chunk published below is guaranteed to contain the
-        // boundary. Reading NDTR first could pair a stale position with an idle
-        // event that happened after it and report a boundary for bytes that are
-        // not in the ring yet.
+        // 先读 idle 计数再采样写指针: IDLE 中断在线路转静的瞬间发布计数, 先读
+        // 计数总能与不早于该瞬间的写指针对配, 保证下方发布的块必含该边界。若
+        // 先读 NDTR, 陈旧位置可能与更晚发生的 idle 事件配对, 为尚未入 ring 的
+        // 字节误报边界。
         const auto idle_count = idle_count_.load(std::memory_order::acquire);
         const auto in = sample_write_position();
         const auto out = out_;
         const auto readable = static_cast<size_t>(static_cast<IndexType>(in - out));
 
         if (readable > kBufferSize) [[unlikely]] {
-            // Abnormal condition: The circular queue has wrapped around.
-            // Fail-fast in debug builds to catch timing/interrupt issues early.
+            // 异常: 环形队列已绕圈覆盖。debug 构建下 fail-fast, 尽早暴露时序
+            // 与中断问题。
             core::utility::assert_debug_lazy([]() noexcept { return false; });
 
-            // Release fallback: discard the accumulated bytes to resync the stream.
+            // Release 兜底: 丢弃积压字节以重新同步流。
             out_ = in;
             consumed_idle_count_ = idle_count;
             return false;
@@ -131,10 +99,9 @@ public:
     }
 
 private:
-    // Bounds the ISR.REACK poll in wait_receiver_ready(). RE is already
-    // acknowledged in steady state, so the loop normally exits on its first
-    // read; this only stops restart_rx_dma() from spinning forever inside the
-    // DMA error interrupt if the receiver never comes back.
+    // 限定 wait_receiver_ready() 的 ISR.REACK 轮询上限。稳态下 RE 早已应答,
+    // 循环通常首读即退出; 此上限只是防止接收器永不恢复时 restart_rx_dma() 在
+    // DMA 错误中断里无限空转。
     static constexpr uint32_t kReceiverAckPollLimit = 1024;
 
     explicit RxBuffer(UART_HandleTypeDef* hal_uart_handle)
@@ -145,57 +112,38 @@ private:
         start_rx_dma();
     }
 
-    // Every port runs with the 16-entry RX and TX FIFOs on, decided here rather
-    // than in the .ioc.
+    // 所有端口都打开 16 项 RX/TX FIFO, 由驱动而非 .ioc 决定。CubeMX 对四口的
+    // 开关本就不一致(UART5/UART7 开、USART1/USART10 关)且无理由; 各口阈值处处
+    // 相同(RXFTCFG/TXFTCFG 均为 1/8, DisableFifoMode 只清 CR1.FIFOEN 不动
+    // CR3), 差别仅此一位。放在驱动里的两个理由:
+    //   - TxBuffer::try_dequeue() 依据 ISR.TC 而非 DMA 完成来计时 idle 窗口,
+    //     其前提正是 TXFIFO 可在 DMA 报完成后仍压着 16 字节(921600 baud 下约
+    //     173 us, 与 300 us 窗口同量级); 该推理只在 FIFO 开启时成立。不变量与
+    //     依赖它的代码放在一起, CubeMX 重新生成时才不会悄然失效。
+    //   - configure_rx_error_policy() 置 CR3.OVRDIS, 溢出完全不上报, DMA 一旦
+    //     晚到而丢字节将是静默的; 16 字节 FIFO 正是针对此的缓冲。
+    // 与吞吐无关: 921600 baud 下一字节 10.8 us, DMA 仲裁快几个量级, 正常运行
+    // 碰不到这层缓冲, 它是为异常情况准备的。
     //
-    // CubeMX leaves the four ports inconsistent -- MX_UART5_Init and MX_UART7_Init
-    // call HAL_UARTEx_EnableFifoMode, MX_USART1_UART_Init and MX_USART10_UART_Init
-    // call HAL_UARTEx_DisableFifoMode -- with no reason behind the split. The
-    // thresholds are already identical everywhere (RXFTCFG/TXFTCFG = 1/8 on all
-    // four, and HAL_UARTEx_DisableFifoMode only clears CR1.FIFOEN, leaving CR3
-    // alone), so the whole difference is one bit.
-    //
-    // Two reasons the bit belongs to this driver instead of to the .ioc:
-    //
-    //   - TxBuffer::try_dequeue() times its idle window from ISR.TC rather than
-    //     from DMA completion *because* a TXFIFO can still hold 16 bytes when the
-    //     DMA reports done -- 173 us at 921600 baud, the same order as the 300 us
-    //     window itself. That reasoning only holds where the FIFO is on. Keeping
-    //     the invariant next to the code that depends on it means a CubeMX
-    //     regeneration cannot quietly invalidate it.
-    //   - configure_rx_error_policy() sets CR3.OVRDIS, so an overrun is not
-    //     reported at all; if the DMA were ever late enough to lose a byte it
-    //     would be silent. The FIFO is 16 bytes of cushion against exactly that,
-    //     which is worth having in a path that cannot detect its own failure.
-    //
-    // Not a throughput argument: at 921600 baud a byte takes 10.8 us and DMA
-    // arbitration is orders of magnitude faster, so the cushion is never
-    // approached in normal operation. It is there for the abnormal case.
-    //
-    // Uses the HAL entry point rather than a raw CR1 write so huart->FifoMode
-    // stays truthful; it does its own UE-disable/restore around the bit, which is
-    // required because FIFOEN is only writable while the USART is disabled.
+    // 经 HAL 入口而非直写 CR1, 使 huart->FifoMode 保持真实; 该入口会自行在写
+    // 位前后关断并恢复 UE, 这是必须的, 因为 FIFOEN 仅在 USART 禁止时才可写。
     void enable_fifo_mode() const {
         core::utility::assert_always(HAL_UARTEx_EnableFifoMode(hal_uart_handle_) == HAL_OK);
     }
 
-    // STM32H7 declares DMA_HandleTypeDef::Instance as void* (F4 types it as
-    // DMA_Stream_TypeDef*), so every register access has to go through this cast.
-    // UART RX streams are DMA1/DMA2 streams, never BDMA -- BDMA only serves
-    // the D3 domain, and every UART on this board lives in D2.
+    // STM32H7 把 DMA_HandleTypeDef::Instance 声明为 void*(F4 为
+    // DMA_Stream_TypeDef*), 寄存器访问必须经此转换。UART 的 RX 流是 DMA1/DMA2
+    // 流而非 BDMA: BDMA 只服务 D3 域, 本板所有 UART 都在 D2。
     [[nodiscard]] DMA_Stream_TypeDef* rx_dma_stream() const {
         return static_cast<DMA_Stream_TypeDef*>(hal_uart_handle_->hdmarx->Instance);
     }
 
-    // Ring offset the stream will write next, taken from the stream's own
-    // counter, plus the lap bits that offset cannot carry.
+    // 由流自身计数器取下个写入位置的 ring 偏移, 并补上偏移承载不了的圈数位。
     //
-    // NDTR counts down from kBufferSize and is reloaded by the hardware on wrap,
-    // so kBufferSize - NDTR is the offset. NDTR reads kBufferSize right after a
-    // wrap and may read 0 in the instant before the reload; both mask to offset
-    // 0, which is where the stream is. Nothing else has to be read, so unlike
-    // the double-buffered version there is no pair of registers that could be
-    // sampled either side of a hardware transition.
+    // NDTR 从 kBufferSize 起倒计, 回绕时由硬件重载, 故偏移 = kBufferSize -
+    // NDTR。刚回绕后 NDTR 读到 kBufferSize, 重载前一瞬可能读到 0, 两者按掩码
+    // 都得偏移 0, 恰为流所在处。只需读这一个寄存器, 不存在跨硬件切换采样两个
+    // 寄存器的竞态。
     IndexType sample_write_position() {
         const auto remaining = static_cast<size_t>(rx_dma_stream()->NDTR);
         core::utility::assert_debug(remaining <= kBufferSize);
@@ -205,11 +153,9 @@ private:
         if (next < in_)
             next = static_cast<IndexType>(next + static_cast<IndexType>(kBufferSize));
 
-        // A consumer that falls a full lap behind gets overwritten in place, and
-        // the reconstruction above would under-report that rather than trip the
-        // readable > kBufferSize check in try_dequeue(). Trap long before it: the
-        // main loop polls every few microseconds, and half a ring is 11 ms at
-        // 921600 baud.
+        // 消费者落后整圈时数据会被原地覆盖, 上面的重构只会低报而非触发
+        // try_dequeue() 里 readable > kBufferSize 的检查, 故须远早于此设陷:
+        // 主循环每几微秒轮询一次, 半圈在 921600 baud 下是 11 ms。
         core::utility::assert_debug(
             static_cast<size_t>(static_cast<IndexType>(next - in_)) <= kBufferSize / 2);
 
@@ -217,34 +163,24 @@ private:
         return next;
     }
 
-    // Reception error policy, applied once before any DMA is armed.
+    // 接收错误策略, 在任何 DMA 武装之前应用一次。
     //
-    //   CR3.DDRE = 0    "DMA Disable on Reception Error" stays OFF, so a
-    //                   parity/framing/noise error does not block the DMA
-    //                   request. The suspect byte lands in the ring like any
-    //                   other and the protocol layer decides what to do with it.
-    //   CR3.OVRDIS = 1  overrun detection off. start_rx_dma() deliberately
-    //                   leaves CR3.EIE clear, so nothing would ever clear a
-    //                   sticky ORE and a set ORE stalls reception. Continuous
-    //                   DMA drains RDR fast enough that the flag carried no
-    //                   information here anyway.
+    //   CR3.DDRE = 0    "DMA Disable on Reception Error" 保持关闭, 奇偶/帧/
+    //                   噪声错误不阻塞 DMA 请求, 可疑字节照常入 ring, 交协议层
+    //                   处置。
+    //   CR3.OVRDIS = 1  关闭溢出检测。start_rx_dma() 刻意不置 CR3.EIE, 置位的
+    //                   ORE 将无人清除并卡死接收; 连续 DMA 排空 RDR 足够快,
+    //                   该标志在这里本就无信息量。
     //
-    // Note the polarity. This code originally SET DDRE, with a comment claiming
-    // that kept the DMA request alive across a line error; the bit does the
-    // opposite -- its name states the behaviour it enables, exactly like OVRDIS
-    // next to it. With DDRE set and CR3.EIE clear, one bad character killed the
-    // port for good: the DMA request stayed blocked until the error flag was
-    // cleared, no interrupt was raised to clear it, and rx_error_callback() only
-    // ever fires for DMA controller faults, never for line errors. Measured on a
-    // two-board rig -- one board caught a glitch during a baudrate switch and
-    // from then on reported an IDLE event for every message the far end sent
-    // while delivering zero bytes, permanently. Clearing DDRE fixed it outright;
-    // see host/examples/uart_cross_test.cpp, "monitor" mode. Neither bit exists
-    // on STM32F407, which is why c_board has no counterpart to this.
+    // 极性陷阱: 位名描述的是它使能的行为, 与旁边的 OVRDIS 同理。曾误置 DDRE
+    // 并注释称可保 DMA 请求存活, 实际相反: DDRE 置 1 且 EIE 清零时, 一个坏
+    // 字符即永久杀死端口, DMA 请求保持阻塞直至错误标志被清, 却没有任何中断会
+    // 去清它(rx_error_callback() 只在 DMA 控制器故障时触发, 线路错误从不)。
+    // 实测复现并经清 DDRE 修复, 见 host/examples/uart_cross_test.cpp 的
+    // monitor 模式。
     //
-    // Both are writable only while the USART is disabled, so UE is cycled around
-    // the write. TxBuffer's constructor only binds callbacks, so nothing is
-    // transmitting or receiving at this point.
+    // 两位均仅在 USART 禁止时才可写, 故写入前后翻转 UE。此刻 TxBuffer 的构造
+    // 函数只绑定回调, 尚无任何收发在进行。
     void configure_rx_error_policy() const {
         auto* instance = hal_uart_handle_->Instance;
         const bool was_enabled = (instance->CR1 & USART_CR1_UE) != 0U;
@@ -256,26 +192,21 @@ private:
             ATOMIC_SET_BIT(instance->CR1, USART_CR1_UE);
     }
 
-    // Drop the sticky RX status through the dedicated clear register, which
-    // leaves RDR untouched. On STM32F407 the only way to clear ORE is the "read
-    // SR, then read DR" sequence, which would steal a byte from the DMA stream.
+    // 经专用清零寄存器清粘滞 RX 状态, 不触碰 RDR。F407 清 ORE 只能走"先读 SR
+    // 再读 DR"序列, 那会从 DMA 流里偷走一个字节。
     void clear_rx_error_flags() const {
         WRITE_REG(
             hal_uart_handle_->Instance->ICR,
             USART_ICR_PECF | USART_ICR_FECF | USART_ICR_NECF | USART_ICR_ORECF | USART_ICR_IDLECF);
     }
 
-    // Discard whatever is still held in RDR and in the 16-entry RXFIFO (DS13313
-    // Table 5 gives the depth). enable_fifo_mode() turns the FIFO on for every
-    // port, so without this up to 16 bytes captured before an abort would survive
-    // it and be written at ring offset 0 as if they had just arrived.
-    // STM32F407 has no request register at all.
+    // 丢弃 RDR 与 16 项 RXFIFO 中残留的字节(深度见 DS13313 Table 5)。
+    // enable_fifo_mode() 对所有端口开启 FIFO, 不清的话中止前捕获的至多 16 字节
+    // 会存活下来并被当作新到数据写到 ring 偏移 0。F407 没有该请求寄存器。
     void flush_rx_fifo() const { WRITE_REG(hal_uart_handle_->Instance->RQR, USART_RQR_RXFRQ); }
 
-    // The receiver acknowledges RE asynchronously: it is only sampling the line
-    // once ISR.REACK reads back as 1, and STM32F407 has no such handshake. RE is
-    // never cleared once CubeMX has enabled it, so this normally exits on the
-    // first read.
+    // 接收器对 RE 的应答是异步的: 仅当 ISR.REACK 读回 1 才真正在采样线路,
+    // F407 无此握手。CubeMX 使能后 RE 从不清除, 故通常首读即返回。
     void wait_receiver_ready() const {
         auto* instance = hal_uart_handle_->Instance;
         if ((instance->CR1 & USART_CR1_RE) == 0U)
@@ -292,11 +223,9 @@ private:
         auto* hal_dma_handle = hal_uart_handle_->hdmarx;
         core::utility::assert_debug(hal_dma_handle != nullptr);
 
-        // Transfer completion carries no information: the stream wraps on its own
-        // and the write position is read out of NDTR by the consumer. The
-        // interrupt is still enabled by HAL_DMA_Start_IT, but HAL_DMA_IRQHandler
-        // null-checks every callback, so it just clears the flag. Once per lap
-        // (22 ms at 921600 baud) that is not worth suppressing.
+        // 传输完成不携带任何信息: 流自行回绕, 写位置由消费者读 NDTR 获得。
+        // HAL_DMA_Start_IT 仍会开这个中断, 但 HAL_DMA_IRQHandler 对回调逐个
+        // 判空, 只清标志而已。每圈一次(921600 baud 下 22 ms), 不值得压制。
         hal_dma_handle->XferCpltCallback = nullptr;
         hal_dma_handle->XferM1CpltCallback = nullptr;
         hal_dma_handle->XferErrorCallback = &T::hal_rx_dma_error_callback;
@@ -309,12 +238,10 @@ private:
         auto* hal_dma_handle = hal_uart_handle_->hdmarx;
         core::utility::assert_debug(hal_dma_handle->Init.Mode == DMA_CIRCULAR);
 
-        // Single-buffer by construction: HAL_DMA_Init() masks DBM and CT out of
-        // CR before writing it (see the register mask in
-        // bsp/stm32h7xx-hal-driver/Src/stm32h7xx_hal_dma.c), and nothing in this
-        // class sets them, so the stream has exactly one target address that
-        // never needs re-pointing. HAL_DMA_Abort() in restart_rx_dma() leaves
-        // both alone, so this holds across a restart too.
+        // 按构造即为单缓冲: HAL_DMA_Init() 写 CR 前把 DBM 与 CT 屏蔽掉(见
+        // bsp/stm32h7xx-hal-driver/Src/stm32h7xx_hal_dma.c 的寄存器掩码), 本类
+        // 也从不设置它们, 故流只有一个目标地址、无需重指向。restart_rx_dma()
+        // 里的 HAL_DMA_Abort() 不动这两位, 重启后依然成立。
         core::utility::assert_debug((rx_dma_stream()->CR & (DMA_SxCR_DBM | DMA_SxCR_CT)) == 0U);
 
         in_ = 0;
@@ -329,84 +256,64 @@ private:
         core::utility::assert_always(
             HAL_DMA_Start_IT(hal_dma_handle, source, destination, kBufferSize) == HAL_OK);
 
-        // Present the port to the HAL as an in-progress circular ReceiveToIdle so
-        // that HAL_UART_IRQHandler takes its DMA_CIRCULAR branch on IDLE: it then
-        // reports the event through HAL_UARTEx_RxEventCallback without touching
-        // DMAR or aborting the stream.
+        // 把端口伪装成进行中的循环 ReceiveToIdle, 使 HAL_UART_IRQHandler 在
+        // IDLE 时走 DMA_CIRCULAR 分支: 事件经 HAL_UARTEx_RxEventCallback 上报,
+        // 且不触碰 DMAR、不中止流。
         hal_uart_handle_->RxState = HAL_UART_STATE_BUSY_RX;
         hal_uart_handle_->ReceptionType = HAL_UART_RECEPTION_TOIDLE;
 
-        // RxXferSize is deliberately one larger than the ring. The IDLE branch of
-        // HAL_UART_IRQHandler reports the event when
-        // `0 < __HAL_DMA_GET_COUNTER(hdmarx) < huart->RxXferSize`, and NDTR spans
-        // 1..kBufferSize while the stream runs. Setting RxXferSize to exactly
-        // kBufferSize would leave the just-wrapped case (NDTR == kBufferSize) to
-        // the handler's separate `nb_remaining == RxXferSize` branch; one more
-        // covers every NDTR the hardware can present through the single
-        // comparison.
-        //
-        // The HAL reads RxXferSize nowhere else on this path: UART_DMAReceiveCplt
-        // is never installed (bind_rx_dma_callbacks leaves XferCpltCallback
-        // null), and RxXferCount is only written by that IDLE branch, never read
-        // by us.
+        // RxXferSize 刻意比 ring 大 1。HAL_UART_IRQHandler 的 IDLE 分支在
+        // `0 < __HAL_DMA_GET_COUNTER(hdmarx) < huart->RxXferSize` 时上报事件,
+        // 而流运行期间 NDTR 取值 1..kBufferSize; 若 RxXferSize 恰为
+        // kBufferSize, 刚回绕的 NDTR == kBufferSize 会落进另一条
+        // `nb_remaining == RxXferSize` 分支, 多加的 1 使硬件可能给出的每个
+        // NDTR 都被同一条比较覆盖。
+        // 此路径上 HAL 不再读 RxXferSize: UART_DMAReceiveCplt 从不安装
+        // (bind_rx_dma_callbacks 令 XferCpltCallback 为空), RxXferCount 仅由该
+        // IDLE 分支写入、我方从不读取。
         hal_uart_handle_->RxXferSize = static_cast<uint16_t>(kBufferSize + 1);
         hal_uart_handle_->RxXferCount = static_cast<uint16_t>(kBufferSize);
 
-        // Drop every sticky RX flag and every byte still held in RDR/RXFIFO, then
-        // confirm the receiver is live, so DMA requests resume on a real byte
-        // boundary instead of on leftovers from before the restart.
+        // 清掉所有粘滞 RX 标志与 RDR/RXFIFO 残留字节, 再确认接收器存活, 使
+        // DMA 请求从真实字节边界恢复, 而非接着重启前的残渣。
         clear_rx_error_flags();
         flush_rx_fifo();
         wait_receiver_ready();
 
-        // CR3.EIE and CR1.PEIE stay clear on purpose, and that is what makes
-        // clearing CR3.DDRE mandatory rather than merely preferable: with the
-        // error interrupt off, nothing would ever clear an error flag, so a set
-        // DDRE would block the DMA request forever. HAL_UART_IRQHandler() classifies *any*
-        // RX error as blocking whenever DMAR is set -- the condition it tests is
-        // `HAL_IS_BIT_SET(huart->Instance->CR3, USART_CR3_DMAR) || ...` -- and
-        // responds with UART_EndRxTransfer() followed by HAL_DMA_Abort_IT(). So
-        // with the error interrupts enabled the hardware would keep the stream
-        // running and the HAL would abort it anyway, reproducing the F407
-        // behaviour on a part that does not need it.
+        // 刻意保持 CR3.EIE 与 CR1.PEIE 清零, 这正是必须清 CR3.DDRE(而非仅更优)
+        // 的原因: 错误中断关闭时无人清除错误标志, DDRE 置位将永久阻塞 DMA 请求。
+        // 另外 HAL_UART_IRQHandler() 在 DMAR 置位时把任何 RX 错误一律判为阻塞
+        // (判据为 `HAL_IS_BIT_SET(huart->Instance->CR3, USART_CR3_DMAR) || ...`),
+        // 随即执行 UART_EndRxTransfer() + HAL_DMA_Abort_IT(): 即使开着错误中断
+        // 让硬件继续跑流, HAL 也会把它中止, 在本不需要的芯片上复刻 F407 行为。
         //
-        // Line errors are absorbed by the DDRE/OVRDIS policy instead. Genuine DMA
-        // controller faults still arrive through the stream's own error
-        // interrupt (hal_rx_dma_error_callback -> rx_error_callback), which is
-        // what restart_rx_dma() now exists for.
+        // 线路错误改由 DDRE/OVRDIS 策略吸收; 真正的 DMA 控制器故障仍经流自身的
+        // 错误中断到达(hal_rx_dma_error_callback -> rx_error_callback), 这正是
+        // restart_rx_dma() 存在的目的。
         ATOMIC_SET_BIT(hal_uart_handle_->Instance->CR3, USART_CR3_DMAR);
         ATOMIC_SET_BIT(hal_uart_handle_->Instance->CR1, USART_CR1_IDLEIE);
     }
 
-    // Published for the half-duplex turnaround gate in TxBuffer, which uses a
-    // change in this counter as "the peer has finished answering". Relaxed
-    // rather than acquire because only the change matters here: nothing is
-    // published through the counter, unlike try_dequeue() above, which acquires
-    // it precisely to pair the boundary with ring contents.
+    // 供 TxBuffer 的半双工 turnaround 门使用, 该计数变化即"对端已应答完毕"。
+    // 用 relaxed 而非 acquire, 因为这里只关心数值变化、计数器不发布任何数据;
+    // 上方 try_dequeue() 之所以用 acquire, 恰是为了把边界与 ring 内容配对。
     [[nodiscard]] uint16_t idle_count() const {
         return idle_count_.load(std::memory_order::relaxed);
     }
 
     void uart_idle_event_callback() {
-        // Publishes a boundary and nothing else, so no lock and no register
-        // write: the consumer pairs this counter with the write position it
-        // samples immediately afterwards. The double-buffered version had to read
-        // CR/NDTR and re-point M0AR/M1AR here, which is why it held a global
-        // __disable_irq() -- at 921600 baud that masked the FDCAN interrupt
-        // (NVIC priority 1) roughly 9000 times a second per port.
+        // 只发布一个边界: 无锁、无寄存器写。消费者随后把本计数与紧随其后采样
+        // 的写指针对配。
         idle_count_.fetch_add(1, std::memory_order::release);
     }
 
     void rx_error_callback() {
-        // Reached for DMA controller faults (transfer/FIFO/direct-mode errors),
-        // not for line errors: with CR3.EIE left clear, a framing/noise/parity
-        // glitch no longer raises the UART interrupt at all and a clear DDRE
-        // keeps the stream running through it. The HAL error callback in uart.cpp can still
-        // route here if the HAL sets an RX ErrorCode by some other path.
-        //
-        // Deliberately no debug assert, unlike c_board: mc02 drives DBUS and
-        // hot-pluggable ports, so the port must recover rather than trap the
-        // debug build.
+        // 只为 DMA 控制器故障(传输/FIFO/直接模式错误)到达, 线路错误不会:
+        // CR3.EIE 保持清零后, 帧/噪声/奇偶毛刺不再触发 UART 中断, 清零的 DDRE
+        // 使流照常穿过错误。uart.cpp 的 HAL 错误回调在 HAL 经其他路径置上 RX
+        // ErrorCode 时仍可能路由到这里。
+        // 刻意不加 debug 断言: mc02 承载 DBUS 与可热插拔端口, 端口必须自行恢复
+        // 而非困死 debug 构建。
         restart_rx_dma();
     }
 
@@ -420,33 +327,28 @@ private:
             core::utility::assert_always(HAL_DMA_Abort(hal_dma_handle) == HAL_OK);
         }
 
-        // The HAL's blocking-error path installs UART_DMAAbortOnError as the
-        // stream's abort callback; re-bind so a later HAL_DMA_Abort cannot bounce
-        // back into the HAL error machinery behind our back.
+        // HAL 的阻塞错误路径会把 UART_DMAAbortOnError 装为流的 abort 回调;
+        // 重新绑定, 防止之后的 HAL_DMA_Abort 绕过我们弹回 HAL 错误机制。
         bind_rx_dma_callbacks();
         start_rx_dma();
     }
 
     UART_HandleTypeDef* hal_uart_handle_;
 
-    // Lives wherever the enclosing port object is placed, which uart.hpp puts in
-    // .d2_sram -- D2 SRAM at 0x30000000, the same domain as the DMA1 streams that
-    // write it. app.cpp maps that range non-cacheable through MPU region 1, so
-    // DMA writes need no cache maintenance. Do not move the port objects into
-    // .dtcm the way can.hpp places its objects: DMA1/DMA2 cannot reach DTCM, so
-    // the stream would silently transfer nothing.
+    // 随外层端口对象放置, uart.hpp 把它放进 .d2_sram(0x30000000 的 D2 SRAM),
+    // 与写它的 DMA1 流同域。app.cpp 经 MPU region 1 把该区间映射为
+    // non-cacheable, DMA 写无需维护缓存。不可像 can.hpp 那样挪进 .dtcm:
+    // DMA1/DMA2 够不到 DTCM, 流会静默地什么都传不了。
     alignas(uint32_t) std::array<std::byte, kBufferSize> ring_{};
 
-    // Consumer-only. in_ carries the lap bits that the ring offset read out of
-    // NDTR cannot; both are reset by start_rx_dma(), which also runs from the DMA
-    // error interrupt -- a restart discards the consumer's position by design.
+    // 仅消费者使用。in_ 承载 NDTR 读出的 ring 偏移放不下的圈数位; 两者均由
+    // start_rx_dma() 复位, 它也在 DMA 错误中断里运行, 重启即按设计丢弃消费者
+    // 位置。
     IndexType in_{0};
     IndexType out_{0};
 
-    // Published by the IDLE interrupt, consumed by try_dequeue(). A counter and
-    // not a position: the consumer pairs it with the write position it samples
-    // immediately afterwards, which is the same pairing the interrupt-published
-    // version provided.
+    // 由 IDLE 中断发布、try_dequeue() 消费。是计数而非位置, 与写指针的配对
+    // 论证见 try_dequeue()。
     std::atomic<uint16_t> idle_count_{0};
     uint16_t consumed_idle_count_{0};
 

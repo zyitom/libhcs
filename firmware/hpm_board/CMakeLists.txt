@@ -5,10 +5,8 @@ project(hpm_board_superbuild LANGUAGES NONE)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/../common/cmake/libhcs_firmware.cmake")
 
-# hpm5321 builds one image serving both HPM5321 PCBs -- single-CAN and dual-CAN --
-# selecting how many CAN ports to bring up, and its LED tables, at run time from
-# OTP word 25
-# (common/board_identity.hpp).
+# hpm5321 构建单一镜像同时服务两块 HPM5321 PCB(单 CAN 与双 CAN), 运行时按
+# OTP word 25 选择初始化多少路 CAN 及其 LED 表(common/board_identity.hpp)。
 set(BOARD "hpm5321" CACHE STRING "Target board (hpm5321)")
 set_property(CACHE BOARD PROPERTY STRINGS hpm5321)
 set(BOARD_SEARCH_PATH "${CMAKE_CURRENT_SOURCE_DIR}/boards" CACHE PATH "Board search path")
@@ -17,42 +15,40 @@ if(BOARD STREQUAL "hpm5321_dual_can")
     message(FATAL_ERROR
         "hpm5321_dual_can was merged into hpm5321; build with -DBOARD=hpm5321")
 endif()
-# Bitmanip is enabled by the HPM SoC CMake via the granular _zba_zbb_zbc_zbs
-# extensions, so the umbrella "b" here is redundant. Keeping it makes the arch
-# string "rv32imafdcb_..._zba_zbb_zbc_zbs", which recent binutils reject ("cannot
-# find default versions of the ISA extension `b'"). Drop the redundant "b".
+# Bitmanip 已由 HPM SoC CMake 经细粒度的 _zba_zbb_zbc_zbs 扩展开启, 这里的伞扩展
+# "b"是冗余的; 保留它会使 arch 串变成 "rv32imafdcb_..._zba_zbb_zbc_zbs", 新版
+# binutils 直接拒绝("cannot find default versions of the ISA extension `b'")。
+# 故去掉冗余的 "b"。
 #
-# Soft-float on purpose (was rv32imafdc / ilp32d): the firmware and core use no
-# floating point anywhere, yet with a hard-float ABI the SDK's preemptive ISR
-# wrapper saves/restores 20 caller-saved FP registers as doubles on EVERY
-# interrupt entry/exit (SAVE_FPU_CONTEXT in hpm_interrupt.h) -- pure forwarding
-# latency spent on nothing. Without F/D, __riscv_flen is undefined and the FPU
-# context code vanishes. Revert if on-board float math ever becomes necessary.
+# 刻意软浮点(原为 rv32imafdc / ilp32d): 固件与 core 全程不用浮点, 而硬浮点 ABI 下
+# SDK 的抢占式 ISR 包装器在每次中断进入/退出都按 double 保存/恢复 20 个
+# caller-saved FP 寄存器(hpm_interrupt.h 的 SAVE_FPU_CONTEXT) -- 纯白付的转发
+# 延迟。没有 F/D 时 __riscv_flen 未定义, FPU 上下文代码随之消失。板上将来若真需要
+# 浮点运算再改回。
 set(RV_ARCH "rv32imac" CACHE STRING "RISC-V arch")
 set(RV_ABI "ilp32" CACHE STRING "RISC-V ABI")
 set(BOARD_BOOTLOADER_MODE "auto" CACHE STRING "Bootloader mode (auto / manual)")
 set_property(CACHE BOARD_BOOTLOADER_MODE PROPERTY STRINGS auto manual)
 
-# Forwarded to the app sub-build as libhcs_APP_CAN_DIAG; see app/CMakeLists.txt.
+# 透传给 app 子构建为 libhcs_APP_CAN_DIAG; 见 app/CMakeLists.txt。
 option(libhcs_CAN_DIAG "Emit CAN forwarding telemetry on the UART0 uplink" OFF)
 
-# Forwarded to the app sub-build as libhcs_APP_TIME_SYNC; see app/CMakeLists.txt.
+# 透传给 app 子构建为 libhcs_APP_TIME_SYNC; 见 app/CMakeLists.txt。
 option(libhcs_TIME_SYNC "Run the shared USB-SOF time base" OFF)
 
-# Forwarded to the app sub-build as libhcs_APP_PULSE_TEST; see app/CMakeLists.txt.
+# 透传给 app 子构建为 libhcs_APP_PULSE_TEST; 见 app/CMakeLists.txt。
 option(libhcs_PULSE_TEST "Measure cross-board skew with GPTMR pulses (takes over UART0)" OFF)
 
-# Forwarded to the app sub-build as libhcs_APP_SOF_DIAG; see app/CMakeLists.txt.
+# 透传给 app 子构建为 libhcs_APP_SOF_DIAG; 见 app/CMakeLists.txt。
 option(libhcs_SOF_DIAG "Emit USB SOF / FRINDEX validation telemetry on the UART0 uplink" OFF)
 
-# Forwarded to the app sub-build as libhcs_APP_USB_FULL_SPEED. Enumerates the
-# device at FULL speed instead of HIGH -- a test vehicle, not a product setting:
-# it costs bulk throughput (64-byte packets) and coarsens the SOF time base from
-# 125 us microframes to 1 ms frames. See SOF_TIMEBASE.md.
+# 透传给 app 子构建为 libhcs_APP_USB_FULL_SPEED。以 FULL 速度而非 HIGH 枚举设备
+# -- 是测试手段, 不是产品设置: 损失 bulk 吞吐(64 字节包), 并把 SOF 时基从 125 us
+# 微帧粗化到 1 ms 帧。见 SOF_TIMEBASE.md。
 option(libhcs_USB_FULL_SPEED "Enumerate USB at full speed (test only)" OFF)
 
-# Forwarded to the app sub-build as libhcs_APP_ILM_HOT_PATH. HPM5321 always
-# uses its board-owned linker layout; this switch applies to HPM6E8Y.
+# 透传给 app 子构建为 libhcs_APP_ILM_HOT_PATH。HPM5321 始终用板自有的链接布局;
+# 该开关只作用于 HPM6E8Y。
 option(libhcs_ILM_HOT_PATH "Run the HPM6E8Y CAN driver from ILM" OFF)
 
 if(NOT CMAKE_BUILD_TYPE)

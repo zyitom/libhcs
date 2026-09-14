@@ -63,7 +63,7 @@ public:
         finish_transfer();
     }
 
-    // Uses DMA mode; completion is signaled through the SPI2 DMA stream IRQ.
+    // DMA 模式; 完成经 SPI2 的 DMA 流中断通知。
     void transmit_receive_async(SpiModule& module, size_t size) {
         core::utility::assert_debug(0 < size && size <= kMaxTransferSize);
         core::utility::assert_debug_lazy(
@@ -86,7 +86,7 @@ public:
             module->transmit_receive_async_callback(success ? tx_rx_size_ : 0);
     }
 
-    // No-op: DMA completion is interrupt-driven, so no polling is needed.
+    // DMA 完成走中断, 故无需轮询。
     void update() {}
 
     alignas(4) uint8_t tx_buffer[kMaxTransferSize];
@@ -126,7 +126,7 @@ private:
     uint16_t tx_rx_size_{0};
 };
 
-// BMI088 uses SPI2 on mc02 hardware.
+// mc02 上 BMI088 接在 SPI2。
 inline constinit Spi::Lazy spi1(&hspi2);
 
 } // namespace libhcs::firmware::spi

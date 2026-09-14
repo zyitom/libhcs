@@ -18,9 +18,8 @@ struct BootMailbox {
         request = 0;
     }
 
-    // The magic is written last so it acts as a commit barrier: a reset landing
-    // between the two stores leaves the mailbox invalid rather than pairing a
-    // valid magic with a stale request from an earlier boot.
+    // magic 最后写入, 充当提交屏障: 若复位恰好落在两次写之间, 邮箱整体无效,
+    // 不会出现"magic 有效但 request 是上次启动残留"的组合。
     void request_enter_dfu() {
         request = kMailboxRequestEnterDfu;
         magic = kMailboxMagic;

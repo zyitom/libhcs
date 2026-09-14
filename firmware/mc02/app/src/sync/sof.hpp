@@ -1,65 +1,42 @@
 #pragma once
 
-// The USB Start-of-Frame hook on mc02's DWC2 controller.
+// mc02 的 DWC2 控制器上的 USB Start-of-Frame 钩子。
 //
-// Same role as hpm_board's sync/sof.hpp -- the single place a board learns what
-// microframe it is in -- but the hardware underneath is a different USB IP, so
-// every register in the path differs:
+// 角色与 hpm_board 的 sync/sof.hpp 相同 -- 板上得知自己所处微帧的唯一入口 --
+// 但底层 USB IP 不同, 整条寄存器路径都不同: 状态位 GINTSTS.SOF、使能位
+// GINTMSK.SOFM、帧计数器 DSTS.FNSOF(全速下数帧)、速度位 DSTS.ENUMSPD。其中
+// 帧计数器的差异影响最大: DWC2 的 FNSOF 只有高速下才是微帧号; 全速 -- mc02
+// 无 ULPI PHY, 也只能全速 -- 下是帧号, 每中断步进 1, 而 EHCI 的 FRINDEX 步进
+// 8。缩放在 sync::timebase 里做, 见其 frame_scale() 的注释。
 //
-//   concept                 HPM (ChipIdea/EHCI)   STM32H723 (Synopsys DWC2)
-//   -------                 -------------------   -------------------------
-//   SOF status flag         USBSTS.SRI            GINTSTS.SOF
-//   SOF interrupt enable    USBINTR.SRE           GINTMSK.SOFM
-//   frame counter           FRINDEX (microframes) DSTS.FNSOF (frames at FS)
-//   port speed              PORTSC1.PSPD          DSTS.ENUMSPD
+// 如何进入中断向量、以及为何形式特殊: hpm_board 持有自己的 USB 向量, 把钩子作为
+// 第一条语句调用。mc02 的向量在 bsp/cubemx/Core/Src/stm32h7xx_it.c, 是 CubeMX
+// 产物, 本仓库禁止编辑(见 AGENTS.md 的 CubeMX BSP 纪律一节), 它只是转调 TinyUSB
+// 的 dcd_int_handler()。因此钩子在链接期介入: -Wl,--wrap=dcd_int_handler 把向量
+// 的调用引到下面的 __wrap_dcd_int_handler(), 先打时间戳再链到真身。生成的代码
+// 不被触碰; libhcs_APP_TIME_SYNC 关闭时 wrap 标志根本不传, 默认构建的链接与
+// 从前完全一致。
 //
-// The frame counter is the difference that propagates: DWC2's FNSOF holds a
-// MICROFRAME number only at high speed. At full speed -- which is all mc02 can
-// do, it has no ULPI PHY -- it holds a FRAME number, so it steps by one per
-// interrupt where an EHCI FRINDEX would step by eight. sync::timebase does the
-// scaling; see the comment on frame_scale() there.
+// 晚一拍进入的代价就是那一次调用本身: 几个周期, 550 MHz 下几十纳秒, 且恒定。
 //
-// HOW IT GETS INTO THE VECTOR, and why it looks unusual. hpm_board owns its USB
-// vector and calls the hook as the first statement. On mc02 the vector lives in
-// bsp/cubemx/Core/Src/stm32h7xx_it.c, which is CubeMX output that this repo
-// forbids editing (see the CubeMX BSP discipline section of AGENTS.md), and it
-// does nothing but call TinyUSB's dcd_int_handler(). The hook is therefore
-// interposed at LINK time
-// instead: -Wl,--wrap=dcd_int_handler routes the vector's call to
-// __wrap_dcd_int_handler() below, which timestamps and then chains to the real
-// one. Nothing generated is touched, and with libhcs_APP_TIME_SYNC off the wrap
-// flag is not passed at all, so the default build links exactly as before.
-//
-// The cost of arriving one call later than hpm_board's hook does is the call
-// itself: a handful of cycles, tens of nanoseconds at 550 MHz, and constant.
-//
-// The SOF status bit is consumed here, so dcd_int_handler() never sees it and
-// never queues a DCD_EVENT_SOF. A board with the time base enabled therefore
-// presents the same USB behaviour to the class drivers as one without it.
+// SOF 状态位在这里被消费, dcd_int_handler() 永远看不到它, 也就不会排队
+// DCD_EVENT_SOF: 时间基开启的板对类驱动呈现的 USB 行为与关闭时完全相同。
 
 #include <cstdint>
 
 namespace libhcs::firmware::sync {
 
-// Reads the timestamp and the frame counter, then acknowledges SOF. Called from
-// __wrap_dcd_int_handler() ahead of the real handler; a no-op the compiler
-// removes entirely when the time base is compiled out.
+// 读取时间戳与帧计数器, 然后应答 SOF。由 __wrap_dcd_int_handler() 在真处理器
+// 之前调用; 时间基被编译剔除时是空函数, 编译器会整体删除。
 void sof_isr_entry();
 
-// Arms GINTMSK.SOFM. Must run after tusb_rhport_init(), whose dcd_init()
-// assigns GINTMSK wholesale.
+// 使能 GINTMSK.SOFM。必须在 tusb_rhport_init() 之后运行: 其 dcd_init() 会整体
+// 覆写 GINTMSK。
 void sof_init();
 
-// True when the hardware SOF capture (TIM2 ITR5) is fine enough to be used, and
-// the number of CPU cycles one TIM2 tick is worth. Both are decided at
-// sof_init() from TIM2's prescaler, so they follow the .ioc without a code
-// change; see the comment block in sof.cpp for why a coarse capture is refused.
-bool sof_capture_active();
-std::uint32_t sof_capture_cycles_per_tick();
-
-// Re-arms the SOF enable. Cheap enough for the main loop's periodic work, and
-// what makes the hook survive a controller that was reinitialized behind us --
-// dcd_int_handler() clears SOFM itself whenever it sees a SOF it did not expect.
+// 重新使能 SOF。足够便宜, 可放主循环周期任务; 这也是钩子能在控制器于背后被
+// 重新初始化后存活的原因 -- dcd_int_handler() 每遇到自己未预期的 SOF 都会自行
+// 清掉 SOFM。
 void sof_rearm();
 
 } // namespace libhcs::firmware::sync

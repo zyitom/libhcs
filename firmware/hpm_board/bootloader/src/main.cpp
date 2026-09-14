@@ -17,30 +17,24 @@ int main() {
 
     const bool force_stay = board_check_bootloader_force_stay_requested();
 
-    // Board identity from OTP, before anything can act on it. An unrecognized
-    // value blocks the jump unconditionally -- even with a perfectly valid,
-    // signed app image present -- because the app configures PA30/PA31 for one
-    // variant or the other and there is no safe default. The device instead falls
-    // through into the DFU loop and enumerates under the sentinel PID with the
-    // offending word 25 in its product string; DFU downloads are refused there
-    // too, so the only way out is deliberate human action.
+    // 任何动作之前先从 OTP 读板型。word 25 非两个已知值时无条件拒绝跳转 --
+    // 即使 app 镜像校验完好: app 必须按板型之一配置 PA30/PA31, 不存在安全默认。
+    // 此时设备落入 DFU 循环, 以哨兵 PID 枚举, product string 携带肇事的 word 25;
+    // DFU 下载同样被拒, 唯一出路是人工介入。
     //
-    // NOTE: this is a hard stop by design (requested explicitly). A chip whose
-    // word 25 is neither 0 nor 2 cannot be recovered over USB at all. Rescue
-    // needs PA07 pulled to GND or a J-Link. That is the accepted trade for never
-    // mis-driving a transceiver against an LED network.
+    // 注意: 这是刻意为之的硬停(明确要求过)。word 25 非 0 非 2 的芯片完全无法
+    // 经 USB 恢复, 救援需将 PA07 拉到 GND 或使用 J-Link。这是绝不把收发器
+    // 灌进 LED 网络的代价。
     const bool board_recognized = board::board_identity().recognized();
 
-    // Install a firmware image the app staged for us (FoE, or the USB self-test
-    // path). Runs before the jump decision so the freshly installed image is the
-    // one validated and entered below -- and before board_init(), like the rest
-    // of this path, because the ROM flash API works at reset-time clocks.
+    // 安装 app 暂存的固件镜像(FoE 或 USB 自检路径)。放在跳转判断之前, 使下面
+    // 校验并进入的是刚装好的镜像; 也放在 board_init() 之前, 与本路径其余步骤
+    // 一致 -- ROM flash API 只在复位时钟下工作。
     //
-    // Gated on the same two conditions as the jump: a held key means the operator
-    // wants DFU, not an install, and an unrecognized board must not be handed new
-    // firmware any more than it may be handed control. No BootMailbox request is
-    // involved -- a committed staging record IS the request, which is what lets a
-    // power loss mid-install resume on the next boot with no volatile state.
+    // 门控条件与跳转相同: 按住按键表示操作者要 DFU 而非安装; 未识别的板不能
+    // 被交给新固件, 正如不能被交给控制权。这里不涉及 BootMailbox 请求 --
+    // 已提交的 staging 记录本身就是请求, 安装中途掉电因此能在下次启动恢复,
+    // 无需任何易失状态。
     if (board_recognized && !force_stay)
         (void)flash::install_staged_image_if_ready();
 
@@ -53,8 +47,8 @@ int main() {
 #endif
         utility::jump_to_app();
 
-    // Reset-time clocks already run CPU0 at 360 MHz, so board_init() would only bump it to
-    // 480 MHz while adding avoidable startup latency on the direct-to-app path.
+    // 复位时钟已让 CPU0 运行在 360 MHz, board_init() 只是把它提到 480 MHz,
+    // 却给直进 app 的路径平添可避免的启动延迟。
     board_init();
     board_init_usb();
     (void)usb::get_usb_descriptors();

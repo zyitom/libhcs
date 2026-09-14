@@ -18,11 +18,10 @@ namespace libhcs::firmware::diag::usb_rx_hist {
 namespace {
 
 constexpr std::uint32_t kEmitPeriodMs = 500U;
-constexpr std::uint32_t kCyclesPerUs = 550U; // SYSCLK, see app.cpp
+constexpr std::uint32_t kCyclesPerUs = 550U; // SYSCLK, 见 app.cpp
 
-// Upper edges in microseconds. The interesting comparisons are the mode around
-// 37 us (the flood's steady state) and anything a full 125 us microframe above
-// it, so the resolution is concentrated there and coarse elsewhere.
+// 桶上边界, 单位 us。关心的是 37 us 附近的众数(洪泛稳态)及其上方整整一个
+// 125 us microframe 的位置, 分辨率集中于此, 其余放宽。
 constexpr std::array<std::uint32_t, 14> kEdgesUs = {
     10U, 20U, 30U, 34U, 38U, 42U, 46U, 55U, 70U, 90U, 120U, 160U, 220U, 400U,
 };
@@ -60,10 +59,9 @@ char* put_text(char* cursor, const char* end, const char* text) {
 }
 
 void emit(std::uint32_t window_ms) {
-    // "rxgap n=<samples> khz=<packets per ms> min=<us> avg=<us.tenths> max=<us>
-    // <edge>:<count> ...". The khz= token is also what makes mc02_packet_rate
-    // print the line at all: it keys on that name to decide a kUart0 record is
-    // a diagnostic worth showing.
+    // 输出格式: "rxgap n=<样本数> khz=<每 ms 包数> min=<us> avg=<us.十分位>
+    // max=<us> <边界>:<计数> ..."。上位机 mc02_packet_rate 正是靠 "khz=" 这个
+    // 名字识别 kUart0 记录为诊断行, 否则该行根本不会显示。
     char* cursor = line.data();
     const char* const end = line.data() + line.size();
 

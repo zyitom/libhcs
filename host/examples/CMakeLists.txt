@@ -107,8 +107,6 @@ target_link_libraries(mfindex_vs_board PRIVATE libhcs-sdk)
 # Cross-board skew MEASURED through hardware CAN Start-of-Frame captures, with
 # a same-board control that establishes the method's own noise floor. Needs all
 # CAN ports on one bus and -Dlibhcs_TIME_SYNC=ON firmware.
-add_executable(sync_skew_test sync_skew_test.cpp)
-target_link_libraries(sync_skew_test PRIVATE libhcs-sdk)
 
 # The same measurement without PTPC in the path: both boards fire a GPTMR
 # compare at one agreed microframe over the existing UART0 cross-wiring and
@@ -160,18 +158,12 @@ target_link_libraries(topo_probe PRIVATE libhcs-sdk)
 
 # Does the phase of a downlink flush inside the 125 us USB microframe change
 # end-to-end latency? Needs both boards on the shared SOF time base.
-add_executable(microframe_phase_test microframe_phase_test.cpp)
-target_link_libraries(microframe_phase_test PRIVATE libhcs-sdk)
 
 # Prices splitting one downlink batch into two packets: what the early command
 # gains, and what the late one pays. Needs the shared SOF time base.
-add_executable(flush_split_test flush_split_test.cpp)
-target_link_libraries(flush_split_test PRIVATE libhcs-sdk)
 
 # The gimbal/chassis flush split on HCS's real five-frame, two-bus, classic-CAN
 # command layout. Needs the shared SOF time base.
-add_executable(hcs_command_split_test hcs_command_split_test.cpp)
-target_link_libraries(hcs_command_split_test PRIVATE libhcs-sdk)
 
 # One IMU UART line strapped to both an mc02 and an hpm5321. Both boards see
 # the same edges, so subtracting their host arrival times measures the
@@ -191,6 +183,12 @@ target_link_libraries(usb_event_loop_bench PRIVATE libhcs-sdk)
 # config field could not do. One hpm5321 dual-CAN board, no CAN/UART wiring.
 add_executable(ep0_config_test ep0_config_test.cpp)
 target_link_libraries(ep0_config_test PRIVATE libhcs-sdk)
+
+add_executable(mc02_ep0_config_test mc02_ep0_config_test.cpp)
+target_link_libraries(mc02_ep0_config_test PRIVATE libhcs-sdk)
+
+add_executable(mc02_flow_control_probe mc02_flow_control_probe.cpp)
+target_link_libraries(mc02_flow_control_probe PRIVATE libhcs-sdk)
 
 # Per-bus CAN health from the controller's own PSR/ECR registers, decoded from
 # the libhcs_CAN_DIAG telemetry. Tells "transmitted, nobody ACKed" apart from
@@ -224,3 +222,5 @@ target_link_libraries(microframe_timebase_test PRIVATE libhcs-sdk)
 # can make.
 add_executable(time_sync_matrix time_sync_matrix.cpp)
 target_link_libraries(time_sync_matrix PRIVATE libhcs-sdk)
+add_executable(rtt_split rtt_split.cpp)
+target_link_libraries(rtt_split PRIVATE libhcs-sdk)

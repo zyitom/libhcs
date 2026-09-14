@@ -543,7 +543,7 @@ int main(int argc, char** argv) {
                 for (auto& board : boards) {
                     auto builder = board->start_transmit();
                     builder.can_transmit(
-                        CanPort::kCan1, {.can_id = 0x5A0, .can_data = payload, .is_fdcan = true});
+                        CanPort::kCan1, {.can_id = 0x5A0, .can_data = payload});
                     sent.fetch_add(1, std::memory_order_relaxed);
                 }
                 // Clamp: once next falls behind now, "next += period" degenerates

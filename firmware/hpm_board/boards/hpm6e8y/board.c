@@ -9,7 +9,7 @@
 #include <hpm_common.h>
 #include <hpm_debug_console.h>
 #include <hpm_enet_drv.h>
-#include <hpm_uart_drv.h> /* board_console_try_send_byte: non-blocking TX check */
+#include <hpm_uart_drv.h> /* board_console_try_send_byte: 非阻塞 TX 检查 */
 #include <hpm_esc_drv.h>
 #include <hpm_gpio_drv.h>
 #include <hpm_gpiom_drv.h>
@@ -24,8 +24,8 @@
 #include <hpm_sysctl_drv.h>
 #include <hpm_usb_drv.h>
 
-/* Pin-level configuration is based on board reverse engineering. The HPM6E*Y*
- * package uses on-die 100M PHYs for the two EtherCAT ports. */
+/* 引脚级配置基于对板子的逆向工程。HPM6E*Y* 封装的两个 EtherCAT 端口使用
+ * 片内 100M PHY。 */
 
 #if defined(FLASH_XIP) && FLASH_XIP
 __attribute__((section(".nor_cfg_option"), used))
@@ -55,7 +55,7 @@ static void board_ecat_apply_internal_phy_link_status(const board_ecat_phy_statu
 #define BOARD_ECAT_PHY_BMSR_LINK_MASK     (0x0004U)
 #define BOARD_ECAT_PHY_RMSR_MII_MODE_MASK (0x0008U)
 
-/* Console: UART0 on PA00/PA01, routed to the on-board FT2232 (DEBUGUART0). */
+/* 控制台: UART0 于 PA00/PA01, 接到板上 FT2232(DEBUGUART0)。 */
 #define BOARD_CONSOLE_UART_BASE     HPM_UART0
 #define BOARD_CONSOLE_UART_CLK_NAME clock_uart0
 #define BOARD_CONSOLE_BAUDRATE      (115200UL)
@@ -63,8 +63,8 @@ static void board_ecat_apply_internal_phy_link_status(const board_ecat_phy_statu
 void board_init_console(void) {
     console_config_t cfg;
 
-    /* Configure the pin function before enabling the clock, otherwise the rx
-     * level change during muxing can be latched as a spurious byte. */
+    /* 先配引脚功能再开时钟: 否则复用切换期间的 RX 电平变化可能被锁存成一个
+     * 假字节。 */
     HPM_IOC->PAD[IOC_PAD_PA00].FUNC_CTL = IOC_PA00_FUNC_CTL_UART0_TXD;
     HPM_IOC->PAD[IOC_PAD_PA01].FUNC_CTL = IOC_PA01_FUNC_CTL_UART0_RXD;
 
@@ -88,17 +88,16 @@ bool board_console_try_send_byte(uint8_t byte) {
 }
 
 static void board_park_leds_off(void) {
-    /* Drive safe board LEDs to their OFF state at boot so nothing glows before
-     * the fieldbus core takes ownership. PA25/PA28 were first found by the LED
-     * scan, but the HPM6E*Y* datasheet identifies them as internal PHY LED/strap
-     * pins, so normal firmware must leave them to the PHY.
+    /* 开机先把"安全"LED 驱到熄灭态, 现场总线核接管前不得有任何东西发光。
+     * PA25/PA28 最初由 LED 扫描发现, 但 HPM6E*Y* 数据手册标明它们是内部 PHY
+     * 的 LED/strap 引脚, 正常固件必须把它们留给 PHY。
      *
-     * These must be real push-pull outputs: a weak internal pull cannot hold an
-     * LED line. This runs before board_init_clock(), so the GPIO peripheral clock
-     * is not up yet -- enable it here or the output writes silently no-op. */
+     * 必须是真正的推挽输出: 弱内部上拉 hold 不住 LED 线。本函数先于
+     * board_init_clock() 执行, GPIO 外设时钟尚未开启 -- 必须在此使能, 否则
+     * 输出写入会静默无效。 */
     clock_add_to_group(clock_gpio, 0);
 
-    /* {GPIO port/bank index, pin, off level}. Bank index: A=0, B=1, C=2, E=4. */
+    /* {GPIO 端口/bank 序号, 引脚, 熄灭电平}。bank 序号: A=0, B=1, C=2, E=4。 */
     static const struct {
         uint8_t bank;
         uint8_t pin;
@@ -106,17 +105,17 @@ static void board_park_leds_off(void) {
     } leds[] = {
         {GPIO_DO_GPIOE,  5, 1},
         {GPIO_DO_GPIOE,  4, 1},
-        {GPIO_DO_GPIOE,  3, 1}, /* main RGB R/G/B */
+        {GPIO_DO_GPIOE,  3, 1}, /* 主 RGB R/G/B */
         {GPIO_DO_GPIOC, 26, 0},
-        {GPIO_DO_GPIOC, 27, 0}, /* CAN0 green/blue */
+        {GPIO_DO_GPIOC, 27, 0}, /* CAN0 绿/蓝 */
         {GPIO_DO_GPIOE,  0, 0},
-        {GPIO_DO_GPIOE,  2, 0}, /* CAN1 green/blue */
+        {GPIO_DO_GPIOE,  2, 0}, /* CAN1 绿/蓝 */
         {GPIO_DO_GPIOA,  9, 0},
-        {GPIO_DO_GPIOB,  0, 0}, /* CAN2 green/blue */
+        {GPIO_DO_GPIOB,  0, 0}, /* CAN2 绿/蓝 */
         {GPIO_DO_GPIOB,  2, 0},
-        {GPIO_DO_GPIOB,  3, 0}, /* CAN3 green/blue */
+        {GPIO_DO_GPIOB,  3, 0}, /* CAN3 绿/蓝 */
         {GPIO_DO_GPIOC, 20, 0},
-        {GPIO_DO_GPIOC, 21, 0}, /* EtherCAT mid grn/red */
+        {GPIO_DO_GPIOC, 21, 0}, /* EtherCAT 中部 绿/红 */
     };
 
     for (uint32_t i = 0; i < sizeof(leds) / sizeof(leds[0]); ++i) {
@@ -129,16 +128,15 @@ static void board_park_leds_off(void) {
 }
 
 bool board_check_bootloader_force_stay_requested(void) {
-    /* Bootloader force-stay input = PB24, asserted low, internal pull-up.
+    /* Bootloader 强制驻留输入 = PB24, 低有效, 内部上拉。
      *
-     * The name "user key" comes from the HPM6E00EVK reference design, where PB24
-     * is KEYA. THIS BOARD HAS NO BUTTON ON IT [confirmed with the hardware,
-     * 2026-09-08] -- the pad is only brought out, so asserting it means shorting
-     * PB24 to GND through the reset. Do not document this as "hold the key".
+     * "user key" 之名来自 HPM6E00EVK 参考设计, 那里 PB24 是 KEYA。本板没有
+     * 任何按键 [2026-09-08 与硬件确认] -- 该焊盘只是引出, 触发它意味着复位
+     * 时把 PB24 短接到 GND。不要把用法写成"按住按键"。
      *
-     * The sampling window is 4 x 250 us (~1 ms) right after reset. Unlike the
-     * hpm5321, PB24 carries no other function here, so it is simply left as a
-     * GPIO input afterwards (the hpm5321 must restore PA07 to JTAG_TMS). */
+     * 采样窗口是复位后的 4 x 250 us(约 1 ms)。与 hpm5321 不同, PB24 在本板
+     * 不承担其他功能, 采样后保持 GPIO 输入即可(hpm5321 那边须把 PA07 还原
+     * 给 JTAG_TMS)。 */
     const uint32_t pad_ctl =
         IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(1) | IOC_PAD_PAD_CTL_HYS_SET(1);
 
@@ -170,8 +168,8 @@ void board_init(void) {
 
 void board_init_core1(void) {
     clock_update_core_clock();
-    /* No console on core1: UART1 (the SDK's core1 console) is this board's
-     * fieldbus data UART. The fieldbus application must not printf. */
+    /* core1 无控制台: UART1(SDK 的 core1 控制台)在本板是现场总线数据 UART,
+     * 现场总线应用不得 printf。 */
     board_init_pmp();
 }
 
@@ -187,7 +185,7 @@ void board_init_pmp(void) {
         PMP_CFG(READ_EN, WRITE_EN, EXECUTE_EN, ADDR_MATCH_NAPOT, REG_UNLOCK);
     index++;
 
-    /* Non-cacheable data region (DMA buffers). Linker-script symbol names.
+    /* 非 cache 数据区(DMA 缓冲)。链接脚本符号名。
      * NOLINTBEGIN(bugprone-reserved-identifier, readability-identifier-naming) */
     extern uint32_t __noncacheable_start__[];
     extern uint32_t __noncacheable_end__[];
@@ -207,8 +205,8 @@ void board_init_pmp(void) {
         index++;
     }
 
-    /* SHARE_RAM: non-cacheable + AMO on BOTH cores -- the cross-core rings of
-     * the EtherCAT bridge (ecat/common/xcore_ring.hpp) rely on this.
+    /* SHARE_RAM: 两个核上都配成非 cache + AMO -- EtherCAT 桥的跨核环形队列
+     * (ecat/common/xcore_ring.hpp)依赖这一点。
      * NOLINTBEGIN(bugprone-reserved-identifier, readability-identifier-naming) */
     extern uint32_t __share_mem_start__[];
     extern uint32_t __share_mem_end__[];
@@ -234,14 +232,14 @@ void board_init_pmp(void) {
 static inline void board_init_clock(void) {
     const uint32_t cpu0_freq = clock_get_frequency(clock_cpu0);
     if (cpu0_freq == PLLCTL_SOC_PLL_REFCLK_FREQ) {
-        /* Configure the External OSC ramp-up time: ~9ms */
+        /* 配置外部 OSC 起振爬升时间: 约 9 ms */
         pllctlv2_xtal_set_rampup_time(HPM_PLLCTLV2, 32UL * 1000UL * 9U);
 
-        /* Select clock setting preset1 */
+        /* 选择时钟预设 preset1 */
         sysctl_clock_set_preset(HPM_SYSCTL, 2);
     }
 
-    /* Group 0: core0 domain (fabric, flash, DMA, EtherCAT-side resources). */
+    /* Group 0: core0 域(fabric、flash、DMA、EtherCAT 侧资源)。 */
     clock_add_to_group(clock_cpu0, 0);
     clock_add_to_group(clock_mchtmr0, 0);
     clock_add_to_group(clock_ahb0, 0);
@@ -259,35 +257,32 @@ static inline void board_init_clock(void) {
     clock_add_to_group(clock_xdma, 0);
     clock_add_to_group(clock_gpio, 0);
     clock_add_to_group(clock_ptpc, 0);
-    /* A clock group answers "which CPU requests this peripheral to stay on", not
-     * "which CPU may access it" -- both cores reach every peripheral over AXI.
-     * A peripheral is gated when the CPU its group is bound to is not running.
-     * The two switches below are therefore ORTHOGONAL and must stay that way:
+    /* 时钟组回答的是"哪个 CPU 请求该外设保持开启", 不是"哪个 CPU 可以访问它"
+     * -- 两个核都经 AXI 访问所有外设。外设在其组绑定的 CPU 不运行时被门控。
+     * 下面两个开关因此正交且必须保持正交:
      *
-     *   BOARD_FIELDBUS_ON_CORE0   CAN0..CAN3 + UART1 belong to group 0
-     *   BOARD_SECONDARY_CORE_USED core1 is released, so group 1 is meaningful
+     *   BOARD_FIELDBUS_ON_CORE0   CAN0..CAN3 + UART1 归 group 0
+     *   BOARD_SECONDARY_CORE_USED 释放 core1, group 1 才有意义
      *
-     * The core-swap layout (EtherCAT on core1, USB+CAN on core0) needs BOTH set:
-     * the fieldbus peripherals must be clocked from the always-running core0
-     * while core1 still needs its CPU clock and machine timer. */
+     * 核交换布局(EtherCAT 在 core1, USB+CAN 在 core0)两者都要置位: 现场总线
+     * 外设必须由常运行的 core0 供时钟, 同时 core1 仍需要自己的 CPU 时钟和
+     * 机器定时器。 */
 #if defined(BOARD_FIELDBUS_ON_CORE0) && BOARD_FIELDBUS_ON_CORE0
-    /* Fieldbus peripherals driven from core0. Leaving them in group 1 while
-     * core1 is never released gates them forever -- that was the 2026-07-31
-     * bug where MCAN silently neither transmitted nor received (bring-up notes
-     * pitfall 12). */
+    /* 现场总线外设由 core0 驱动。若留在 group 1 而 core1 永不释放, 它们会被
+     * 永久门控 -- 即 2026-07-31 的 bug: MCAN 静默地不收不发(bring-up 笔记
+     * 坑 12)。 */
     clock_add_to_group(clock_can0, 0);
     clock_add_to_group(clock_can1, 0);
     clock_add_to_group(clock_can2, 0);
     clock_add_to_group(clock_can3, 0);
     clock_add_to_group(clock_uart1, 0);
 #endif
-    /* Connect Group0 to CPU0 */
+    /* 把 Group0 连到 CPU0 */
     clock_connect_group_to_cpu(0, 0);
 
 #if defined(BOARD_SECONDARY_CORE_USED) && BOARD_SECONDARY_CORE_USED
-    /* Group 1: core1 domain. Always carries core1's own CPU clock and machine
-     * timer; the fieldbus peripherals only join when they are not already in
-     * group 0. */
+    /* Group 1: core1 域。始终包含 core1 自己的 CPU 时钟与机器定时器; 现场总线
+     * 外设仅在未归入 group 0 时才加入。 */
     clock_add_to_group(clock_cpu1, 1);
     clock_add_to_group(clock_mchtmr1, 1);
 #if !defined(BOARD_FIELDBUS_ON_CORE0) || !BOARD_FIELDBUS_ON_CORE0
@@ -297,28 +292,26 @@ static inline void board_init_clock(void) {
     clock_add_to_group(clock_can3, 1);
     clock_add_to_group(clock_uart1, 1);
 #endif
-    /* Connect Group1 to CPU1 */
+    /* 把 Group1 连到 CPU1 */
     clock_connect_group_to_cpu(1, 1);
 #endif
 
-    /* Bump up DCDC voltage to 1275mv */
+    /* 把 DCDC 电压提高到 1275 mV */
     pcfg_dcdc_set_voltage(HPM_PCFG, 1275);
     pcfg_dcdc_switch_to_dcm_mode(HPM_PCFG);
 
-    /* Set CPU clock to 600MHz */
+    /* 把 CPU 时钟设为 600 MHz */
     clock_set_source_divider(clock_cpu0, clk_src_pll0_clk0, 1);
     clock_set_source_divider(clock_cpu1, clk_src_pll0_clk0, 1);
 
-    /* Pin AHB0 to a known 200 MHz (PLL1CLK0 800 MHz / 4). PTPC -- the shared
-     * CAN timestamp timebase -- runs on AHB0; the app-layer CAN driver bakes
-     * the resulting 5 ns PTPC step into a compile-time divisor
-     * (board::kCanTimestampNsPerUs = 1000, see app/board_app.hpp) and asserts
-     * the relationship at init. Keep these three places consistent. */
+    /* 把 AHB0 钉在已知的 200 MHz(PLL1CLK0 800 MHz / 4)。PTPC -- 共享的 CAN
+     * 时间戳时基 -- 挂在 AHB0 上; 应用层 CAN 驱动把由此得到的 5 ns PTPC 步进
+     * 固化进编译期除数 board::kCanTimestampNsPerUs = 1000(见
+     * app/board_app.hpp)并在 init 时断言该关系。这三处必须保持一致。 */
     clock_set_source_divider(clock_ahb0, clk_src_pll1_clk0, 4);
 
-    /* Both machine timers run at 4 MHz (24 MHz OSC / 6): the shared app-layer
-     * Timer (app/src/timer) and the protocol session lease constants assume
-     * 0.25 us ticks on every board. */
+    /* 两个机器定时器都跑 4 MHz(24 MHz OSC / 6): 共享的应用层 Timer
+     * (app/src/timer)与协议会话租期常量在所有板上都按 0.25 us tick 假设。 */
     clock_set_source_divider(clock_mchtmr0, clk_src_osc24m, 6);
     clock_set_source_divider(clock_mchtmr1, clk_src_osc24m, 6);
 
@@ -334,16 +327,14 @@ void board_init_usb(void) {
     clock_add_to_group(clock_usb0, 0);
 
     usb_hcd_set_power_ctrl_polarity(HPM_USB0, true);
-    /* Wait for the USB_PWR pin controlled vbus power to stabilize. */
+    /* 等待 USB_PWR 引脚控制的 VBUS 供电稳定。 */
     board_delay_ms(100);
 }
 
 void board_init_ethercat(ESC_Type* ptr) {
-    /* Keep the ESC in the clock group of whichever core owns it, same as
-     * clock_eth0 below. Purely tidiness: a clock group only says which CPU
-     * requests the peripheral to stay on, and core0 is always running in every
-     * layout, so leaving the ESC in group 0 would work even when core1 drives
-     * it. Nothing here is fragile. */
+    /* 把 ESC 放进拥有它的核的时钟组, 与下方 clock_eth0 一致。纯粹是整洁性:
+     * 时钟组只说明哪个 CPU 请求外设保持开启, 而每种布局里 core0 都常运行,
+     * 即使由 core1 驱动 ESC, 留在 group 0 也能工作。这里没有任何脆弱之处。 */
 #if defined(BOARD_RUNNING_CORE) && BOARD_RUNNING_CORE == HPM_CORE1
     clock_add_to_group(clock_esc0, 1);
 #else
@@ -354,7 +345,7 @@ void board_init_ethercat(ESC_Type* ptr) {
     configure_esc_internal_phy_interface(ptr);
 
     init_esc_pins();
-    /* Keep the on-die ECAT PHY resets asserted; the port layer releases them. */
+    /* 保持片内 ECAT PHY 的复位有效; 由 port 层释放。 */
     gpio_set_pin_output_with_initial(
         BOARD_ECAT_PHY0_RESET_GPIO, BOARD_ECAT_PHY0_RESET_GPIO_PORT_INDEX,
         BOARD_ECAT_PHY0_RESET_PIN_INDEX, BOARD_ECAT_PHY_RESET_LEVEL);
@@ -375,15 +366,12 @@ static inline void configure_esc_internal_phy_interface(ESC_Type* ptr) {
 }
 
 void board_ecat_set_internal_phy_link(bool port0_up, bool port1_up) {
-    /* The two on-die PHYs do NOT route a dedicated LINK pin to an ESC CTR input
-     * the way the EVK's external PHYs do. The SDK default therefore leaves
-     * NMII_LINK sourced from pads that are not real link inputs.
+    /* 两个片内 PHY 不像 EVK 的外部 PHY 那样把专用 LINK 引脚馈给 ESC 的 CTR
+     * 输入, SDK 默认值因此让 NMII_LINK 取自并非真实链路输入的焊盘。
      *
-     * Switch the NMII_LINK source for port0/port1 to the GPR register and drive
-     * the value from software. The GPR bit is "link invalid" when set, so
-     * clearing it marks the link valid. Do not blindly force both ports up: with
-     * one cable connected, a false-up empty port prevents the ESC from closing
-     * that loop and the master may never receive a frame back. */
+     * 把 port0/port1 的 NMII_LINK 来源切到 GPR 寄存器, 由软件驱动其值。GPR
+     * 位置 1 表示"链路无效", 清零即标记有效。不可盲目把两路都置 up: 只插一根
+     * 线时, 空端口假 up 会让 ESC 闭不上这个环, 主站可能永远收不到回帧。 */
     uint32_t gpr = HPM_ESC->GPR_CFG2;
     gpr &= ~(ESC_GPR_CFG2_NMII_LINK0_FROM_IO_MASK | ESC_GPR_CFG2_NMII_LINK1_FROM_IO_MASK);
     if (port0_up) {
@@ -615,22 +603,20 @@ static inline void init_esc_pins(void) {
     HPM_IOC->PAD[IOC_PAD_PW20].FUNC_CTL = IOC_PW20_FUNC_CTL_ESC0_REFCK;
     HPM_IOC->PAD[IOC_PAD_PW21].FUNC_CTL = IOC_PW21_FUNC_CTL_ESC0_REFCK;
 
-    /* On-die PHY LED/address-strap pads double as ESC link-source controls. */
+    /* 片内 PHY 的 LED/地址 strap 焊盘兼任 ESC 链路源控制。 */
     HPM_IOC->PAD[IOC_PAD_PA25].FUNC_CTL = IOC_PA25_FUNC_CTL_ESC0_CTR_0;
     HPM_IOC->PAD[IOC_PAD_PA25].PAD_CTL = strap_pullup_ctl;
     HPM_IOC->PAD[IOC_PAD_PA28].FUNC_CTL = IOC_PA28_FUNC_CTL_ESC0_CTR_1;
     HPM_IOC->PAD[IOC_PAD_PA28].PAD_CTL = strap_pullup_ctl;
 
-    /* EtherCAT RUN/ERROR status LEDs: the GPIO LED scan found PC20 (green) and
-     * PC21 (red) as the "EtherCAT middle" indicators, and both carry an ESC0_CTR
-     * alt function (PC20 = CTR_2, PC21 = CTR_3), so the ESC drives them directly
-     * from the AL state machine. CTR_2/CTR_3 are free (CTR_0/CTR_1 are the
-     * NMII_LINK sources above). The port layer (hpm_ecat_hw.c) binds LED_RUN to
-     * BOARD_ECAT_LED_RUN_CTRL_INDEX (2) and LED_ERROR to
-     * BOARD_ECAT_LED_ERROR_CTRL_INDEX (3); board_park_leds_off() drives these OFF
-     * before the ESC takes them. The LEDs are active-high and the SDK drives the
-     * CTR LED signal non-inverted -- if they read inverted on hardware, that
-     * polarity is the thing to flip. */
+    /* EtherCAT RUN/ERROR 状态 LED: GPIO LED 扫描找到 PC20(绿)与 PC21(红)即
+     * "EtherCAT 中部"指示灯, 两者都带 ESC0_CTR 复用功能(PC20 = CTR_2,
+     * PC21 = CTR_3), ESC 直接由 AL 状态机驱动它们。CTR_2/CTR_3 空闲
+     * (CTR_0/CTR_1 已用作上面的 NMII_LINK 源)。port 层(hpm_ecat_hw.c)把
+     * LED_RUN 绑到 BOARD_ECAT_LED_RUN_CTRL_INDEX(2), LED_ERROR 绑到
+     * BOARD_ECAT_LED_ERROR_CTRL_INDEX(3); board_park_leds_off() 会在 ESC 接管
+     * 之前把它们驱到熄灭。LED 高有效, SDK 以非反相方式驱动 CTR LED 信号 --
+     * 若硬件上观察到反相, 应翻转的就是这个极性。 */
     HPM_IOC->PAD[IOC_PAD_PC20].FUNC_CTL = IOC_PC20_FUNC_CTL_ESC0_CTR_2;
     HPM_IOC->PAD[IOC_PAD_PC21].FUNC_CTL = IOC_PC21_FUNC_CTL_ESC0_CTR_3;
 

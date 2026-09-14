@@ -31,7 +31,7 @@ namespace {
 
 // Bus configuration
 constexpr unsigned kBusCount = 2;       // CAN bus 0 + bus 1
-constexpr bool kUseCanFd = true;        // send CAN-FD frames on both buses
+// No classic/FD switch any more: frames go out in the bus's compiled mode.
 
 // Motor / CAN identifiers (3519 control protocol)
 constexpr unsigned kMotorId = 2;
@@ -83,7 +83,7 @@ public:
         frame[3] = static_cast<std::byte>(current & 0xFF);
         board_->transmit([&](examples::BoardTransmitter& tx) {
             tx.can(static_cast<int>(bus),
-                {.can_id = kControlCanId, .can_data = frame, .is_fdcan = kUseCanFd});
+                {.can_id = kControlCanId, .can_data = frame});
         });
     }
 
@@ -141,7 +141,7 @@ int main() {
     std::signal(SIGINT, on_sigint);
 
     printf("Motor PID Sine -- two-CAN-bus bridge (CAN-FD, hw-timestamp velocity)\n");
-    printf("  buses        : bus 0 + bus 1 (CAN-FD=%s)\n", kUseCanFd ? "on" : "off");
+    printf("  buses        : bus 0 + bus 1 (frames follow the bus mode: CAN-FD)\n");
     printf("  motor ID     : %u\n", kMotorId);
     printf("  control CAN  : 0x%03X\n", kControlCanId);
     printf("  feedback CAN : 0x%03X\n", kFeedbackCanId);

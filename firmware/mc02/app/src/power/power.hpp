@@ -7,26 +7,21 @@
 
 namespace libhcs::firmware::power {
 
-// The three switched output rails on mc02's screw terminals.
+// mc02 接线端子上的三路开关输出电源轨。
 //
-// Pins, and the states they come up in, are fixed by mc02_slave.ioc and applied
-// by MX_GPIO_Init() long before anything here runs:
+// 引脚及其上电状态由 mc02_slave.ioc 固定、由 MX_GPIO_Init() 在此之前很久施加:
 //
-//   Power_OUT1_EN  PC14  24 V rail 0  reset LOW   (off)
-//   Power_OUT2_EN  PC13  24 V rail 1  reset LOW   (off)
-//   Power_5V_EN    PC15   5 V rail    reset HIGH  (on)
+//   Power_OUT1_EN  PC14  24 V 轨 0  复位低(关)
+//   Power_OUT2_EN  PC13  24 V 轨 1  复位低(关)
+//   Power_5V_EN    PC15   5 V 轨    复位高(开)
 //
-// Deliberately free functions holding no state, and deliberately no
-// initialization step: the 24 V rails feed whatever is wired to the terminals,
-// so their power-on state is a hardware decision that belongs in the .ioc. A
-// constructor that drove them would either duplicate that decision or silently
-// override it, and either way the rails would glitch on every reset. The
-// accessors read ODR back instead of caching, so they cannot disagree with the
-// pin.
+// 刻意用无状态的自由函数, 也刻意不做初始化: 24 V 轨馈给端子上所接的东西, 其上电
+// 状态是 .ioc 里的硬件决策。构造函数去驱动它, 要么重复该决策要么悄悄覆盖, 无论
+// 哪种都会让电源轨在每次复位时毛刺。访问器回读 ODR 而非缓存, 故不可能与引脚
+// 不一致。
 //
-// Board-local only: nothing in core/ carries a power-rail concept, so these are
-// not reachable from the host. Exposing them means adding a data view in
-// core/include/libhcs/data/datas.hpp first.
+// 仅限本板: core/ 不携带电源轨概念, 主机不可达。要暴露须先在
+// core/include/libhcs/data/datas.hpp 增加数据视图。
 
 namespace internal {
 

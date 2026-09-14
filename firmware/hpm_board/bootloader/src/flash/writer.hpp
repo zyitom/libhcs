@@ -13,15 +13,13 @@
 
 namespace libhcs::firmware::flash {
 
-// Sector-buffered writer for the application slot, fed by the DFU download path.
+// app 槽的按扇区缓冲写入器, 由 DFU 下载路径喂数据。
 //
-// Every erase/program failure is returned to the caller, which turns it into a
-// DFU status the host can see (errERASE / errPROG). Nothing on this path traps:
-// a worn or locked sector must not be able to make the bootloader unreachable.
+// 擦除/编程失败一律返回给调用方, 由调用方转成主机可见的 DFU 状态(errERASE /
+// errPROG)。此路径上没有任何 trap: 磨损或锁死的扇区不能让 bootloader 失联。
 //
-// The bounds checks below are real checks rather than assertions. They are the
-// last thing standing between a malformed download and an overwritten
-// bootloader or metadata sector, so they must never be compiled out.
+// 下面的边界检查是真实检查而非断言: 它们是畸形下载与覆写 bootloader 或
+// metadata 扇区之间的最后屏障, 绝不能被编译掉。
 class Writer {
 public:
     static constexpr uint32_t kTransferBlockSize = CFG_TUD_DFU_XFER_BUFSIZE;
@@ -62,9 +60,8 @@ public:
             const size_t writable = static_cast<size_t>(sector_size - sector_offset);
             const size_t chunk_size = std::min(writable, data.size() - input_offset);
 
-            // DFU never rewinds, so the incoming offset must line up with what
-            // the buffer already holds. A mismatch means the transfer went out
-            // of step and the image would be silently corrupted.
+            // DFU 从不回退, 进来的偏移必须与缓冲已有内容衔接。不匹配说明传输
+            // 失序, 镜像将被静默写坏。
             if (sector_offset != buffered_size_)
                 return false;
 

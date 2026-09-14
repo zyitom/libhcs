@@ -140,9 +140,7 @@ public:
             case hcs::CanPort::kCan1: id = data::DataId::kCan1; break;
             case hcs::CanPort::kCan2: id = data::DataId::kCan2; break;
             case hcs::CanPort::kCan3: id = data::DataId::kCan3; break;
-            default:
-                throw std::out_of_range{
-                    "Hpm6e8y: CAN port out of range (CAN0..CAN3)"};
+            default: throw std::out_of_range{"Hpm6e8y: CAN port out of range (CAN0..CAN3)"};
             }
             if (!builder_.write_can(id, data)) [[unlikely]]
                 throw std::invalid_argument{"CAN transmission failed: Invalid CAN data"};
@@ -183,9 +181,9 @@ public:
     uint32_t uart0_baudrate() { return hcs::read_uart_baudrate(handler_, 0); }
 
     // Frame type of each CAN bus, as the board reported it during construction.
-    // It is a property of the bus, not of a frame: CanDataView::is_fdcan is
-    // ignored by this board's firmware, which sends every frame in its bus's
-    // mode. Read this instead of assuming.
+    // It is a property of the bus, not of a frame: the wire protocol carries no
+    // per-frame type flag any more, and this board's firmware sends every frame
+    // in its bus's compiled mode. Read this instead of assuming.
     [[nodiscard]] bool can0_is_fd() const { return interface_.can_fd(0); }
 
     [[nodiscard]] bool can1_is_fd() const { return interface_.can_fd(1); }
@@ -199,6 +197,14 @@ public:
     // wIndex is the silkscreen number (CanPort::kCan0 == 0).
     [[nodiscard]] hcs::vc::CanStatusPayload can_status(hcs::CanPort port) {
         return hcs::read_can_status(handler_, static_cast<std::size_t>(port));
+    }
+
+    // One CAN bus's full timing identity over EP0: the TX mode in force (this
+    // board applies nothing -- the capability bit is clear), the rates and
+    // sample points the controller is actually timed for (1 Mbit/s / 5 Mbit/s /
+    // 875 per mille), and the capability bits.
+    [[nodiscard]] hcs::vc::CanConfigPayload can_config(hcs::CanPort port) {
+        return hcs::read_can_config(handler_, static_cast<std::size_t>(port));
     }
 
     // How much of a CAN round trip happens on the board. Cycles; divide by

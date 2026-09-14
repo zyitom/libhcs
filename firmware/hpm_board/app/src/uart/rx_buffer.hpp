@@ -29,9 +29,9 @@ public:
     static constexpr size_t kBufferMask = kBufferSize - 1;
     static_assert((kBufferSize & (kBufferSize - 1)) == 0);
 
-    // 64-byte DMA transfer per descriptor: 32 linked descriptors cover
-    // the full 2 KiB ring.  Small transfers keep latency low for framed
-    // protocols — HT fires at 32 B (347 us @ 921600), TC at 64 B (694 us).
+    // 每描述符 64 字节 DMA 传输: 32 个链式描述符覆盖整个 2 KiB 环。小传输
+    // 降低帧协议的延迟 -- HT 在 32 B 触发(921600 baud 下 347 us), TC 在
+    // 64 B(694 us)触发。
     static constexpr size_t kBufferTriggerIrqSize = HPM_L1C_CACHELINE_SIZE;
     static constexpr size_t kDmaTransSize = 2 * kBufferTriggerIrqSize;
     static constexpr size_t kDmaDescriptorCount = kBufferSize / kDmaTransSize;
@@ -76,12 +76,11 @@ private:
         config.dst_addr_ctrl = DMA_MGR_ADDRESS_CONTROL_INCREMENT;
         config.src_mode = DMA_MGR_HANDSHAKE_MODE_HANDSHAKE;
         config.dst_mode = DMA_MGR_HANDSHAKE_MODE_NORMAL;
-        // One transfer per handshake, because the UART raises the RX DMA
-        // request at uart_rx_fifo_trg_not_empty -- i.e. with a single byte in
-        // the FIFO (see Uart::init). A burst larger than the guaranteed FIFO
-        // occupancy makes the DMA read RBR again on an empty FIFO and store
-        // whatever it returns: with the previous 4T setting every received byte
-        // landed in the ring as one good byte followed by three junk bytes.
+        // 每次握手只传一个字节: UART 在 uart_rx_fifo_trg_not_empty 时才发
+        // RX DMA 请求, 即 FIFO 里只有一个字节时(见 Uart::init)。突发量超过
+        // FIFO 保证的占用量, DMA 就会在空 FIFO 上再次读 RBR 并存下返回的
+        // 任意值: 先前的 4T 配置下, 每个收到的字节都以"一个好字节跟三个
+        // 垃圾字节"的形式落入环形。
         config.src_burst_size = DMA_MGR_NUM_TRANSFER_PER_BURST_1T;
         config.size_in_byte = kDmaTransSize;
         config.linked_ptr = reinterpret_cast<uintptr_t>(&dma_linked_descriptors_[1]);
@@ -99,7 +98,7 @@ private:
                 == status_success);
             config.dst_addr += kDmaTransSize;
         }
-        // No cache maintenance: buffers reside in AHB SRAM (non-cached).
+        // 无需 cache 维护: 缓冲位于 AHB SRAM(非缓存)。
 
         auto callback = [](DMA_Type* /*base*/, uint32_t /*channel*/, void* user_data) {
             static_cast<RxBuffer*>(user_data)->dma_tc_half_tc_callback();
@@ -126,7 +125,7 @@ private:
         } else {
             const auto offset = out & kBufferMask;
             const auto slice = std::min(readable, kBufferSize - offset);
-            // No cache inval: data_buffer_ is in AHB SRAM.
+            // 无需 cache invalidate: data_buffer_ 在 AHB SRAM。
 
             if (slice == readable) {
                 static_cast<T*>(this)->handle_uplink({data_buffer_ + offset, slice}, {}, is_idle);
@@ -159,8 +158,7 @@ private:
     }
 
     UART_Type* uart_base_;
-    // Placed in AHB SRAM by the caller — naturally non-cached, no manual
-    // invalidate required.
+    // 由调用方放入 AHB SRAM -- 天然非缓存, 无需手工 invalidate。
     std::byte* data_buffer_;
     dma_mgr_linked_descriptor_t* dma_linked_descriptors_;
     dma_resource_t dma_;

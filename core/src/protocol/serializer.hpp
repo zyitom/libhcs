@@ -53,7 +53,6 @@ public:
         if (view.is_extended_can_id) {
             auto header = CanHeaderExtended::Ref(cursor);
             cursor += sizeof(CanHeaderExtended);
-            header.set<CanHeaderExtended::IsFdCan>(view.is_fdcan);
             header.set<CanHeaderExtended::IsExtendedCanId>(true);
             header.set<CanHeaderExtended::IsRemoteTransmission>(view.is_remote_transmission);
             header.set<CanHeaderExtended::HasTimestamp>(has_timestamp);
@@ -63,7 +62,6 @@ public:
         } else {
             auto header = CanHeaderStandard::Ref(cursor);
             cursor += sizeof(CanHeaderStandard);
-            header.set<CanHeaderStandard::IsFdCan>(view.is_fdcan);
             header.set<CanHeaderStandard::IsExtendedCanId>(false);
             header.set<CanHeaderStandard::IsRemoteTransmission>(view.is_remote_transmission);
             header.set<CanHeaderStandard::HasTimestamp>(has_timestamp);
@@ -78,9 +76,13 @@ public:
         }
 
         if (has_timestamp) {
-            const uint32_t ts = *view.timestamp_us;
-            std::memcpy(cursor, &ts, sizeof(ts));
-            cursor += sizeof(ts);
+            // Explicit little-endian to match every other wire field -- this
+            // used to be a native memcpy, which made it the one field whose
+            // layout depended on the CPU endianness. On a little-endian host
+            // the bitfield store compiles to the same plain store.
+            utility::Bitfield<4>::Ref{cursor}.set<layouts::CanTimestampLayout::TimestampUs>(
+                *view.timestamp_us);
+            cursor += sizeof(uint32_t);
         }
 
         utility::assert_debug(cursor == dst.data() + dst.size());
@@ -431,41 +433,6 @@ public:
         payload.set<TimeStatusPayload::ResidualMeanQ16>(view.residual_mean_q16);
         payload.set<TimeStatusPayload::ResidualAbsMaxQ16>(view.residual_abs_max_q16);
         payload.set<TimeStatusPayload::ResidualCount>(view.residual_count);
-        payload.set<TimeStatusPayload::PtpcUnitsPerMicroframe>(view.ptpc_units_per_microframe);
-        payload.set<TimeStatusPayload::PtpcReferenceUnits>(view.ptpc_reference_units);
-        payload.set<TimeStatusPayload::PtpcReferenceMicroframe>(view.ptpc_reference_microframe);
-        payload.set<TimeStatusPayload::PtpcResidualMean>(view.ptpc_residual_mean);
-        payload.set<TimeStatusPayload::PtpcResidualAbsMax>(view.ptpc_residual_abs_max);
-        payload.set<TimeStatusPayload::PtpcStepMin>(view.ptpc_step_min);
-        payload.set<TimeStatusPayload::PtpcStepMax>(view.ptpc_step_max);
-        payload.set<TimeStatusPayload::PtpcRawNs>(view.ptpc_raw_ns);
-        payload.set<TimeStatusPayload::PtpcRawMicroframe>(view.ptpc_raw_microframe);
-
-        utility::assert_debug(cursor == dst.data() + dst.size());
-        return SerializeResult::kSuccess;
-    }
-
-    SerializeResult write_sync_sample(const data::SyncSampleView& view) noexcept {
-        const std::size_t required = required_session_size() + sizeof(SyncSamplePayload);
-
-        auto dst = buffer_.allocate(required);
-        libhcs_VERIFY_LIKELY(!dst.empty(), SerializeResult::kBadAlloc);
-        utility::assert_debug(dst.size() == required);
-        std::byte* cursor = dst.data();
-
-        write_field_header(cursor, FieldId::kSession);
-
-        auto header = SessionHeader::Ref(cursor);
-        cursor += sizeof(SessionHeader);
-        header.set<SessionHeader::Type>(data::SessionType::kSyncSample);
-        header.set<SessionHeader::Nonce>(view.nonce);
-
-        auto payload = SyncSamplePayload::Ref(cursor);
-        cursor += sizeof(SyncSamplePayload);
-        payload.set<SyncSamplePayload::Tag>(view.tag);
-        payload.set<SyncSamplePayload::MicroframeQ16>(view.microframe_q16);
-        payload.set<SyncSamplePayload::Bus>(view.bus);
-        payload.set<SyncSamplePayload::PtpcNs>(view.ptpc_ns);
 
         utility::assert_debug(cursor == dst.data() + dst.size());
         return SerializeResult::kSuccess;

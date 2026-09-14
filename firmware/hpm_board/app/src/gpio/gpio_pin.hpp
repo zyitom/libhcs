@@ -96,7 +96,7 @@ public:
 private:
     uintptr_t gpio_base_;
 
-    // Optimized for RV32I: 1-instruction extract for port / pin / active_high.
+    // 为 RV32I 优化: port / pin / active_high 均可单指令提取。
     uint32_t port_        : 4;
     uint32_t active_high_ : 1;
     uint32_t controller_  : 6;
@@ -253,21 +253,21 @@ struct GpioPortTraits {
 
 #define libhcs_INTERNAL_PAD_ENTRY(letter, pin) libhcs_INTERNAL_GET_PAD_VAL(IOC_PAD_P##letter##pin)
 
-#define libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(letter)                                     \
-    template <>                                                                              \
-    struct GpioPortTraits<libhcs_INTERNAL_PORT_CHAR(letter)> {                              \
-        static_assert(GPIO_DI_GPIO##letter == GPIO_DO_GPIO##letter);                         \
-        static_assert(GPIO_DI_GPIO##letter == GPIO_OE_GPIO##letter);                         \
-        static_assert(GPIO_DI_GPIO##letter == GPIO_IF_GPIO##letter);                         \
-        static_assert(GPIO_DI_GPIO##letter == GPIO_IE_GPIO##letter);                         \
-        static_assert(GPIO_DI_GPIO##letter == GPIO_PL_GPIO##letter);                         \
-        static_assert(GPIO_DI_GPIO##letter == GPIO_TP_GPIO##letter);                         \
-        static_assert(GPIO_DI_GPIO##letter == GPIO_AS_GPIO##letter);                         \
-        static_assert(GPIO_DI_GPIO##letter == GPIO_PD_GPIO##letter);                         \
-        static_assert(GPIO_DI_GPIO##letter == GPIOM_ASSIGN_GPIO##letter);                    \
-        static_assert(GPIO_DI_GPIO##letter < 256);                                           \
-        static constexpr uint32_t kInvalidPad = std::numeric_limits<uint32_t>::max();        \
-        static constexpr std::array<uint32_t, 32> kPadByPin = {                              \
+#define libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(letter)                                    \
+    template <>                                                                            \
+    struct GpioPortTraits<libhcs_INTERNAL_PORT_CHAR(letter)> {                             \
+        static_assert(GPIO_DI_GPIO##letter == GPIO_DO_GPIO##letter);                       \
+        static_assert(GPIO_DI_GPIO##letter == GPIO_OE_GPIO##letter);                       \
+        static_assert(GPIO_DI_GPIO##letter == GPIO_IF_GPIO##letter);                       \
+        static_assert(GPIO_DI_GPIO##letter == GPIO_IE_GPIO##letter);                       \
+        static_assert(GPIO_DI_GPIO##letter == GPIO_PL_GPIO##letter);                       \
+        static_assert(GPIO_DI_GPIO##letter == GPIO_TP_GPIO##letter);                       \
+        static_assert(GPIO_DI_GPIO##letter == GPIO_AS_GPIO##letter);                       \
+        static_assert(GPIO_DI_GPIO##letter == GPIO_PD_GPIO##letter);                       \
+        static_assert(GPIO_DI_GPIO##letter == GPIOM_ASSIGN_GPIO##letter);                  \
+        static_assert(GPIO_DI_GPIO##letter < 256);                                         \
+        static constexpr uint32_t kInvalidPad = std::numeric_limits<uint32_t>::max();      \
+        static constexpr std::array<uint32_t, 32> kPadByPin = {                            \
             libhcs_INTERNAL_PAD_ENTRY(letter, 00), libhcs_INTERNAL_PAD_ENTRY(letter, 01),  \
             libhcs_INTERNAL_PAD_ENTRY(letter, 02), libhcs_INTERNAL_PAD_ENTRY(letter, 03),  \
             libhcs_INTERNAL_PAD_ENTRY(letter, 04), libhcs_INTERNAL_PAD_ENTRY(letter, 05),  \
@@ -284,11 +284,11 @@ struct GpioPortTraits {
             libhcs_INTERNAL_PAD_ENTRY(letter, 26), libhcs_INTERNAL_PAD_ENTRY(letter, 27),  \
             libhcs_INTERNAL_PAD_ENTRY(letter, 28), libhcs_INTERNAL_PAD_ENTRY(letter, 29),  \
             libhcs_INTERNAL_PAD_ENTRY(letter, 30), libhcs_INTERNAL_PAD_ENTRY(letter, 31)}; \
-        static constexpr bool has_pad(uint32_t pin) {                                        \
-            return pin < kPadByPin.size() && kPadByPin[pin] != kInvalidPad;                  \
-        }                                                                                    \
-        static constexpr uint32_t pad(uint32_t pin) { return kPadByPin[pin]; }               \
-        static constexpr uint32_t kPort = GPIO_DI_GPIO##letter;                              \
+        static constexpr bool has_pad(uint32_t pin) {                                      \
+            return pin < kPadByPin.size() && kPadByPin[pin] != kInvalidPad;                \
+        }                                                                                  \
+        static constexpr uint32_t pad(uint32_t pin) { return kPadByPin[pin]; }             \
+        static constexpr uint32_t kPort = GPIO_DI_GPIO##letter;                            \
     };
 
 #ifdef GPIO_DI_GPIOA
@@ -296,103 +296,114 @@ libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(A)
 #endif
 
 #ifdef GPIO_DI_GPIOB
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(B)
+    libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(B)
 #endif
 
 #ifdef GPIO_DI_GPIOC
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(C)
+        libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(C)
 #endif
 
 #ifdef GPIO_DI_GPIOD
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(D)
+            libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(D)
 #endif
 
 #ifdef GPIO_DI_GPIOE
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(E)
+                libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(E)
 #endif
 
 #ifdef GPIO_DI_GPIOF
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(F)
+                    libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(F)
 #endif
 
 #ifdef GPIO_DI_GPIOG
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(G)
+                        libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(G)
 #endif
 
 #ifdef GPIO_DI_GPIOH
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(H)
+                            libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(H)
 #endif
 
 #ifdef GPIO_DI_GPIOI
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(I)
+                                libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(I)
 #endif
 
 #ifdef GPIO_DI_GPIOJ
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(J)
+                                    libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(J)
 #endif
 
 #ifdef GPIO_DI_GPIOK
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(K)
+                                        libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(K)
 #endif
 
 #ifdef GPIO_DI_GPIOL
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(L)
+                                            libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(L)
 #endif
 
 #ifdef GPIO_DI_GPIOM
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(M)
+                                                libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(M)
 #endif
 
 #ifdef GPIO_DI_GPION
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(N)
+                                                    libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(N)
 #endif
 
 #ifdef GPIO_DI_GPIOO
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(O)
+                                                        libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(O)
 #endif
 
 #ifdef GPIO_DI_GPIOP
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(P)
+                                                            libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(
+                                                                P)
 #endif
 
 #ifdef GPIO_DI_GPIOQ
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(Q)
+                                                                libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(
+                                                                    Q)
 #endif
 
 #ifdef GPIO_DI_GPIOR
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(R)
+                                                                    libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(
+                                                                        R)
 #endif
 
 #ifdef GPIO_DI_GPIOS
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(S)
+                                                                        libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(
+                                                                            S)
 #endif
 
 #ifdef GPIO_DI_GPIOT
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(T)
+                                                                            libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(
+                                                                                T)
 #endif
 
 #ifdef GPIO_DI_GPIOU
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(U)
+                                                                                libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(
+                                                                                    U)
 #endif
 
 #ifdef GPIO_DI_GPIOV
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(V)
+                                                                                    libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(
+                                                                                        V)
 #endif
 
 #ifdef GPIO_DI_GPIOW
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(W)
+                                                                                        libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(
+                                                                                            W)
 #endif
 
 #ifdef GPIO_DI_GPIOX
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(X)
+                                                                                            libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(
+                                                                                                X)
 #endif
 
 #ifdef GPIO_DI_GPIOY
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(Y)
+                                                                                                libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(
+                                                                                                    Y)
 #endif
 
 #ifdef GPIO_DI_GPIOZ
-libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(Z)
+                                                                                                    libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS(
+                                                                                                        Z)
 #endif
 
 #undef libhcs_INTERNAL_DEFINE_GPIO_PORT_TRAITS

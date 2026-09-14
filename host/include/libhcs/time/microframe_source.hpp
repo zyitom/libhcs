@@ -35,6 +35,18 @@
 //   cost is bounded by predicting the next edge and opening a narrow window
 //   around it -- see sample_edge().
 //
+// COUNTER WIDTH. xHCI 5.5.1 gives MFINDEX 10 bits -- a wrap every 1024
+// microframes, 128 ms, and the wrap event fires that often. The Tiger Lake
+// this was built and measured on implements 14 bits instead (2.048 s wrap);
+// believing either width on the wrong controller is fatal: masked deltas
+// across a real wrap look like the counter jumping by ~15/16 of its span,
+// which the consistency check then reports as a stopped counter. Construction
+// therefore MEASURES the width: over a 300 ms window a 10-bit counter must
+// cross its wrap at least twice, and each crossing shows up as a delta past
+// half the 14-bit span, which a 14-bit counter cannot reach in 300 ms at
+// 8 kHz (2400 counts). counter_modulus() reports what was detected; a width
+// other than 10 or 14 is rejected as a stopped counter rather than guessed.
+//
 // CLOCKS. Every reading carries both a steady_clock stamp (CLOCK_MONOTONIC, to
 // interoperate with Timeline) and a CLOCK_MONOTONIC_RAW stamp. Use the raw one
 // for anything measured in ppm: this kernel was caught slewing CLOCK_MONOTONIC
@@ -75,11 +87,17 @@ public:
     using Clock = std::chrono::steady_clock;
 
     static constexpr std::uint32_t kCounterBits = 14;
+    // Widest counter this class can make sense of, and the mask read_raw()
+    // applies. The EFFECTIVE wrap width is detected at construction (10-bit
+    // per spec, 14-bit on the controllers observed so far) -- see
+    // counter_modulus().
     static constexpr std::uint32_t kCounterModulus = std::uint32_t{1} << kCounterBits;
     static constexpr std::chrono::nanoseconds kMicroframePeriod{125'000};
 
-    // 2.048 s. Two samples further apart than half of this cannot resolve the
-    // wrap from the counter alone; see the gap policy on sample().
+    // Nominal wrap period of the widest counter. 2.048 s. Two samples further
+    // apart than half of this cannot resolve the wrap from the counter alone;
+    // see the gap policy on sample(). A 10-bit controller wraps 16x more often,
+    // which the extension handles through the same elapsed-time resolution.
     static constexpr std::chrono::nanoseconds kWrapPeriod = kMicroframePeriod * kCounterModulus;
 
     // Longest gap between sample() calls from which the axis can still be
@@ -219,6 +237,11 @@ public:
 
     [[nodiscard]] State state() const noexcept;
     [[nodiscard]] bool valid() const noexcept { return state() == State::kValid; }
+
+    // Wrap width detected at construction: 1024 (spec 10-bit) or 16384
+    // (14-bit, observed on Intel xHC). Zero before construction completed --
+    // only reachable on a moved-from source.
+    [[nodiscard]] std::uint32_t counter_modulus() const noexcept;
 
     [[nodiscard]] const std::string& pci_device() const noexcept;
 

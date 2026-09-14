@@ -8,8 +8,8 @@ extern "C" {
 # error CFG_TUSB_MCU must be defined
 #endif
 
-// STM32H723 has only USB_OTG_HS; TinyUSB remaps it to rhport 0 by aliasing
-// USB_OTG_FS_PERIPH_BASE -> USB1_OTG_HS_PERIPH_BASE when USB2_OTG_FS is absent.
+// STM32H723 只有 USB_OTG_HS; USB2_OTG_FS 缺席时, TinyUSB 通过把
+// USB_OTG_FS_PERIPH_BASE 别名到 USB1_OTG_HS_PERIPH_BASE 将其映射为 rhport 0。
 #ifndef BOARD_DEVICE_RHPORT_NUM
 # define BOARD_DEVICE_RHPORT_NUM 0
 #endif

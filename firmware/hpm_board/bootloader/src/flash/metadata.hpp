@@ -7,10 +7,9 @@
 
 namespace libhcs::firmware::flash {
 
-// Every mutating entry point returns false instead of trapping on a flash
-// failure. The bootloader is the last line of recovery: a metadata sector that
-// has become unwritable must leave the device sitting in DFU reporting an error
-// status, not fault into a state no host can talk to.
+// 每个会改动 flash 的入口在 flash 失败时返回 false 而非 trap。bootloader 是恢复
+// 的最后防线: 变得不可写的 metadata 扇区必须让设备停在 DFU 上报错误状态, 而不
+// 是 fault 进主机无法通信的状态。
 class Metadata {
 public:
     static Metadata& get_instance() {
@@ -30,8 +29,7 @@ public:
         } else if (latest_valid_slot_state_ == DataSlotState::kEmpty) {
 
         } else if (latest_valid_slot_state_ == DataSlotState::kFlashing) {
-            // Reuse the marker an interrupted session already left behind: the
-            // ready record goes into this same slot, word by word.
+            // 复用被中断会话留下的标记: ready 记录将逐字写进同一个槽。
             return true;
         } else if (latest_valid_slot_state_ == DataSlotState::kReady) {
             const auto next_addr =
@@ -80,10 +78,9 @@ private:
         volatile uint32_t magic;
         volatile uint32_t image_state;
         volatile uint32_t image_size;
-        // Retired CRC32 word. The image is covered by the SHA-256 suffix, which
-        // subsumes a CRC entirely; the word is kept so the on-flash slot layout
-        // and stride are unchanged and sectors written by earlier bootloaders
-        // still read back correctly. It is left erased.
+        // 已废弃的 CRC32 字。镜像由 SHA-256 后缀覆盖, 其检测力完全包含 CRC;
+        // 保留该字使 flash 上的槽位布局与步长不变, 早期 bootloader 写的扇区仍
+        // 能正确读回。该字保持擦除态。
         volatile uint32_t reserved;
 
         DataSlotState read_state() const {
@@ -126,9 +123,8 @@ private:
                 return false;
 
             auto& xpi_nor = XpiNor::instance();
-            // Size first, state last: the state word is the commit barrier, so a
-            // power loss between the two leaves the slot unrecognizable rather
-            // than valid-looking with a missing size.
+            // 先写 size 后写 state: state 字是提交屏障, 两次写入之间掉电只会留下
+            // 无法辨认的槽, 而非看似有效却缺 size 的记录。
             if (!xpi_nor.program_word(reinterpret_cast<uintptr_t>(&image_size), size))
                 return false;
             if (!xpi_nor.program_word(reinterpret_cast<uintptr_t>(&image_state), kImageStateReady))

@@ -9,9 +9,9 @@
 
 namespace libhcs::firmware::flash {
 
-// Boards can reserve flash above the app image (e.g. the EtherCAT bridge's
-// flash-emulated ESC EEPROM at offset 2 MiB) by capping the accepted image
-// region with BOARD_APP_FLASH_END_OFFSET; the default is the whole flash.
+// 板卡可在 app 镜像之上保留 flash(如 EtherCAT 桥用 flash 模拟的 ESC EEPROM,
+// 偏移 2 MiB), 做法是用 BOARD_APP_FLASH_END_OFFSET 封顶可接受的镜像区域;
+// 默认为整片 flash。
 #ifndef BOARD_APP_FLASH_END_OFFSET
 # define BOARD_APP_FLASH_END_OFFSET BOARD_FLASH_SIZE
 #endif
@@ -30,20 +30,17 @@ static_assert((kMetadataStartAddress % kFlashSectorSize) == 0U);
 static_assert((kAppStartAddress % kFlashSectorSize) == 0U);
 static_assert((kAppEndAddress % kFlashSectorSize) == 0U);
 
-// FoE staging region. Addresses and the on-flash record live in common/, because
-// the RUNNING APP writes them and the bootloader reads them -- see
-// common/foe_staging.hpp for the ownership split and the crash-safety argument.
+// FoE staging 区域。地址与 flash 上的记录格式都放在 common/: 写入方是运行中的
+// app, 读取方是 bootloader -- 归属划分与崩溃安全论证见 common/foe_staging.hpp。
 #if defined(BOARD_FOE_STAGING_ADDR)
 
-// The cap itself lives in common/foe_staging.hpp, because the app enforces it
-// while receiving and the bootloader enforces it while installing; a cap that
-// differed between the two would let the app stage an image the bootloader then
-// refuses, which is the one failure this whole design is meant to avoid.
+// 容量上限本身定义在 common/foe_staging.hpp: app 在接收时执行它, bootloader 在
+// 安装时执行它; 两边不一致会让 app 暂存一个 bootloader 随后拒绝的镜像 --
+// 这正是整套设计要避免的唯一失败。
 inline constexpr size_t kStagingMaxImageSize = foe::kStagingMaxImageSize;
 
-// foe_staging.hpp has to spell the app slot out from board.h alone (the app must
-// not include bootloader headers). This is where the two derivations meet, so
-// assert they agree rather than trusting that they do.
+// foe_staging.hpp 只能凭 board.h 推导 app 槽(app 不得包含 bootloader 的头文件)。
+// 两条推导在此汇合, 用断言确认一致, 而非默认它们一致。
 static_assert(
     foe::kAppSlotCapacity == kAppMaxImageSize,
     "foe_staging.hpp's app-slot arithmetic drifted from layout.hpp's kAppStartAddress");

@@ -144,17 +144,13 @@ inline void sha256_init(Sha256Ctx* ctx) {
     ctx->state[7] = 0x5be0cd19U;
 }
 
-// Feeds whole 64-byte chunks straight out of the caller's buffer.
-//
-// The original upstream loop copied one byte at a time into ctx->data, which
-// costs a load, a store, an increment and a branch for every input byte before
-// any hashing happens -- on a full application image that dominates the scan.
-// sha256_transform only ever does byte loads, so it can read the source
-// directly with no alignment requirement.
+// 直接从调用方缓冲区按 64 字节整块喂入: 逐字节经 ctx->data 中转会在正式哈希前
+// 为每个输入字节付出一次 load/store/自增/分支的开销, 整镜像扫描时占主导。
+// sha256_transform 只做逐字节读取, 因此无需对齐即可直接消费源缓冲区。
 inline void sha256_update(Sha256Ctx* ctx, const uint8_t* data, size_t len) {
     size_t offset = 0U;
 
-    // Top up a partially filled buffer left by a previous call.
+    // 先补齐上次调用残留的半满缓冲区。
     if (ctx->datalen != 0U) {
         const size_t fill =
             std::min(static_cast<size_t>(detail::kChunkBytes - ctx->datalen), len);

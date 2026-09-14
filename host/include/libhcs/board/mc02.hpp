@@ -1,10 +1,13 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string_view>
 
 #include <libhcs/board/common.hpp>
+#include <libhcs/board/hcs_can_port.hpp>
+#include <libhcs/board/hcs_config.hpp>
 #include <libhcs/data/datas.hpp>
 #include <libhcs/protocol/handler.hpp>
 #include <libhcs/spec/gpio.hpp>
@@ -32,6 +35,16 @@ namespace libhcs::board {
  * constructor body, on post-construction configuration, or on the board object itself having
  * finished construction. Delay board construction with `std::optional` or `std::unique_ptr` when
  * callback behavior depends on such state.
+ *
+ * Channel configuration rides EP0, not the data stream: since the EP0
+ * configuration channel reached this board (2026-09-12) the constructor applies
+ * and verifies the requested settings through hcs::apply() before the first
+ * session opens, and a rejected baudrate or an unexpected CAN bus frame type
+ * throws here -- which is the whole reason configuration moved off the data
+ * stream, where neither could be reported. The in-band `uartN_config()`
+ * PacketBuilder methods are gone with it: the firmware refuses kUart*Config
+ * fields, so a caller that kept using one would fail the link rather than
+ * switch a baudrate.
  */
 class Mc02 final {
 public:
@@ -71,9 +84,7 @@ public:
         virtual void uart2_receive_callback(const libhcs::data::UartDataView& data) { (void)data; }
         virtual void uart3_receive_callback(const libhcs::data::UartDataView& data) { (void)data; }
         virtual void uart7_receive_callback(const libhcs::data::UartDataView& data) { (void)data; }
-        virtual void uart10_receive_callback(const libhcs::data::UartDataView& data) {
-            (void)data;
-        }
+        virtual void uart10_receive_callback(const libhcs::data::UartDataView& data) { (void)data; }
 
         // Telemetry from a diagnostic firmware (CAN_DIAG / LOOP_PROFILE /
         // USB_RX_HIST), on kUart0 -- not a silkscreen port on this board, so it
@@ -154,13 +165,23 @@ public:
         }
     };
 
-    // mc02 uses the shared HCS vendor id (0xA511) and the fixed board-type PID
-    // 0x0723; per-device identity lives in the serial number, so pass a
-    // serial_filter to target a specific board when several are connected.
+    // Optional channel configuration, applied over EP0 and read back from the
+    // hardware before this constructor returns. Leaving a field unset keeps
+    // whatever the firmware brought that channel up with. A rejected baudrate,
+    // or a CAN bus whose frame type is not the one asked for, throws here --
+    // which is the whole reason configuration moved off the data stream, where
+    // neither could be reported. See libhcs/board/hcs_config.hpp.
+    using Configuration = hcs::Configuration;
+
     explicit Mc02(
         Callback& callback = default_callback_, std::string_view serial_filter = {},
-        const AdvancedOptions& options = {})
-        : handler_(0xA511, 0x0723, serial_filter, options, callback) {}
+        const AdvancedOptions& options = {}, const Configuration& configuration = {})
+        : configuration_(configuration)
+        , handler_(
+              0xA511, 0x0723, serial_filter, options, callback,
+              [this](host::protocol::Handler& handler) {
+                  interface_ = hcs::apply(handler, configuration_);
+              }) {}
 
     Mc02(const Mc02&) = delete;
     Mc02& operator=(const Mc02&) = delete;
@@ -172,6 +193,11 @@ public:
         friend class Mc02;
 
     public:
+        // Transmits on the silkscreen CAN port named by the method. The frame
+        // type is a property of the BUS, not of a frame: the firmware puts every
+        // frame on the wire in its compiled bus mode (CAN-FD on all three mc02
+        // buses) and reports that mode over EP0 -- read can1_is_fd() and
+        // friends instead of assuming. There is no per-frame flag to set.
         PacketBuilder& can1_transmit(const libhcs::data::CanDataView& data) {
             if (!builder_.write_can(data::DataId::kCan1, data)) [[unlikely]]
                 throw std::invalid_argument{"CAN1 transmission failed: Invalid CAN data"};
@@ -194,67 +220,27 @@ public:
             return *this;
         }
 
-        // Runtime reconfiguration of UART1. Rides the same downlink stream as
-        // the data above, so it is ordered against it: bytes queued earlier in
-        // this batch are sent at the old baudrate, later ones at the new one.
-        PacketBuilder& uart1_config(const libhcs::data::UartConfigView& config) {
-            if (!builder_.write_uart_config(data::DataId::kUart1Config, config)) [[unlikely]]
-                throw std::invalid_argument{"UART1 configuration failed: Invalid UART config"};
-            return *this;
-        }
         PacketBuilder& uart2_transmit(const libhcs::data::UartDataView& data) {
             if (!builder_.write_uart(data::DataId::kUart2, data)) [[unlikely]]
                 throw std::invalid_argument{"UART2 transmission failed: Invalid UART data"};
             return *this;
         }
 
-        // Runtime reconfiguration of UART2 (USART2 RS-485). Rides the same
-        // downlink stream as the data above, so it is ordered against it: bytes
-        // queued earlier in this batch are sent at the old baudrate, later ones
-        // at the new one.
-        //
-        // It is a byte pipe like the TTL ports; nothing here knows what device
-        // is on the bus. Firmware owns the half-duplex turnaround alone -- one
-        // queued packet per bus transaction, released once the peer answers or a
-        // deadline expires -- so a caller need not pace its requests by hand.
-        PacketBuilder& uart2_config(const libhcs::data::UartConfigView& config) {
-            if (!builder_.write_uart_config(data::DataId::kUart2Config, config)) [[unlikely]]
-                throw std::invalid_argument{"UART2 configuration failed: Invalid UART config"};
-            return *this;
-        }
         PacketBuilder& uart3_transmit(const libhcs::data::UartDataView& data) {
             if (!builder_.write_uart(data::DataId::kUart3, data)) [[unlikely]]
                 throw std::invalid_argument{"UART3 transmission failed: Invalid UART data"};
             return *this;
         }
 
-        // Runtime reconfiguration of UART3 (USART3 RS-485). Same half-duplex
-        // contract as uart2_config above.
-        PacketBuilder& uart3_config(const libhcs::data::UartConfigView& config) {
-            if (!builder_.write_uart_config(data::DataId::kUart3Config, config)) [[unlikely]]
-                throw std::invalid_argument{"UART3 configuration failed: Invalid UART config"};
-            return *this;
-        }
         PacketBuilder& uart7_transmit(const libhcs::data::UartDataView& data) {
             if (!builder_.write_uart(data::DataId::kUart7, data)) [[unlikely]]
                 throw std::invalid_argument{"UART7 transmission failed: Invalid UART data"};
             return *this;
         }
 
-        PacketBuilder& uart7_config(const libhcs::data::UartConfigView& config) {
-            if (!builder_.write_uart_config(data::DataId::kUart7Config, config)) [[unlikely]]
-                throw std::invalid_argument{"UART7 configuration failed: Invalid UART config"};
-            return *this;
-        }
         PacketBuilder& uart10_transmit(const libhcs::data::UartDataView& data) {
             if (!builder_.write_uart(data::DataId::kUart10, data)) [[unlikely]]
                 throw std::invalid_argument{"UART10 transmission failed: Invalid UART data"};
-            return *this;
-        }
-
-        PacketBuilder& uart10_config(const libhcs::data::UartConfigView& config) {
-            if (!builder_.write_uart_config(data::DataId::kUart10Config, config)) [[unlikely]]
-                throw std::invalid_argument{"UART10 configuration failed: Invalid UART config"};
             return *this;
         }
 
@@ -301,8 +287,133 @@ public:
 
     PacketBuilder start_transmit() noexcept { return PacketBuilder{handler_}; }
 
+    // Runtime reconfiguration, over EP0 rather than in the data stream. Unlike
+    // the retired in-band config field these are synchronous and verified: the
+    // call returns only once the board has confirmed the new setting, and
+    // throws if it refused (baudrate 0, or a rate whose divisor falls outside
+    // the HAL's BRR bounds). They are NOT ordered against queued data -- bytes
+    // already handed to the board go out at whichever rate the port reaches
+    // them at, so quiesce the link before switching. The RS-485 ports keep
+    // their own firmware-side turnaround discipline; nothing here paces them.
+    void configure_uart1(uint32_t baudrate) { hcs::configure_uart(handler_, 1, baudrate); }
+    void configure_uart2(uint32_t baudrate) { hcs::configure_uart(handler_, 2, baudrate); }
+    void configure_uart3(uint32_t baudrate) { hcs::configure_uart(handler_, 3, baudrate); }
+    void configure_uart7(uint32_t baudrate) { hcs::configure_uart(handler_, 4, baudrate); }
+    void configure_uart10(uint32_t baudrate) { hcs::configure_uart(handler_, 5, baudrate); }
+    void configure_dbus(uint32_t baudrate) { hcs::configure_uart(handler_, 0, baudrate); }
+
+    // Full-setting forms: baudrate plus framing (word length 7/8, parity
+    // none/even/odd, stop bits 1/2), each field optional -- zero fields leave
+    // that aspect of the port untouched. See hcs::UartSetting for the coding
+    // and configure_uart() for the verify semantics. Framing changes the byte
+    // stream the far end sees: quiesce the link and reconfigure the peer in
+    // the same breath.
+    void configure_uart1(const hcs::UartSetting& setting) {
+        hcs::configure_uart(handler_, 1, setting);
+    }
+    void configure_uart2(const hcs::UartSetting& setting) {
+        hcs::configure_uart(handler_, 2, setting);
+    }
+    void configure_uart3(const hcs::UartSetting& setting) {
+        hcs::configure_uart(handler_, 3, setting);
+    }
+    void configure_uart7(const hcs::UartSetting& setting) {
+        hcs::configure_uart(handler_, 4, setting);
+    }
+    void configure_uart10(const hcs::UartSetting& setting) {
+        hcs::configure_uart(handler_, 5, setting);
+    }
+    void configure_dbus(const hcs::UartSetting& setting) {
+        hcs::configure_uart(handler_, 0, setting);
+    }
+
+    // What each port is really running, reconstructed on the board from the
+    // divisor actually programmed -- not the value that was last requested.
+    uint32_t uart1_baudrate() { return hcs::read_uart_baudrate(handler_, 1); }
+    uint32_t uart2_baudrate() { return hcs::read_uart_baudrate(handler_, 2); }
+    uint32_t uart3_baudrate() { return hcs::read_uart_baudrate(handler_, 3); }
+    uint32_t uart7_baudrate() { return hcs::read_uart_baudrate(handler_, 4); }
+    uint32_t uart10_baudrate() { return hcs::read_uart_baudrate(handler_, 5); }
+    uint32_t dbus_baudrate() { return hcs::read_uart_baudrate(handler_, 0); }
+
+    // Full read-back (rate + framing) for one port, indexed by the EP0 UART
+    // numbering documented above.
+    hcs::UartSetting read_uart_setting(std::size_t port) {
+        return hcs::read_uart_setting(handler_, port);
+    }
+
+    // Runtime frame-type switch per CAN bus, over EP0. This board's firmware
+    // APPLIES the requested mode (the controllers stay FD-capable, so only what
+    // the bus transmits changes -- no controller re-init), then the mode is
+    // read back and the call returns; it throws if the board refused. Like
+    // every EP0 reconfiguration it is NOT ordered against queued data: quiesce
+    // the link before switching a bus mid-traffic. Mind the far end too -- an
+    // FD peer keeps decoding classic frames, but a classic-only peer errors on
+    // FD frames, which is why the firmware default is FD for every bus.
+    void configure_can1(bool fd) { configure_can(0, fd); }
+    void configure_can2(bool fd) { configure_can(1, fd); }
+    void configure_can3(bool fd) { configure_can(2, fd); }
+
+    // Frame type of each CAN bus. Seed from the construction handshake, kept in
+    // step by the configure_canN() calls above; the wire itself carries no
+    // per-frame type flag any more. Read this instead of assuming.
+    [[nodiscard]] bool can1_is_fd() const { return interface_.can_fd(0); }
+    [[nodiscard]] bool can2_is_fd() const { return interface_.can_fd(1); }
+    [[nodiscard]] bool can3_is_fd() const { return interface_.can_fd(2); }
+
+    // The controller's own error registers for one CAN port: TEC/REC, the last
+    // protocol error, bus state flags, and the forwarded-frame count that tells
+    // "the bus delivers nothing" from "the bus delivers but something drops".
+    // Read over EP0 on the shipping image; see libhcs/board/hcs_config.hpp for
+    // how to interpret it.
+    [[nodiscard]] hcs::vc::CanStatusPayload can_status(hcs::CanPort port) {
+        return hcs::read_can_status(handler_, static_cast<std::size_t>(port) - 1);
+    }
+
+    // WHY the board most recently refused a configuration request (see
+    // LastConfigErrorPayload). Sticky until the next refusal or reboot.
+    [[nodiscard]] hcs::vc::LastConfigErrorPayload last_config_error() {
+        return hcs::read_last_config_error(handler_);
+    }
+
+    // One CAN bus's full timing identity over EP0: the TX mode in force, the
+    // arbitration/data rates and sample points the controller is actually
+    // timed for (1 Mbit/s / 5 Mbit/s / 875 per mille on this board), and the
+    // capability bits. Read-only -- see configure_canN() for the one field a
+    // host may change.
+    [[nodiscard]] hcs::vc::CanConfigPayload can_config(hcs::CanPort port) {
+        return hcs::read_can_config(handler_, static_cast<std::size_t>(port) - 1);
+    }
+
+    // Channels the board reports it has. This image carries all three CAN buses
+    // and all six UART indexes, so this is the static truth -- but it is read
+    // over EP0 like every other board's, which keeps the construction handshake
+    // uniform (and is what the session gate on the firmware keys off).
+    [[nodiscard]] const hcs::Interface& interface() const { return interface_; }
+
 private:
+    // Shared body of configure_canN(): apply the mode over EP0, then mirror it
+    // into the cached mask so canN_is_fd() stays truthful without another
+    // round trip.
+    void configure_can(std::size_t bus, bool fd) {
+        hcs::request_can_mode(handler_, bus, fd, true);
+        const uint8_t bit = static_cast<uint8_t>(1U << bus);
+        interface_.can_fd_mask =
+            fd ? static_cast<uint8_t>(interface_.can_fd_mask | bit)
+               : static_cast<uint8_t>(interface_.can_fd_mask & ~bit);
+    }
+
+    // mc02 uses the shared HCS vendor id (0xA511) and the fixed board-type PID
+    // 0x0723; per-device identity lives in the serial number, so pass a
+    // serial_filter to target a specific board when several are connected.
     static inline Callback default_callback_{};
+    // Declared BEFORE handler_ on purpose. The before-session hook runs while
+    // handler_ is still being constructed and touches both, so their lifetimes
+    // must already have begun -- member initialisation runs in declaration
+    // order. configuration_ is a COPY: the hook runs again on every reconnect,
+    // long after the constructor argument has gone.
+    hcs::Interface interface_{};
+    Configuration configuration_;
     host::protocol::Handler handler_;
 };
 

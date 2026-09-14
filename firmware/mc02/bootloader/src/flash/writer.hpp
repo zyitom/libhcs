@@ -15,15 +15,14 @@
 
 namespace libhcs::firmware::flash {
 
-// Sector-buffered writer for the application slot, fed by the DFU download path.
+// App 槽的按扇区缓冲写入器, 由 DFU 下载路径喂数据。
 //
-// Every erase/program failure is returned to the caller, which turns it into a
-// DFU status the host can see (errERASE / errPROG). Nothing on this path traps:
-// a worn or locked sector must not be able to make the bootloader unreachable.
+// 每一次擦除/编程失败都返回给调用方, 由其转为主机可见的 DFU 状态
+// (errERASE / errPROG)。这条路径上任何失败都不 trap: 磨损或锁死的扇区不能让
+// bootloader 变得不可达。
 //
-// The bounds checks below are real checks rather than assertions. They are the
-// last thing standing between a malformed download and an overwritten
-// bootloader or metadata sector, so they must never be compiled out.
+// 下方的边界检查是真实检查而非断言: 它们是畸形下载与覆盖 bootloader/metadata
+// 扇区之间的最后一道防线, 绝不能被编译剔除。
 class Writer {
 public:
     static constexpr uint32_t kTransferBlockSize = CFG_TUD_DFU_XFER_BUFSIZE;
@@ -67,9 +66,8 @@ public:
             const size_t chunk_size =
                 (data.size() - input_offset < writable) ? (data.size() - input_offset) : writable;
 
-            // DFU never rewinds, so the incoming offset must line up with what
-            // the buffer already holds. A mismatch means the transfer went out
-            // of step and the image would be silently corrupted.
+            // DFU 不会回退, 传入偏移必须与缓冲区已有内容对齐; 不一致说明传输
+            // 失步, 镜像会被静默写坏。
             if (offset_in_sector != buffered_size_)
                 return false;
 
@@ -172,13 +170,12 @@ private:
         erase.NbSectors    = 1;
 
         uint32_t sector_error = 0U;
-        // Bootloader runs cache-less (see main.cpp), so no D-cache maintenance is
-        // needed or allowed here -- issuing cache ops with the D-cache disabled
-        // faults on Cortex-M7.
+        // bootloader 无缓存运行(见 main.cpp), 此处既不需要也不允许 D-cache
+        // 维护 -- 在 D-cache 关闭的 Cortex-M7 上执行缓存维护指令会 fault。
         return HAL_FLASHEx_Erase(&erase, &sector_error) == HAL_OK;
     }
 
-    // STM32H7 flash programming: 256-bit (32-byte) flashwords, address must be 32-byte aligned.
+    // STM32H7 flash 编程: 256 bit (32 字节) flashword, 地址必须 32 字节对齐。
     static bool program_bytes(uint32_t address, std::span<const std::byte> data) {
         if ((address & 0x1FU) != 0U)
             return false;

@@ -29,11 +29,9 @@ inline void compute_image_sha256(uintptr_t address, uint32_t size, uint8_t* hash
     crypto::sha256_final(&ctx, hash);
 }
 
-// The SHA-256 suffix is the whole integrity story for the image. A CRC32 pass
-// used to run alongside it, which cost a second full-image scan on every boot
-// while adding nothing: a cryptographic digest already covers everything a CRC
-// detects. Note this proves the image is intact, not that it is authentic --
-// the digest is unsigned and travels with the image.
+// 镜像完整性只由 SHA-256 后缀保证: 密码学摘要已覆盖 CRC 能检出的一切, 额外的
+// CRC32 扫描纯属浪费。注意这证明的是镜像完好, 而非来源可信 -- 摘要无签名,
+// 随镜像本身一同传输。
 inline bool validate_image_hash(uintptr_t address, uint32_t size) {
     if (size <= kImageHashSuffixSize)
         return false;
@@ -55,11 +53,9 @@ inline bool validate_image_hash(uintptr_t address, uint32_t size) {
     return std::memcmp(computed_sha256, expected_sha256, crypto::kSha256DigestSize) == 0;
 }
 
-// Same checks the app slot gets, applied at an arbitrary address so a staged
-// candidate can be proven intact BEFORE the app slot is erased for it. Keeping
-// one implementation matters more than the parameter: a staged image that the
-// bootloader would later reject must be rejected here, while the running image
-// is still the one that boots.
+// 与 app 槽相同的检查, 作用于任意地址, 使暂存的候选镜像能在 app 槽为其擦除
+// 之前先证明完好。单一实现比参数更重要: bootloader 稍后会拒绝的暂存镜像必须
+// 在这里被拒, 此时运行的镜像仍是可启动的那个。
 inline bool validate_image_at(uintptr_t address, uint32_t size, size_t max_size) {
     if (size == 0U || size > max_size)
         return false;

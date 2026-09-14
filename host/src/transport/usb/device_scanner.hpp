@@ -127,8 +127,8 @@ private:
 
     static std::vector<DeviceInfo> scan_devices(
         libusb_device** device_list, ssize_t device_count, uint16_t vendor_id,
-        std::span<const uint16_t> product_ids,
-        std::string_view serial_filter, const ConnectionOptions& options) {
+        std::span<const uint16_t> product_ids, std::string_view serial_filter,
+        const ConnectionOptions& options) {
         std::vector<DeviceInfo> infos;
         infos.reserve(static_cast<size_t>(device_count));
 
@@ -151,8 +151,7 @@ private:
                 continue;
             }
             if (!product_ids.empty()
-                && std::ranges::find(product_ids, info.descriptor.idProduct)
-                       == product_ids.end()) {
+                && std::ranges::find(product_ids, info.descriptor.idProduct) == product_ids.end()) {
                 info.result = DeviceInfo::ProductMismatch{};
                 continue;
             }
@@ -288,10 +287,9 @@ private:
             pid_text = "Any";
         const std::string serial_filter_text =
             serial_filter.empty() ? "Any" : std::string{serial_filter};
-        const std::string firmware_filter_text =
-            options.dangerously_skip_version_checks
-                ? "Any"
-                : std::string{"v" libhcs_PROJECT_VERSION_STRING};
+        const std::string firmware_filter_text = options.dangerously_skip_version_checks
+                                                   ? "Any"
+                                                   : std::string{"v" libhcs_PROJECT_VERSION_STRING};
 
         std::string report = std::format(
             "Target Specs:\n"

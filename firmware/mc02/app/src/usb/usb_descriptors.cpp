@@ -4,7 +4,7 @@
 
 namespace libhcs::firmware::usb {
 
-// TinyUSB descriptor callbacks
+// TinyUSB 描述符回调
 extern "C" {
 
 uint8_t const* tud_descriptor_device_cb(void) { return usb_descriptors->get_device_descriptor(); }

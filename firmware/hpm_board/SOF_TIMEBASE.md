@@ -409,6 +409,63 @@ SOF"的判断一直在翻，每翻一次就是 **125 µs 的静默跳变**。
 流量时，SOF 之后第一个进来的中断可能是传输完成中断，于是"处理 SOF"发生在 SOF 之后的任意
 相位。**归属推断在这个前提下根本不成立**，不是把阈值调好就能修的。
 
+> **2026-09-13 更新：`kTimeStatus` 的 PTPC 字段契约已恢复与 `datas.hpp` 注释一致。**
+> 此前 `ptpc_step_min/max` 实际装的是 capture age（ISR 进入延迟）、`ptpc_raw_ns` 装的是
+> 归属跳变计数、`ptpc_raw_microframe` 恒 0——与线上契约（"8 ms 抽取样本的原始模步进，
+> 期望 7'680'000"、"中断里的原始样本对"）各说各话，`sync_skew_test` 依赖
+> `ptpc_raw_microframe != 0` 的主机侧独立换算因此整段静默失效。现在板上写真实值：
+> 原始样本对（锁存 ns + 归属微帧）照发，跳变计数不再上线——主机用原始对自行发现翻转，
+> 比信一个板上的二值计数更直接；capture age 诊断随第五条路一并退役。
+> 跳变计数语义在 `sync/timebase.cpp` 的 `ownership_glitches` 内部保留 [推断，未上板]。
+>
+> **同日修复与上板复测**（本机 usb3：一块 HPM5321 + 一块 mc02，同一 xHCI）[实测]：
+> 两板以 `libhcs_TIME_SYNC=ON` 重烧后，`time_sync_test`（hpm）/ `mc02_time_sync_test`
+>（mc02）各 99/99 报告 valid、运行期异常 0；8 ms 步进实测 7'692'918..7'696'842，
+> 与板已发布的 PTPC 斜率（120218 units/µf × 64 = 7'693'952）吻合，翻转位置假设成立。
+> hpm 的 `kTimeStatus` 改为上报插值到当前时刻的配对（`microframe_now()`，与 mc02 同一
+> 理由同一做法）后，`microframe_timebase_test` 测得往返常量部分 41.7 µs——与已测往返
+> 不对称度 ~37.5 µs 相符；旧行为（上报最后一次 SOF 的锁存对）应另加 0..125 µs 均匀
+> 量化、均值 62.5 µs。主机侧 `MicroframeSource` 构造期探测 MFINDEX 位宽（规范 10 位 /
+> 本机实测 14 位，`counter_modulus()` 发布结果），本机探测 16384 正确、跨 2.5 次回绕
+> 扩展零差错；`microframe_timebase_test` 9.3 s 锁定、offset 0 微帧、drift 0.031 µf。
+> `mfindex_vs_board`：板计数器对主机 MFINDEX 拟合漂移 +1.29 ppm，判定单时钟。
+> 已知未变：PTPC 参考对的隐含斜率报告 INCONSISTENT（±370 ppm 的报告间相位游走）——
+> 5.4 节判定的采样相位病根，属"尺子"而非时间轴，待整条删除。
+>
+> **同日追加：两板 timebase 拟合样本减去 SOF 包传输耗时**（`sof_packet_delay_ns()`，
+> 高速 133 ns / 全速 2917 ns），使"微帧 k 的本地时刻"逐板对齐到包起始——与 pulse
+> 模块既有做法同一约定。此前该常数逐板不同，HS+FS 混速舰队在动作时刻上差 ~2.8 µs；
+> 减去后混速残差只剩两板中断进入延迟之差（同构代码，亚微秒）[推断，未上板混速对照]。
+> mc02 的 SOF 桥接锚点（`previous_timer_quarter_us`）同步减去，保持锚点对内部自洽。
+>
+> **同日协议重构**：`kTimeStatus` 载荷 78 B → 30 B（PTPC 诊断块随测量路一并删除，
+> FS 64 B bulk 单包装下）；`kSyncSample` 类型与 SOF→PTPC→微帧换算整条退役
+> （`can.cpp` 探针分支、`poll_sync_samples`、`microframe_q16_at_ptpc`/`ptpc_fit` 全删；
+> PTPC 外设本身保留——它仍是 MCAN TSU 时钟源，CAN 硬件时间戳照常）。session 载荷
+> 布局新增 `data::kSessionWireVersion = 2` 并折叠进 EP0 指纹，新旧固件在 EP0 门
+> 干净互斥。以 SyncSample 为测量载具的 `sync_skew_test` / `microframe_phase_test` /
+> `flush_split_test` / `hcs_command_split_test` 一并退役，跨板实测以
+> `pulse_skew_test`（GPTMR 路径）为准。session 周期维持 250 ms [实测]。
+>
+> **重构后上板回归**（三板，250 ms）[实测]：两块 hpm 119/119、mc02 94/99 valid，
+> 0 运行期异常；板内拟合残差 hpm 0.0163/0.0186 µs、mc02 0.0057 µs，与重构前持平；
+> 端到端 9.3 s 锁定、drift 0.012 µf、MFINDEX 拟合相位 25 ns。主机会话租约随之
+> 修正：hpm 的 `kSessionLeaseQuarterUs` 原为 1 s（4'000'000 quarter-us），与 mc02
+> 统一改为 4 s——原值在试验 1 Hz 轮次时即等于轮次周期，板子会在到期边界静默丢弃
+> keepalive [实测，1 Hz 下 hpm ~70% 轮次超时；1 Hz 轮次本身另有 hpm 特有的丢
+> ack 问题待定位（mc02 正常），session 周期暂回 250 ms]。
+>
+> **2026-09-14 续：session 周期已定为 1 Hz。** 此前 1 Hz 下的 hpm 丢 ack 复现
+> 追查结果：不是周期本身——是某轮 dfu-util 链路中断后一块板的固件停留在旧
+> 版本（EP0 指纹当时尚未覆盖 session 载荷，旧板照样通过版本门）。`kVersion`
+> 重构后三板统一重刷，1 Hz 全绿：双板 90 s 零会话失败，89/89 报告、0 运行期
+> 异常，板内拟合残差 0.0052/0.0062 µs；端到端 34 s 锁定（32 观测 × 1 Hz）、
+> offset 恒定、drift 0.191 µf（容限 0.25，早期窗口余量薄属正常，观测满窗后
+> 收敛）、MFINDEX 拟合相位 23 ns [实测]。EP0 指纹同时完成重构：session 载荷
+> 布局由 protocol.hpp 的 `session_layout_fingerprint()` 自动计算，
+> `data::kSessionWireVersion` 由 static_assert 钉死到该计算值——改 session
+> 载荷而不更新常数已无法通过编译。
+
 #### 为什么这些都没有牵连到 42 ns
 
 有人会问：采样相位乱了，机器定时器那条路是不是也废了。**没有**——它的外推残差是独立统计的，

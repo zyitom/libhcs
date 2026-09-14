@@ -10,9 +10,9 @@
 namespace libhcs::firmware::flash {
 
 inline constexpr uint32_t kDtcmramStart = 0x20000000U;
-inline constexpr uint32_t kDtcmramEnd   = 0x20020000U; // Exclusive
+inline constexpr uint32_t kDtcmramEnd   = 0x20020000U; // 不含
 inline constexpr uint32_t kAxiSramStart  = 0x24000000U;
-inline constexpr uint32_t kAxiSramEnd    = 0x24020000U; // Exclusive
+inline constexpr uint32_t kAxiSramEnd    = 0x24020000U; // 不含
 inline constexpr uint32_t kImageHashMagic = 0x48415348U;                 // "HASH"
 inline constexpr uint32_t kImageHashSuffixSize =
     sizeof(uint32_t) + static_cast<uint32_t>(crypto::kSha256DigestSize); // 36
@@ -22,9 +22,8 @@ inline bool is_vector_table_valid() {
     const uint32_t reset_handler =
         *reinterpret_cast<volatile const uint32_t*>(kAppStartAddress + 4U);
 
-    // Initial MSP is allowed to be exactly at the end of a RAM region.
-    // Cortex-M uses a descending stack, so reset code commonly sets SP to
-    // one-past-the-last valid RAM address.
+    // 初始 MSP 允许恰好等于 RAM 区域末尾: Cortex-M 栈向下生长, 复位代码常把 SP
+    // 设为最后一个有效 RAM 地址 +1。
     const bool valid_dtcm = (initial_msp >= kDtcmramStart && initial_msp <= kDtcmramEnd);
     const bool valid_axi  = (initial_msp >= kAxiSramStart  && initial_msp <= kAxiSramEnd);
     if (!valid_dtcm && !valid_axi)
@@ -48,11 +47,8 @@ inline void compute_image_sha256(uint32_t address, uint32_t size, uint8_t* hash)
     crypto::sha256_final(&ctx, hash);
 }
 
-// The SHA-256 suffix is the whole integrity story for the image. A CRC32 pass
-// used to run alongside it, which cost a second full-image scan on every boot
-// while adding nothing: a cryptographic digest already covers everything a CRC
-// detects. Note this proves the image is intact, not that it is authentic --
-// the digest is unsigned and travels with the image.
+// SHA-256 后缀是镜像完整性的全部依据。注意它只证明镜像完好, 不证明来源可信
+// -- 摘要未签名, 且随镜像本身一同存储。
 inline bool validate_image_hash(uint32_t address, uint32_t size) {
     if (size <= kImageHashSuffixSize)
         return false;

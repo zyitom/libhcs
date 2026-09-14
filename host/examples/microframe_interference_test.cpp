@@ -209,7 +209,7 @@ BlockResult
         {
             auto builder = node.board().start_transmit();
             builder.can_transmit(
-                CanPort::kCan1, {.can_id = kCanIdBase, .can_data = payload, .is_fdcan = true});
+                CanPort::kCan1, {.can_id = kCanIdBase, .can_data = payload});
         }
         const auto now = Clock::now();
         intervals.push_back(

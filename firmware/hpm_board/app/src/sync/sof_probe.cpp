@@ -22,30 +22,26 @@ namespace {
 constexpr std::uint32_t kEmitPeriodMs = 100U;
 constexpr std::uint32_t kFrindexMask = USB_FRINDEX_FRINDEX_MASK;
 
-// All ISR-shared state is std::atomic rather than plain scalars guarded by the
-// interrupt lock alone: the SDK's disable_global_irq() is a bare csrrc with no
-// memory clobber, so it stops the interrupt but does not stop the compiler from
-// keeping a value in a register across it. The guard is still taken around the
-// drain below, to keep an anomaly entry from being read while the ISR is midway
-// through writing its four fields.
+// ISR 共享状态一律用 std::atomic 而非仅靠中断锁保护的普通标量: SDK 的
+// disable_global_irq() 只是一条无 memory clobber 的裸 csrrc, 能挡住中断,
+// 挡不住编译器把值留在寄存器里跨过它。下方的排空仍会取锁, 避免读到 ISR 只
+// 写到一半的异常条目。
 struct AtomicAnomaly {
     std::atomic<std::uint32_t> previous_frame{0};
     std::atomic<std::uint32_t> current_frame{0};
     std::atomic<std::uint32_t> delta{0};
     std::atomic<std::uint32_t> interval_ticks{0};
-    // The status word this interrupt was taken on, not a re-read: a coinciding
-    // port change, reset or suspend is exactly what would explain a frame index
-    // that stopped advancing, and it is gone by the time the main loop looks.
+    // 本中断发生时的状态字, 而非事后重读: 与帧索引停止推进同时出现的端口
+    // 状态变化、复位或挂起正是最可能的解释, 主循环再看时它早已消失。
     std::atomic<std::uint32_t> usbsts{0};
     std::atomic<std::uint32_t> portsc1{0};
-    // Local machine-timer reading of the anomalous SOF itself, in quarter
-    // microseconds. Records carry a millisecond tick already, so what this adds
-    // is ordering and spacing WITHIN a record period -- the difference between a
-    // burst of anomalies and a scatter of them.
+    // 异常 SOF 当时的本地机器定时器读数, 单位 1/4 us。记录本就带毫秒
+    // tick, 此项补充的是同一记录周期内的先后与间距 -- 区分异常扎堆还是
+    // 零散。
     std::atomic<std::uint32_t> timestamp{0};
 };
 
-// Word count per anomaly entry on the wire.
+// 线上每条异常条目的字数。
 constexpr std::size_t kAnomalyWords = 7;
 
 std::atomic<std::uint32_t> sof_count{0};
@@ -66,7 +62,7 @@ std::atomic<std::uint32_t> interval_sum_low{0};
 std::atomic<std::uint32_t> interval_sum_high{0};
 std::atomic<std::uint32_t> interval_count{0};
 
-// ISR-private; no other context touches them.
+// 仅 ISR 私有; 其他上下文不触碰。
 std::uint32_t isr_previous_frame = 0;
 std::uint32_t isr_previous_time = 0;
 bool isr_previous_valid = false;
@@ -90,8 +86,8 @@ void store(std::atomic<std::uint32_t>& value, std::uint32_t next) {
 } // namespace
 
 void note_sof(
-    std::uint32_t frame_first, std::uint32_t frame_second, std::uint32_t now,
-    std::uint32_t status, std::uint32_t portsc1) {
+    std::uint32_t frame_first, std::uint32_t frame_second, std::uint32_t now, std::uint32_t status,
+    std::uint32_t portsc1) {
     store(sof_count, load(sof_count) + 1U);
     store(last_frame, frame_first);
     store(last_sof_time, now);
@@ -151,22 +147,21 @@ void poll(std::uint32_t tick) {
         return;
     last_emit_tick = tick;
 
-    // The counters keep running while there is no session; the first record
-    // after it comes up carries everything accumulated so far.
+    // 无会话期间计数器照常累计; 会话建立后的首条记录带上此前积攒的全部
+    // 数据。
     if (!link::uplink_enabled())
         return;
 
-    // Sampled from the main loop, deliberately outside any interrupt context:
-    // pairing a frame index the host can compare across boards with the host's
-    // own arrival time is what turns two independent record streams into
-    // evidence that both boards count the same SOF stream.
+    // 在主循环采样, 刻意置于任何中断上下文之外: 把主机可跨板比对的帧索引
+    // 与主机自身感知的到达时刻配对, 两条独立记录流才能互证两板数的是同一
+    // 路 SOF 流。
     const std::uint32_t emit_frame = HPM_USB0->FRINDEX & kFrindexMask;
     const std::uint32_t emit_time = timer::Timer::timestamp_quarter_us();
 
-    // 4-byte header, then 18 fixed words plus the delta histogram: record_size,
-    // tick, sof_count, [histogram], races, anomaly_total, last frame + time,
-    // microframe low + high, emit frame + time, interval min/max/sum lo/sum
-    // hi/count, timer frequency, and the anomaly entry count.
+    // 4 字节头, 之后 18 个固定字加 delta 直方图: record_size、tick、
+    // sof_count、[直方图]、races、anomaly_total、last frame + time、
+    // 以及 microframe low + high、emit frame + time、interval min/max/
+    // sum lo/sum hi/count、timer frequency、异常条目数。
     constexpr std::size_t kFixedSize = 4 + 4 * (18 + kDeltaBuckets);
     constexpr std::size_t kAnomalySize = 4 * kAnomalyWords;
     constexpr std::size_t kMaxRecordSize = kFixedSize + kAnomalyCapacity * kAnomalySize;
@@ -201,10 +196,8 @@ void poll(std::uint32_t tick) {
         for (std::size_t index = 0; index < kDeltaBuckets; index++)
             histogram[index] = load(delta_histogram[index]);
 
-        // Interval statistics describe one record period, so they are reset
-        // here. The histogram and the counters are cumulative on purpose: a
-        // single dropped record must not lose a delta anomaly that happened
-        // during it.
+        // 间隔统计只描述一个记录周期, 故在此清零。直方图与各计数器刻意
+        // 保持累计: 单条记录被丢弃时, 该周期内的 delta 异常不能随之丢失。
         min_interval = load(interval_min);
         max_interval = load(interval_max);
         sum_low = load(interval_sum_low);
@@ -265,9 +258,8 @@ void poll(std::uint32_t tick) {
             cursor = put_u32(cursor, word);
     }
 
-    // Best effort, like every other telemetry record here: a full batch pool
-    // drops this one rather than retrying, and the gap shows up as a jump in the
-    // record sequence numbers.
+    // 尽力而为, 与此处其他遥测记录一致: 批次池满即丢弃本条而非重试, 缺口
+    // 表现为记录序号跳变。
     (void)link::uplink_serializer().write_uart(
         static_cast<core::protocol::FieldId>(data::DataId::kUart0),
         {

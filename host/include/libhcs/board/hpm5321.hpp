@@ -144,10 +144,8 @@ public:
         PacketBuilder& can_transmit(hcs::CanPort port, const libhcs::data::CanDataView& data) {
             const auto index = static_cast<std::size_t>(port);
             if (index < 1 || index > can_count_) [[unlikely]]
-                throw std::out_of_range{
-                    std::format(
-                        "Hpm5321: CAN port out of range (this board has CAN1..CAN{})",
-                        can_count_)};
+                throw std::out_of_range{std::format(
+                    "Hpm5321: CAN port out of range (this board has CAN1..CAN{})", can_count_)};
             static constexpr data::DataId kIds[]{data::DataId::kCan1, data::DataId::kCan2};
             if (!builder_.write_can(kIds[index - 1], data)) [[unlikely]]
                 throw std::invalid_argument{"CAN transmission failed: Invalid CAN data"};
@@ -187,14 +185,26 @@ public:
     // them at, so quiesce the link before switching.
     void configure_uart0(uint32_t baudrate) { hcs::configure_uart(handler_, 0, baudrate); }
 
+    // Full-setting form: baudrate plus framing (word length 7/8, parity
+    // none/even/odd, stop bits 1/2), each field optional. See hcs::UartSetting.
+    void configure_uart0(const hcs::UartSetting& setting) {
+        hcs::configure_uart(handler_, 0, setting);
+    }
+
     // What UART0 is really running, reconstructed on the board from the
     // divisor actually programmed -- not the value that was last requested.
     uint32_t uart0_baudrate() { return hcs::read_uart_baudrate(handler_, 0); }
 
+    // Full read-back (rate + framing) for one port, indexed by the board's EP0
+    // UART numbering.
+    hcs::UartSetting read_uart_setting(std::size_t port) {
+        return hcs::read_uart_setting(handler_, port);
+    }
+
     // Frame type of each CAN bus, as the board reported it during construction.
-    // It is a property of the bus, not of a frame: CanDataView::is_fdcan is
-    // ignored by this board's firmware, which sends every frame in its bus's
-    // mode. Read this instead of assuming.
+    // It is a property of the bus, not of a frame: the wire protocol carries no
+    // per-frame type flag any more, and this board's firmware sends every frame
+    // in its bus's compiled mode. Read this instead of assuming.
     [[nodiscard]] bool can1_is_fd() const { return interface_.can_fd(0); }
 
     // Only meaningful when interface().can_count is 2.
@@ -204,6 +214,20 @@ public:
     // the shipping image; see libhcs/board/hcs_config.hpp for how to read it.
     [[nodiscard]] hcs::vc::CanStatusPayload can_status(hcs::CanPort port) {
         return hcs::read_can_status(handler_, static_cast<std::size_t>(port) - 1);
+    }
+
+    // WHY the board most recently refused a configuration request (see
+    // LastConfigErrorPayload). Sticky until the next refusal or reboot.
+    [[nodiscard]] hcs::vc::LastConfigErrorPayload last_config_error() {
+        return hcs::read_last_config_error(handler_);
+    }
+
+    // One CAN bus's full timing identity over EP0: the TX mode in force (this
+    // board applies nothing -- the capability bit is clear), the rates and
+    // sample points the controller is actually timed for (1 Mbit/s / 5 Mbit/s /
+    // 875 per mille), and the capability bits.
+    [[nodiscard]] hcs::vc::CanConfigPayload can_config(hcs::CanPort port) {
+        return hcs::read_can_config(handler_, static_cast<std::size_t>(port) - 1);
     }
 
     // How much of a CAN round trip happens on the board. Cycles; divide by

@@ -27,8 +27,9 @@ namespace libhcs::firmware::can {
 // mailboxes (no software TX ring, no try_transmit -- bxCAN's three TX mailboxes
 // serve that role), and a single irq_handler() drains RX FIFO0.
 //
-// CH32H417 CAN is CAN 2.0B only (no CAN-FD), so is_fdcan is always false and
-// there is no data-phase timing to configure.
+// CH32H417 CAN is CAN 2.0B only (no CAN-FD): there is no data-phase timing to
+// configure, and every frame this board sends or forwards is classic by
+// construction -- the Ch32Board host class offers no way to ask for FD.
 class Can : private core::utility::Immovable {
 public:
     using Lazy = utility::Lazy<Can, board::CanPort>;
@@ -101,7 +102,6 @@ public:
             CAN_Receive(can_base_, CAN_FIFO0, &rx);
 
             data::CanDataView data;
-            data.is_fdcan = false;
             data.is_extended_can_id = (rx.IDE == CAN_Id_Extended);
             data.is_remote_transmission = (rx.RTR == CAN_RTR_Remote);
             data.can_id = data.is_extended_can_id ? rx.ExtId : rx.StdId;

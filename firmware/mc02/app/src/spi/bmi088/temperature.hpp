@@ -51,7 +51,7 @@ public:
         if (!read_async(RegisterAddress::kTempMsb, kTemperatureReadSizeBytes))
             return false;
 
-        // Temperature timestamps are anchored to SPI launch time, not probe-deadline arrival.
+        // 温度时间戳锚定在 SPI 发起时刻, 而非探询到期时刻。
         active_probe_launch_timestamp_quarter_us_.store(
             timer::timer->timepoint().time_since_epoch().count(), std::memory_order_relaxed);
         has_active_probe_launch_timestamp_.store(true, std::memory_order_release);
@@ -100,8 +100,7 @@ private:
         const bool observed_value_changed =
             !has_last_observation_ || raw_temperature != last_observed_temperature_;
         if (observed_value_changed) {
-            // When the observed temperature changes, estimate the update time as the midpoint
-            // between the previous and current probe launches.
+            // 观测值变化时, 以上一次与本次探询发起时刻的中点估计变化时刻。
             current_value_timestamp_quarter_us_ = has_last_observation_
                                                     ? midpoint_timestamp_quarter_us(
                                                           last_probe_launch_timestamp_quarter_us_,

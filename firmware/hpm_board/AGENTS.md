@@ -95,11 +95,11 @@ init 和 `abort_transmit()` 之后采样，遥测只读快照；`uart_set_baudra
 
 | bRequest | 方向 | wIndex | 载荷 | 语义 |
 |---|---|---|---|---|
-| `0x40 kGetInterface` | IN | 0 | `InterfacePayload` | 版本、CAN/UART 路数、哪几路是 CAN-FD |
-| `0x41 kGetCanConfig` | IN | 总线号 | `CanConfigPayload` | 该总线实际模式 |
-| `0x42 kSetCanConfig` | OUT | 总线号 | `CanConfigPayload` | **只校验不重配**，与固件不符即 STALL |
-| `0x43 kGetUartConfig` | IN | 端口号 | `UartConfigPayload` | **实际生效**的波特率（由分频器反推） |
-| `0x44 kSetUartConfig` | OUT | 端口号 | `UartConfigPayload` | 求解失败即 STALL，寄存器不动 |
+| `0x40 kGetInterface` | IN | 0 | `InterfacePayload` | 版本（v2）、CAN/UART 路数、实时 FD 掩码、能力位 |
+| `0x41 kGetCanConfig` | IN | 总线号 | `CanConfigPayload` | 硬件事实：当前 TX 模式 + 实际速率与采样点 |
+| `0x42 kSetCanConfig` | OUT | 总线号 | `CanConfigPayload` | 本板无 `kCapCanModeSettable` 位：apply 位无语义，模式与固件不符即 STALL；速率/采样点字段是非零即核对的断言 |
+| `0x43 kGetUartConfig` | IN | 端口号 | `UartConfigPayload` | 硬件事实：**实际生效**的波特率（由分频器反推）+ 活寄存器解码的帧格式 |
+| `0x44 kSetUartConfig` | OUT | 端口号 | `UartConfigPayload` | 稀疏 patch（波特率 + 字长/校验/停止位，0=不动）：先全量校验后统一提交，STALL 严格等于寄存器不动 |
 | `0x45 kGetCanStatus` | IN | 丝印编号 | — | 控制器错误寄存器回读，判读表见 [PITFALLS.md](PITFALLS.md) 第 5 节 |
 | `0x47 kGetLatencyBreakdown` | IN | — | — | 延迟拆解埋点，恒开（见下） |
 
@@ -108,11 +108,13 @@ init 和 `abort_transmit()` 之后采样，遥测只读快照；`uart_set_baudra
 
 三条必须知道的约束：
 
-1. **`kSetCanConfig` 不会重配控制器。** `mcan_init()` 那一整块（87.5% 采样点、TDC、
-   外部 PTPC 时基喂 TSU、sync 滤波器）是逐条实测调出来的，运行时重跑等于把它们全部
-   重新置于风险中，还要断总线。所以板端保留编译期的 `CanPort::mode`，`SET` 只做
-   "主机的预期和我一致吗"这一件事。**推论：`CanDataView::is_fdcan` 在 hpm_board 上
-   已被忽略**，FD 总线一律发 FD 帧；要知道某条总线是什么模式，读 `canN_is_fd()`。
+1. **`kSetCanConfig` 不会重配控制器（本板未设 `kCapCanModeSettable`）。** `mcan_init()`
+   那一整块（87.5% 采样点、TDC、外部 PTPC 时基喂 TSU、sync 滤波器）是逐条实测调出来的，
+   运行时重跑等于把它们全部重新置于风险中，还要断总线；且 classic 化意味着控制器收不到
+   任何 FD 帧（实测 0/50）。所以板端保留编译期的 `CanPort::mode`，`SET` 只做
+   "主机的预期和我一致吗"这一件事（mc02 设了能力位，那边模式真的可切——差别由能力位
+   表达，协议同一套）。**推论：每帧 `IsFdCan` 头部位已在协议中废弃（2026-09-12）**，
+   FD 总线一律发 FD 帧；要知道某条总线是什么模式，读 `canN_is_fd()`。
 2. **回读永远不等于请求值。** `effective_baudrate()` 由实际写进去的分频器反推，
    115200 读回 114942，921600 读回 909090。**用容差比，不要用相等比**——相等比会在
    几乎所有 80 MHz 除不尽的速率上误报失败。
@@ -216,7 +218,8 @@ RTT p50 124.8us，板端整条路径不到 3%。完整论证与"哪些板端优�
 本板的调试口（FT2232：串口 + JTAG）**在实际使用的板子上只留了通孔焊盘，没有插座，
 不是对外接口**——它是调试预留，不要当数据/日志通道用（详见
 [boards/hpm6e8y/README.md](boards/hpm6e8y/README.md)「串口：只有调试通孔，不是接口」）。
-本机 OpenOCD 状态见根 `AGENTS.md` 环境节。带内诊断通道已入库，都走 USB vendor 端点、
+调试与烧录探针**只用 J-Link**，不使用 OpenOCD（见 [ENV.md](../../ENV.md)「宿主机调试
+工具」）。带内诊断通道已入库，都走 USB vendor 端点、
 编成 UART0 上行帧：
 
 | 想看什么 | 固件开关 | 主机工具 |

@@ -145,7 +145,8 @@ c_board（STM32F407VG）同理，把路径换成 `firmware/c_board`、目标换�
 
 ### 烧录 Bootloader（首次或更新引导）
 
-Bootloader 位于 Flash 起始地址 `0x08000000`，需要用调试器（ST-Link / J-Link）烧录一次，例如：
+Bootloader 位于 Flash 起始地址 `0x08000000`，需要用调试器（**只用 J-Link**，不用
+ST-Link / OpenOCD，见 [ENV.md](ENV.md)「宿主机调试工具」）烧录一次，例如：
 
 App 之后即可通过下面的 DFU 流程烧录，无需调试器。
 

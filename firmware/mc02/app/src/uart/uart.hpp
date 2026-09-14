@@ -18,62 +18,133 @@
 
 namespace libhcs::firmware::uart {
 
-// State and behaviour shared by both port flavours: identity, the runtime
-// baudrate control surface, and the hand-off of received bytes to USB. It holds
-// no buffers of its own, so the RX-only DBUS port does not carry a 3 KB TX ring
-// it can never use.
+// 两种端口共享的状态与行为: 身份标识、运行时波特率控制、接收字节向 USB 的
+// 交接。自身不持有缓冲, 因此仅接收的 DBUS 口不必背着一个永远用不上的 3 KB
+// TX ring。
 class UartCommon : private core::utility::Immovable {
 public:
-    // Runtime baudrate switch requested by the host. Writes BRR directly rather
-    // than re-running HAL_UART_Init, so every other setting stays exactly as
-    // CubeMX generated it and the running DMA is not torn down.
+    // ---- 运行时配置: 波特率与帧格式, 全部供 EP0 配置通道调用 ----
     //
-    // This mirrors UART_SetConfig() in the STM32H7 HAL. Unlike the F4 parts,
-    // H7 UARTs take their kernel clock from a selectable source (not simply
-    // PCLK) and pass it through Init.ClockPrescaler, so the divisor must be
-    // computed from the resolved clock source -- using HAL_RCC_GetPCLKxFreq here
-    // the way c_board does would silently produce the wrong baudrate.
-    //
-    // RX bytes arriving inside the switch window may be garbled; the host is
-    // expected to quiesce the link first.
-    bool handle_config(const data::UartConfigView& data) {
-        if (!data.baudrate.has_value() || *data.baudrate == 0) [[unlikely]]
+    // 约定与 core/include/libhcs/protocol/vendor_control.hpp 的 UartConfigPayload
+    // 一致: 先全量校验后统一提交, 任何字段非法时寄存器一个都不动, 控制传输的
+    // STALL 严格等于"什么都没改"。切换窗口内到达的 RX 字节可能乱码, 主机应先
+    // 静默链路。
+
+    // 只解不写: 求给定速率的 BRR 值, 供处理器先校验再提交。逻辑对应 STM32H7
+    // HAL 的 UART_SetConfig(): H7 的 UART 内核时钟来自按组可选的时钟源(并非
+    // 简单的 PCLK)且经 Init.ClockPrescaler 分频, 除数必须由解析后的时钟源
+    // 计算; 像 c_board 那样用 HAL_RCC_GetPCLKxFreq 会静默得到错误波特率。
+    // 边界与 HAL 一致: 超出范围的除数会错配外设, 故拒绝而非写入垃圾值。
+    [[nodiscard]] bool solve_brr(uint32_t baudrate, uint32_t& brr) const {
+        if (baudrate == 0U) [[unlikely]]
             return false;
 
         const uint32_t kernel_clock_hz = peripheral_clock_hz();
         if (kernel_clock_hz == 0U) [[unlikely]]
             return false;
 
-        // Bounds per the HAL: a divisor outside them would misconfigure the
-        // peripheral, so reject instead of writing garbage.
         constexpr uint32_t kBrrMin = 0x10U;
         constexpr uint32_t kBrrMax = 0xFFFFU;
 
-        uint32_t brr;
         if (hal_uart_handle_->Init.OverSampling == UART_OVERSAMPLING_8) {
             const uint32_t usartdiv = UART_DIV_SAMPLING8(
-                kernel_clock_hz, *data.baudrate, hal_uart_handle_->Init.ClockPrescaler);
+                kernel_clock_hz, baudrate, hal_uart_handle_->Init.ClockPrescaler);
             if (usartdiv < kBrrMin || usartdiv > kBrrMax) [[unlikely]]
                 return false;
-            // Oversampling-by-8 packs BRR[3] as zero and shifts the low nibble.
+            // 8 倍过采样把 BRR[3] 记为零并右移低半字节。
             brr = (usartdiv & 0xFFF0U) | ((usartdiv & 0x000FU) >> 1U);
         } else {
             const uint32_t usartdiv = UART_DIV_SAMPLING16(
-                kernel_clock_hz, *data.baudrate, hal_uart_handle_->Init.ClockPrescaler);
+                kernel_clock_hz, baudrate, hal_uart_handle_->Init.ClockPrescaler);
             if (usartdiv < kBrrMin || usartdiv > kBrrMax) [[unlikely]]
                 return false;
             brr = usartdiv;
         }
-
-        hal_uart_handle_->Init.BaudRate = *data.baudrate;
-        hal_uart_handle_->Instance->BRR = brr;
         return true;
     }
 
-    // The baudrate actually programmed, reconstructed from BRR rather than from
-    // Init.BaudRate: the latter is only what was last requested, and on a rejected
-    // request neither it nor BRR is written, so reading BRR back is what lets the
-    // host tell "switch applied" from "switch refused, old rate still running".
+    // 提交 solve_brr() 的结果。只在校验全部通过后调用, 无失败路径。
+    void commit_brr(uint32_t baudrate, uint32_t brr) {
+        hal_uart_handle_->Init.BaudRate = baudrate;
+        hal_uart_handle_->Instance->BRR = brr;
+    }
+
+    // 应用帧格式。字长直接用数据位数(7/8; 9 位不提供 -- RX 环是字节 DMA, 第
+    // 九位会被静默截断), 校验与停止位用协议编码(0 = 保持不变; 校验 1=无 2=偶
+    // 3=奇; 停止位 1=1 2=2; 1.5 停止位不提供 -- 本系列控制器只在 5 位字长下
+    // 实现它)。先全量校验后一次 UE 下拉内写完: M/PCE/PS/STOP 只能在 UE=0 时
+    // 写, 窗口内到达的字节会失配。
+    bool set_framing(uint32_t word_length, uint32_t parity, uint32_t stop_bits) {
+        // 纯校验, 不碰寄存器。
+        uint32_t m_bits = 0;
+        if (word_length != 0U) {
+            if (word_length == 7U)
+                m_bits = USART_CR1_M1;
+            else if (word_length == 8U)
+                m_bits = 0U;
+            else
+                return false;
+        }
+        uint32_t parity_bits = 0;
+        if (parity != 0U) {
+            switch (parity) {
+            case 1U: parity_bits = 0U; break; // 无校验
+            case 2U: parity_bits = USART_CR1_PCE; break; // 偶
+            case 3U: parity_bits = USART_CR1_PCE | USART_CR1_PS; break; // 奇
+            default: return false;
+            }
+        }
+        uint32_t stop_reg = 0;
+        if (stop_bits != 0U) {
+            if (stop_bits == 1U)
+                stop_reg = 0U;
+            else if (stop_bits == 2U)
+                stop_reg = USART_CR2_STOP_1;
+            else
+                return false;
+        }
+
+        auto* instance = hal_uart_handle_->Instance;
+        const uint32_t cr1 = instance->CR1;
+        uint32_t new_cr1 = cr1 & ~(USART_CR1_UE | USART_CR1_M | USART_CR1_PCE | USART_CR1_PS);
+        if (word_length != 0U)
+            new_cr1 |= m_bits;
+        if (parity != 0U)
+            new_cr1 |= parity_bits;
+
+        instance->CR1 = new_cr1 & ~USART_CR1_UE; // UE=0, 帧格式字段可写
+        if (stop_bits != 0U)
+            instance->CR2 = (instance->CR2 & ~USART_CR2_STOP) | stop_reg;
+        instance->CR1 = new_cr1; // UE 恢复
+        return true;
+    }
+
+    // ---- 帧格式读回: 从活寄存器解码, 编码同上, 永不返回 0(0 只表示"跳过") ----
+
+    [[nodiscard]] uint32_t word_length() const {
+        const uint32_t m = hal_uart_handle_->Instance->CR1 & USART_CR1_M;
+        // M0(9 位)不会由本驱动写出; 万一出现, 如实上报。
+        if ((m & USART_CR1_M0) != 0U)
+            return 9U;
+        return (m & USART_CR1_M1) != 0U ? 7U : 8U;
+    }
+
+    [[nodiscard]] uint32_t parity() const {
+        const uint32_t cr1 = hal_uart_handle_->Instance->CR1;
+        if ((cr1 & USART_CR1_PCE) == 0U)
+            return 1U; // 无校验
+        return (cr1 & USART_CR1_PS) != 0U ? 3U : 2U; // 奇 : 偶
+    }
+
+    [[nodiscard]] uint32_t stop_bits() const {
+        // 1.5 停止位的编码不会由本驱动写出(见 set_framing); 万一出现, 如实上报
+        // 协议中无此编码的原始值没有意义, 按最近的 2 处理并注释于此。
+        return (hal_uart_handle_->Instance->CR2 & USART_CR2_STOP) == USART_CR2_STOP_1 ? 2U : 1U;
+    }
+
+    // 实际编程的波特率, 从 BRR 反推而非 Init.BaudRate: 后者只是最近一次请求
+    // 值, 被拒绝的请求两者都不会写。读 BRR 才能让主机区分"切换已生效"与
+    // "切换被拒、仍按旧速率运行"。
     [[nodiscard]] uint32_t effective_baudrate() const {
         const uint32_t kernel_clock_hz = peripheral_clock_hz();
         const uint32_t brr = hal_uart_handle_->Instance->BRR & 0xFFFFU;
@@ -82,8 +153,7 @@ public:
         const uint32_t presc = UARTPrescTable[hal_uart_handle_->Init.ClockPrescaler & 0x0FU];
         const uint32_t clock = presc ? kernel_clock_hz / presc : kernel_clock_hz;
         if (hal_uart_handle_->Init.OverSampling == UART_OVERSAMPLING_8) {
-            // Oversampling by 8 stores BRR[3] as zero and the low nibble shifted
-            // right by one, so undo that before dividing.
+            // 8 倍过采样把 BRR[3] 记为零、低半字节右移一位, 相除前先还原。
             const uint32_t usartdiv = (brr & 0xFFF0U) | ((brr & 0x0007U) << 1U);
             return usartdiv ? (2U * clock) / usartdiv : 0U;
         }
@@ -95,9 +165,8 @@ protected:
         : data_id_(data_id)
         , hal_uart_handle_(hal_uart_handle) {}
 
-    // RxBuffer and TxBuffer each keep their own copy of the handle, so the derived
-    // ports cannot name hal_uart_handle_ unqualified. Route the two accesses they
-    // need through here rather than sprinkling UartCommon:: qualifications.
+    // RxBuffer 与 TxBuffer 各存一份句柄, 派生端口无法无限定地访问
+    // hal_uart_handle_; 把所需的两处访问经此路由, 避免到处写 UartCommon:: 限定。
     [[nodiscard]] bool has_rx_error() const {
         constexpr uint32_t rx_error_mask =
             HAL_UART_ERROR_PE | HAL_UART_ERROR_NE | HAL_UART_ERROR_FE | HAL_UART_ERROR_ORE;
@@ -108,10 +177,9 @@ protected:
 
     void handle_uplink(
         std::span<const std::byte> payload, std::span<const std::byte> payload2, bool is_idle) {
-        // Nothing written without a session survives: activate_session() clears
-        // the ring when a host arrives. RxBuffer::try_dequeue() advances out_
-        // either way, so the receive ring still drains here rather than backing
-        // up into its wrapped-around fail-fast path.
+        // 无会话时写入的内容不保存: 主机到达时 activate_session() 会清 ring。
+        // 无论如何 RxBuffer::try_dequeue() 都会推进 out_, 接收 ring 仍在此
+        // 排空, 不会积压进其绕圈 fail-fast 路径。
         if (!usb::uplink_session_active())
             return;
 
@@ -122,29 +190,20 @@ protected:
             != core::protocol::Serializer::SerializeResult::kInvalidArgument);
     }
 
-    // Kernel clock feeding this UART's baudrate divider.
+    // 供给本 UART 波特率除数的内核时钟。
     //
-    // c_board does the same job in two lines with HAL_RCC_GetPCLKxFreq(), and
-    // that is correct there: on STM32F407 a UART is clocked straight off its APB
-    // bus, so the bus frequency IS the kernel clock. STM32H7 inserts a
-    // selectable clock source per UART group plus Init.ClockPrescaler, so the
-    // source has to be resolved before the frequency means anything.
+    // H7 的 UART 时钟来自按组可选的时钟源并经 Init.ClockPrescaler 分频, 必须
+    // 先解析时钟源频率才有意义; F407 的 UART 直接挂 APB 总线, c_board 用
+    // HAL_RCC_GetPCLKxFreq() 两行即可, 勿照搬。
     //
-    // Resolved with the HAL's own UART_GETCLOCKSOURCE, which dispatches on the
-    // peripheral instance -- the same macro UART_SetConfig() uses to compute BRR
-    // at init. Deliberately NOT HAL_RCCEx_GetPeriphCLKFreq(): that function's
-    // if/else chain in this HAL version covers SAI/SPI/ADC/SDMMC/FDCAN but has
-    // NO branch for either UART group, so RCC_PERIPHCLK_USART16910 and
-    // RCC_PERIPHCLK_USART234578 both fall through to its final
-    // `else { frequency = 0; }` and return 0. Those macros do exist, so nothing
-    // warns at compile time. handle_config() then took its kernel_clock_hz == 0
-    // early-out and returned without ever writing BRR: every runtime baudrate
-    // request was silently ignored and the port stayed at the CubeMX 115200.
-    //
-    // Invisible to a same-board UART7<->UART10 loopback: both ends ignored the
-    // switch identically, so the loop passed at every requested rate while
-    // actually running at 115200 throughout. Only a cross-board test against an
-    // end that did switch exposed it.
+    // 经 HAL 的 UART_GETCLOCKSOURCE 按外设实例解析, 与 UART_SetConfig() 计算
+    // BRR 用的是同一宏。刻意不用 HAL_RCCEx_GetPeriphCLKFreq(): 本 HAL 版本该
+    // 函数的 if/else 链覆盖 SAI/SPI/ADC/SDMMC/FDCAN 却没有 UART 分支,
+    // RCC_PERIPHCLK_USART16910 与 RCC_PERIPHCLK_USART234578 都会落入末尾的
+    // `else { frequency = 0; }` 返回 0。宏确实存在, 编译期不会有任何告警,
+    // handle_config() 则因 kernel_clock_hz == 0 提前返回, 每次运行时波特率请求
+    // 都被静默忽略, 端口停留在 CubeMX 的 115200。同板 UART7<->UART10 环回测不
+    // 出该问题(两端同样忽略切换), 只有跨板对测才暴露。
     [[nodiscard]] uint32_t peripheral_clock_hz() const {
         UART_ClockSourceTypeDef clocksource = UART_CLOCKSOURCE_UNDEFINED;
         UART_GETCLOCKSOURCE(hal_uart_handle_, clocksource);
@@ -155,9 +214,9 @@ protected:
         case UART_CLOCKSOURCE_CSI: return CSI_VALUE;
         case UART_CLOCKSOURCE_LSE: return LSE_VALUE;
         case UART_CLOCKSOURCE_HSI:
-            // HSI reaches the UARTs through its divider, so raw HSI_VALUE is
-            // only right when that divider is 1. UART_SetConfig shifts the same
-            // way. UART7/UART10 select HSI in the .ioc, so this path is live.
+            // HSI 经分频器到达 UART, 仅当分频为 1 时裸 HSI_VALUE 才正确,
+            // UART_SetConfig 同样移位。UART7/UART10 在 .ioc 中选择 HSI, 此路径
+            // 是活的。
             if (__HAL_RCC_GET_FLAG(RCC_FLAG_HSIDIV) != 0U)
                 return static_cast<uint32_t>(HSI_VALUE >> (__HAL_RCC_GET_HSI_DIVIDER() >> 3U));
             return static_cast<uint32_t>(HSI_VALUE);
@@ -179,8 +238,8 @@ protected:
     UART_HandleTypeDef* hal_uart_handle_;
 };
 
-// Full-duplex port: USART1, UART7 and USART10, each with both an RX and a TX DMA
-// stream wired up by CubeMX.
+// 全双工端口: USART1、UART7、USART10, CubeMX 为每个口接好 RX 与 TX 两条
+// DMA 流。
 class Uart
     : public UartCommon
     , private TxBuffer</*half_duplex=*/false>
@@ -229,14 +288,13 @@ private:
     static void hal_tx_dma_error_callback(DMA_HandleTypeDef* hal_dma_handle);
 };
 
-// Receive-only port, used for UART5 (DBUS).
+// 仅接收端口, 用于 UART5 (DBUS)。
 //
-// Two independent reasons it carries no TX path: CubeMX wires UART5 with an RX
-// DMA stream only (bsp/cubemx/Core/Src/usart.c declares hdma_uart5_rx and no
-// hdma_uart5_tx), and the protocol never routes a downlink to kUartDbus anyway --
-// usb/vendor.hpp's uart_deserialized_callback dispatches kUart1/kUart7/kUart10
-// and, when libhcs_APP_RS485_ENABLE, the two RS-485 ports. Only
-// kUartDbusConfig is routed here, and that lands in UartCommon::handle_config.
+// 无 TX 路径的两个独立原因: CubeMX 只给 UART5 接了 RX DMA 流
+// (bsp/cubemx/Core/Src/usart.c 只声明 hdma_uart5_rx 而无 hdma_uart5_tx); 协议
+// 也不会把下行路由到 kUartDbus, usb/vendor.hpp 的 uart_deserialized_callback
+// 只分发 kUart1/kUart7/kUart10(libhcs_APP_RS485_ENABLE 时另含两个 RS-485 口)。
+// 仅 kUartDbusConfig 路由至此, 落在 UartCommon::handle_config。
 class UartRxOnly
     : public UartCommon
     , private RxBuffer<UartRxOnly> {
@@ -249,8 +307,7 @@ public:
         : UartCommon(data_id, hal_uart_handle)
         , RxBuffer(hal_uart_handle) {}
 
-    // Named to match the full-duplex port so app.cpp can poll every port
-    // uniformly; here it only drains the receive ring.
+    // 与全双工端口同名, 便于 app.cpp 统一轮询所有端口; 此处仅排空接收 ring。
     void try_transmit() { RxBuffer::try_dequeue(); }
 
     void uart_error_callback() {
@@ -269,44 +326,29 @@ private:
     static void hal_rx_dma_error_callback(DMA_HandleTypeDef* hal_dma_handle);
 };
 
-// Half-duplex RS-485 port, used for USART2.
+// 半双工 RS-485 端口, 用于 USART2。
 //
-// On the wire nothing distinguishes this from Uart. CubeMX assigns PD4 as
-// USART2_DE and MX_USART2_UART_Init calls HAL_RS485Ex_Init, which sets CR3.DEM,
-// so the USART asserts DE before the start bit and releases it after the stop
-// bit with no software involvement; the schematic ties the transceiver's RE# to
-// that same net, so the receiver is disabled exactly while the driver is on and
-// the port never hears its own transmission. RxBuffer is therefore used
-// unchanged, and there is no direction GPIO anywhere in this driver. STM32F407's
-// USART has no DEM/DEP at all, which is why c_board could not have done this.
+// 线路上与 Uart 无任何差别: CubeMX 指定 PD4 为 USART2_DE, MX_USART2_UART_Init
+// 调 HAL_RS485Ex_Init 置 CR3.DEM, USART 在起始位前、停止位后自动驱动 DE, 无需
+// 软件参与; 原理图把收发器 RE# 接到同一网络, 驱动开启的全程接收器关闭, 端口
+// 听不到自己的发送。RxBuffer 因此原样复用, 整个驱动里没有方向 GPIO。F407 的
+// USART 无 DEM/DEP, c_board 做不到这一点。
 //
-// The difference is the bus discipline, and it lives entirely in
-// TxBuffer<true> -- see the comment on kTurnaroundDeadline there. A
-// distinct type rather than a runtime flag is what keeps every branch of it out
-// of the three full-duplex ports, and it also makes it impossible to hand this
-// port to code that assumes it owns its transmit line.
+// 区别在总线纪律, 全部位于 TxBuffer<true>, 见彼处 kTurnaroundDeadline 注释。
+// 用独立类型而非运行时标志, 既让相关分支彻底离开三个全双工端口, 也使把这个口
+// 交给"假定独占发送线"的代码成为不可能。
 //
-// Rings an eighth the size of a streaming port's, because a bus master never has
-// more than one transaction on the wire. The ports above are sized for a device
-// that talks continuously; here the sequence is bounded by construction -- send a
-// request, stay quiet, receive one answer -- so what the ring must cover is a
-// single exchange plus slack, not a stream.
+// ring 只有流式端口的八分之一: 总线主节点线上永远只有一次事务, 发请求、静默、
+// 收一答, ring 只需覆盖单次交互加余量。256 字节在 4.8 Mbaud 下绕一圈 533 us,
+// 主循环每 12.5 us 回来一次, 余量 42 倍; sample_write_position() 的落后断言在
+// 半圈处, 仍有 21 倍。可容纳三个 78 字节应答; 发送侧 256 字节为七条 34 字节
+// 命令, 32 个检查点是 ring 能装下包数的两倍, 两者都不会先耗尽。
 //
-// 256 bytes is a full lap in 533 us at 4.8 Mbaud while the main loop comes back
-// every 12.5 us, a margin of 42x; sample_write_position()'s fallen-behind assert
-// sits at half a lap and still has 21x. It holds three of the 78-byte replies
-// this bus carries. On the transmit side 256 bytes is seven queued 34-byte
-// commands, and 32 checkpoints is twice as many boundaries as the ring can hold
-// packets, so neither runs out first.
+// staging 刻意与 ring 等大: try_dequeue() 按它钳制每次突发, 跨两次突发的包会
+// 在帧中间插入主循环静默, 对流无害, 对按总线静默定界的对端致命。
 //
-// The staging buffer deliberately matches the ring rather than being smaller:
-// try_dequeue() clamps each burst to it, and a packet split across two bursts
-// would put main-loop silence in the middle of a frame -- harmless on a stream,
-// fatal to a peer that frames on the bus going quiet.
-//
-// Together this is about 890 bytes per port instead of 5696. The two ports pay
-// 1.8 KB of the 32 KB D2 SRAM region instead of 11.4 KB, which is what makes
-// having both of them affordable at all.
+// 合计每口约 890 字节而非 5696; 两个口占 32 KB D2 SRAM 中的 1.8 KB 而非
+// 11.4 KB, 这正是两者能够共存的理由。
 inline constexpr size_t kRs485BufferSize = 256;
 inline constexpr size_t kRs485CheckpointCount = 32;
 
@@ -330,10 +372,9 @@ public:
             led::led->downlink_buffer_full();
     }
 
-    // Feeds the raw IDLE counter to the turnaround gate, deliberately not the
-    // consumed_idle_count_ bookkeeping RxBuffer::try_dequeue() keeps: whether
-    // the bus is free again depends only on the peer having stopped talking, not
-    // on whether the host has picked the bytes up yet.
+    // 把原始 IDLE 计数喂给 turnaround 门, 刻意不用 RxBuffer::try_dequeue()
+    // 维护的 consumed_idle_count_: 总线是否重新空闲只取决于对端是否停口, 与
+    // 主机是否已取走字节无关。
     void try_transmit() {
         RxBuffer::try_dequeue();
         TxBuffer::try_dequeue(RxBuffer::idle_count());
@@ -353,16 +394,12 @@ public:
 
     void tx_dma_error_callback() { TxBuffer::tx_error_callback(); }
 
-    // Deliberately does NOT drain the ring here. Draining from this ISR instead
-    // of from the main loop was built behind libhcs_APP_UART_RX_IN_ISR and
-    // measured on two cross-wired boards; the switch is gone because it lost.
-    // See firmware/mc02/AGENTS.md for the numbers. In short: it does remove this
-    // port's per-pass NDTR read (main loop 5410 -> 5133 cycles per pass, 101 ->
-    // 107 kHz), but that time is surplus -- the loop already runs four passes per
-    // arriving USB packet -- and it costs 26% of the round trip on a 200-byte
-    // message, because publishing only on IDLE gives up the chunked streaming
-    // RxBuffer::try_dequeue() does at every kMinFragmentSize boundary while the
-    // bytes are still arriving.
+    // 刻意不在此中断里排空 ring。曾在 libhcs_APP_UART_RX_IN_ISR 开关下实测
+    // ISR 排空方案: 确能省掉主循环每遍的 NDTR 读取(5410 -> 5133 周期/遍,
+    // 101 -> 107 kHz), 但该时间本就富余(每个到达的 USB 包主循环已跑四遍), 且
+    // 200 字节消息的往返耗时增加 26%, 因为仅按 IDLE 发布会放弃
+    // RxBuffer::try_dequeue() 在字节仍在到达时按 kMinFragmentSize 边界的分块
+    // 流式转发。数据见 firmware/mc02/AGENTS.md, 该开关因此被移除。
     void rx_event_callback() { RxBuffer::uart_idle_event_callback(); }
 
 private:
@@ -373,85 +410,53 @@ private:
     static void hal_tx_dma_error_callback(DMA_HandleTypeDef* hal_dma_handle);
 };
 
-// In D2 SRAM (.d2_sram, 0x30000000). Each object carries its own DMA rings, and
-// DMA1/DMA2 -- which drive the UART RX streams and TX streams -- are
-// D2-domain masters: keeping the rings in D2 SRAM keeps every transfer inside the
-// domain instead of crossing the D2-to-D1 interconnect to the AXI SRAM and
-// contending there with the M7. See the .d2_sram comment in
-// bsp/linker/STM32H723VGTx_APP.ld for the second reason (AXI SRAM headroom under
-// the non-cacheable MPU window) and for what app.cpp has to do at boot.
-//
-// Do NOT move these into .dtcm the way can.hpp places its objects: DTCM is
-// reachable only by the core, so a DMA stream targeting it silently transfers
-// nothing.
+// 位于 D2 SRAM (.d2_sram, 0x30000000)。每个对象自带 DMA ring, 而驱动 UART
+// RX/TX 流的 DMA1/DMA2 是 D2 域主设备: ring 放在 D2 SRAM 使每次传输都留在域
+// 内, 不跨 D2-D1 互连去 AXI SRAM 与 M7 争用。第二个原因(non-cacheable MPU
+// 窗口下的 AXI SRAM 余量)与 app.cpp 开机需做的事, 见
+// bsp/linker/STM32H723VGTx_APP.ld 的 .d2_sram 注释。不可像 can.hpp 那样挪进
+// .dtcm: DTCM 仅核内可达, 指向它的 DMA 流会静默地什么都传不了。
 [[gnu::section(".d2_sram")]] inline constinit Uart::Lazy uart1{data::DataId::kUart1, &huart1};
 [[gnu::section(".d2_sram")]] inline constinit Uart::Lazy uart7{data::DataId::kUart7, &huart7};
 [[gnu::section(".d2_sram")]] inline constinit Uart::Lazy uart10{data::DataId::kUart10, &huart10};
 [[gnu::section(".d2_sram")]] inline constinit UartRxOnly::Lazy uart_dbus{
     data::DataId::kUartDbus, &huart5};
 
-// RS-485 ports on USART2 / USART3, named for the enclosure silkscreen (UART2 /
-// UART3) rather than for a spare protocol slot. See UartRs485 for how they
-// differ from the streaming ports above, and the kTurnaroundDeadline comment in
-// tx_buffer.hpp for why.
+// RS-485 端口接在 USART2 / USART3, 按机壳丝印 (UART2 / UART3) 而非备用协议
+// 槽位命名。与流式端口的差异见 UartRs485, 以及 tx_buffer.hpp 的
+// kTurnaroundDeadline 注释。
 //
-// Settled against schematic CtrBoard-H7_V1.0-240124 sheet 5 (transceiver U5):
+// 电气事实, 依据原理图 CtrBoard-H7_V1.0-240124 第 5 页 (收发器 U5):
+//   - 无回显。引脚 2 (RE#)与 3 (DE)接同一网络, 由 USART2_DE(PD04)驱动, 本端
+//     发送全程接收器关闭, 发出的内容不会回来; R11 在此期间把 RO 拉到 3V3
+//     维持空闲电平, 禁用的接收器不会呈现虚假起始位。上游无需滤回显。
+//   - R17 把 DE 网络拉低, 端口上电即处于接收态, 软件运行前不占用总线。
+//   - R15 在本端 A-B 间装了 120R 端接, 再加一路前先确认远端情况。
+//   - DEAT/DEDT 在 .ioc 中为 16/16, 即 4.8 Mbaud、16 倍过采样下前后各一位
+//     时间; CubeMX 默认的 0 不可用。
 //
-//   - No echo. Pins 2 (RE#) and 3 (DE) are tied to one net driven by
-//     USART2_DE(PD04), so the receiver is off for the whole of our own
-//     transmission and nothing we send comes back up. R11 pulls RO to 3V3
-//     meanwhile, holding the idle level so the disabled receiver cannot present
-//     a false start bit. Nothing upstream has to filter an echo.
-//   - R17 pulls the DE net low, so the port powers up receiving and never
-//     squats on the bus before software runs.
-//   - R15 fits the 120R termination on-board, between A and B at this end.
-//     Check the far end before adding another.
-//   - DEAT/DEDT are 16/16 in the .ioc, one bit time either side at 4.8 Mbaud
-//     with oversampling by 16, rather than CubeMX's default of 0.
+// 此前留开放的两个疑问均已实测排除 `[实测 2026-08-25]`:
+//   - 本端发送结束后重新使能接收器不会引发虚假 IDLE, 否则 turnaround 门会
+//     提前放行而碰撞。
+//   - 一位时间的 DEAT 对该收发器足够; DEAT 过短会最先在最高波特率截断前沿。
+// `[实测 2026-09-01]` USART2 对接 USART3 的单板链路复测同样全部通过。
 //
-// Both of the questions this comment used to leave open were answered on the
-// bench with two boards cross-wired A-A / B-B on this port, running
-// host/examples/rs485_cross_test with HCS_RS485_PORT=1. `[实测 2026-08-25]`
+// 实测发现: TX ring 装不下的下行包会被丢弃且仅有 LED 提示。257 B 起到不了
+// 总线(256 B 及以下完好); 32 字节命令连发时第九条之后的全部丢失(12 条发 9、
+// 24 条发 10, 总是丢尾、无残帧)。ring 容量即上述设计点, 但静默丢弃不是;
+// mc02 的 CAN 也有同样缺口, 见 firmware/mc02/AGENTS.md 的"未做"注(hpm_board
+// 的下行流控未移植)。
 //
-//   - Re-enabling the receiver at the end of our own transmission does NOT
-//     raise a spurious IDLE. Had it, the turnaround gate would have released
-//     early and collided; instead the half-duplex turnaround test kept 8 of 8
-//     messages separate, and a silent bus delivered 0 bytes in 0 chunks over 5 s
-//     at both ends. The kTurnaroundDeadline-only fallback is not needed.
-//   - One bit time of DEAT is enough for this transceiver. A short DEAT would
-//     truncate the leading edge first at the highest rate, and the baudrate
-//     sweep passed both directions at every step through 4800000, with payloads
-//     from 1 to 200 bytes and 200 ping-pong rounds at 0 lost / 0 corrupt.
-//
-// The USART3 port below now answers the same two questions the same way, on a
-// one-board rig with USART2 wired to USART3 (HCS_RS485_RIG=single). Full suite
-// ALL PASSED: sizes 1-200 B both directions, the sweep through 4800000, the
-// turnaround gate, 5000 ping-pong rounds at 4800000 with 0 lost / 0 corrupt,
-// collision recovery, a silent bus, and channel isolation. A one-sided baudrate
-// change was checked to break the link, so the sweep is not passing on two ends
-// that both ignored it. `[实测 2026-09-01]`
-//
-// What that run did find: a downlink the TX ring cannot hold is dropped with
-// nothing but an LED to say so. 257 B and above never reach the bus (256 B and
-// below are intact), and a burst of 32-byte commands loses everything past the
-// ninth -- 12 queued deliver 9, 24 queued deliver 10, always the tail, never a
-// truncated frame. The ring size is the documented design point above; the
-// silence is not, and mc02 has the same gap on CAN (see the "未做" note in
-// firmware/mc02/AGENTS.md: hpm_board's downlink flow control was never ported).
-//
-// Always compiled when libhcs_APP_RS485_ENABLE (the default). They are the
-// enclosure's UART2 / UART3, not an overlay on a spare DataId. Diagnostic
-// builds emit on kUart0, which is not a silkscreen port on this board, so they
-// no longer collide with these two. Set the switch OFF to drop the objects,
-// their 1.8 KB of D2 SRAM, and the per-pass NDTR polls.
+// libhcs_APP_RS485_ENABLE(默认开)时始终编译。它们就是机壳的 UART2/UART3, 不
+// 是叠在备用 DataId 上的别名; 诊断构建改用 kUart0 输出, 与这两个口不再冲突。
+// 关掉该开关即可连同 1.8 KB D2 SRAM 与每遍 NDTR 轮询一起去掉。
 #ifdef libhcs_APP_RS485_ENABLE
 [[gnu::section(".d2_sram")]] inline constinit UartRs485::Lazy uart2{data::DataId::kUart2, &huart2};
 
-// Second RS-485 port, on USART3 through transceiver U6 -- 485_DIR1 driven by
-// USART3_DE on PB14, data on PD8/PD9, bus on connector P5. Electrically the same
-// circuit as U5 above: RE# tied to DE, R12 pulling RO to 3V3 so the disabled
-// receiver holds the idle level, R18 pulling the DE net low so the port powers
-// up receiving, and R16 fitting the 120R termination at this end.
+// 第二个 RS-485 口, USART3 经收发器 U6: 485_DIR1 由 PB14 上的 USART3_DE 驱动,
+// 数据走 PD8/PD9, 总线接 P5 连接器。电路与上述 U5 相同, RE# 接 DE, R12 把 RO
+// 拉到 3V3 使禁用的接收器维持空闲电平, R18 把 DE 网络拉低使端口上电即接收,
+// R16 在本端装 120R 端接。
 [[gnu::section(".d2_sram")]] inline constinit UartRs485::Lazy uart3{data::DataId::kUart3, &huart3};
 #endif
 

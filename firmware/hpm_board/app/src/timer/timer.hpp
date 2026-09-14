@@ -24,9 +24,8 @@ public:
         (static_cast<uint64_t>(kTimerFrequencyHz) + (kTickFrequencyHz / 2U)) / kTickFrequencyHz;
 
     Timer() {
-        // The running core's machine timer (mchtmr0 on core0 boards, mchtmr1
-        // on the ECAT bridge's fieldbus core) must be clocked at 4 MHz; every
-        // board configures the divider accordingly.
+        // 当前核的机器定时器(core0 板上是 mchtmr0, ECAT 桥的现场总线核上
+        // 是 mchtmr1)时钟必须为 4 MHz; 各板据此配置分频。
         core::utility::assert_always(
             clock_get_frequency(board::kMchtmrClockName) == kTimerFrequencyHz);
 
@@ -37,11 +36,10 @@ public:
         enable_mchtmr_irq();
     }
 
-    // Deliberately minimal: the machine timer interrupt (MTIP) bypasses the
-    // PLIC priority threshold, so once the nested-IRQ wrapper re-enables
-    // mstatus.MIE it can preempt even the priority-3 CAN ISR. Any work done
-    // here is worst-case latency added to the forwarding hot path -- the LED
-    // bookkeeping is therefore driven from the main loop off tick_count().
+    // 刻意保持最小: 机器定时器中断(MTIP)绕过 PLIC 优先级门槛, 嵌套中断
+    // 包装层一旦重新打开 mstatus.MIE, 它就能抢占乃至优先级 3 的 CAN ISR。
+    // 在这里做的任何事都会加到转发热路径的最坏延迟上 -- 因此 LED 记账改由
+    // 主循环依据 tick_count() 驱动。
     void irq_handler() {
         tick_counter_.store(
             tick_counter_.load(std::memory_order::relaxed) + 1, std::memory_order::relaxed);
@@ -52,19 +50,19 @@ public:
         mchtmr_set_compare_value(HPM_MCHTMR, next_tick_compare_value_);
     }
 
-    // 1 kHz tick counter for main-loop paced work (LED patterns).
+    // 1 kHz tick 计数器, 供主循环节奏型工作(LED 花样)使用。
     uint32_t tick_count() const { return tick_counter_.load(std::memory_order::relaxed); }
 
     static uint32_t timestamp_quarter_us() {
-        // Read MTIME through its 32-bit MMIO view to avoid aliasing the SDK's uint64_t field.
+        // 经 32 位 MMIO 视图读 MTIME, 避免别名访问 SDK 的 uint64_t 字段。
         const volatile uint32_t* const mtime_words =
             reinterpret_cast<volatile uint32_t*>(HPM_MCHTMR_BASE);
         return mtime_words[0];
     }
 
     static uint64_t timestamp64_quarter_us() {
-        // On riscv32, reading the 64-bit MTIME MMIO register compiles to two 32-bit loads.
-        // Read high-low-high and retry on rollover so the returned 64-bit timestamp is stable.
+        // riscv32 上读 64 位 MTIME MMIO 寄存器会编译成两次 32 位加载。
+        // 按高-低-高顺序读取并在回绕时重试, 保证返回的 64 位时间戳自洽。
         const volatile uint32_t* const mtime_words =
             reinterpret_cast<volatile uint32_t*>(HPM_MCHTMR_BASE);
         uint32_t hi1 = 0;

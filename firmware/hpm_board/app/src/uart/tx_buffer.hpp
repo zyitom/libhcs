@@ -100,38 +100,30 @@ public:
         return true;
     }
 
-    // Stop an in-flight TX DMA immediately. Used before a baudrate switch, for
-    // two reasons: bytes still queued would otherwise be clocked out at the new
-    // rate and arrive as garbage, and -- because DLL aliases THR while LCR.DLAB
-    // is set -- a DMA write landing inside the switch window would overwrite the
-    // divisor latch itself. The caller relies on TX being provably stopped, not
-    // merely likely to be idle.
+    // 立即停掉在途的 TX DMA。波特率切换前使用, 有两个原因: 不停的话队列里
+    // 剩余字节会按新速率移位输出、到达即乱码; 且 LCR.DLAB 置位期间 DLL
+    // 别名 THR, 落在切换窗口内的 DMA 写会覆盖分频锁存器本身。调用方依赖的
+    // 是"TX 可证明已停止", 而非"多半空闲"。
     //
-    // The queued data itself is left alone: out_ does not move, so try_dequeue()
-    // re-triggers from the same position on the next poll. Bytes the DMA had
-    // already pushed into the FIFO are re-sent rather than dropped, which can
-    // duplicate a partially shifted-out character across the switch. That is
-    // within the documented contract for handle_config -- the host is expected to
-    // quiesce the link first -- and is the safer of the two failure modes.
+    // 队列数据本身不动: out_ 不前移, 下次轮询时 try_dequeue() 从原位重新
+    // 触发。DMA 已推入 FIFO 的字节会重发而非丢弃, 跨切换可能把一个移位到
+    // 一半的字符重复一遍。这在 handle_config 的既有约定之内 -- 主机本应先
+    // 静默链路 -- 且是两种失败模式中较安全的一种。
     void abort_transmit() {
-        // CHABORT before disabling: its register documentation states writes are
-        // ignored for channels that are not currently enabled, so clearing
-        // CTRL.ENABLE first would silently skip the abort and leave the channel's
-        // handshake with the UART half-completed. Aborting also raises
-        // INTABORTSTS, cleared below so the next transfer starts from clean
-        // status flags.
+        // 先 CHABORT 再禁用: 寄存器文档写明对未使能的通道写会被忽略, 若先
+        // 清 CTRL.ENABLE 会静默跳过中止, 通道与 UART 的握手停在半途。中止
+        // 还会置起 INTABORTSTS, 在下方清掉, 让下一次传输从干净的状态标志
+        // 起步。
         if (dma_channel_is_enable(dma_.base, dma_.channel))
             dma_abort_channel(dma_.base, 1U << dma_.channel);
         core::utility::assert_always(dma_mgr_disable_channel(&dma_) == status_success);
         dma_clear_transfer_status(dma_.base, dma_.channel);
         tx_triggered_ = false;
-        // Aborting discards the bytes the channel was mid-way through, so the
-        // pending count must go with it. Leaving it set let the next
-        // try_dequeue() advance out_ past data the DMA never actually sent,
-        // permanently desynchronising the ring so that every subsequent byte came
-        // from the wrong offset. Independent of the divisor-latch corruption that
-        // caused the silent-TX symptom -- this one only ever fired after a
-        // baudrate switch, and corrupted the stream rather than stopping it.
+        // 中止会丢弃通道写到一半的字节, 在途计数必须随之清零。留着它会让
+        // 下一次 try_dequeue() 把 out_ 推过 DMA 实际从未发出的数据, 环形被
+        // 永久错位, 之后每个字节都来自错误偏移。与造成静默 TX 症状的分频
+        // 锁存器破坏是两回事 -- 这一条只在切换波特率后触发, 且是打乱数据流
+        // 而非停发。
         in_flight_ = 0;
     }
 
@@ -200,12 +192,10 @@ private:
         config.dst_addr_ctrl = DMA_MGR_ADDRESS_CONTROL_FIXED;
         config.src_mode = DMA_MGR_HANDSHAKE_MODE_NORMAL;
         config.dst_mode = DMA_MGR_HANDSHAKE_MODE_HANDSHAKE;
-        // Same constraint as the RX side: the TX request fires at
-        // uart_tx_fifo_trg_not_full, which guarantees exactly one free slot, so
-        // a burst of 8 could push 8 bytes at a FIFO with room for one and drop
-        // the remainder. The RX corruption this mirrors was observed directly;
-        // this side is corrected by the same rule rather than left to depend on
-        // the FIFO happening to drain faster than the DMA fills it.
+        // 与 RX 侧同一约束: TX 请求在 uart_tx_fifo_trg_not_full 时发出, 只
+        // 保证一个空槽, 若突发 8 字节, 可能往只剩一个空位的 FIFO 塞 8 个而
+        // 丢弃其余。RX 侧同源的损坏是直接观测到的; 这一侧按同一规则修正,
+        // 而不是指望 FIFO 恰好排空得比 DMA 灌入快。
         config.src_burst_size = DMA_MGR_NUM_TRANSFER_PER_BURST_1T;
 
         core::utility::assert_always(
@@ -213,12 +203,12 @@ private:
             && dma_mgr_setup_channel(&dma_, &config) == status_success
             && dma_mgr_config_linked_descriptor(&dma_, &config, linked_descriptor_)
                    == status_success);
-        // No cache flush: descriptor in AHB SRAM.
+        // 无需 cache flush: 描述符在 AHB SRAM。
     }
 
     void trigger_dma(const std::byte* src, size_t size, const std::byte* src2, size_t size2) {
         core::utility::assert_debug(src);
-        // No cache flush: buffers in AHB SRAM.
+        // 无需 cache flush: 缓冲在 AHB SRAM。
         auto& ctrl = dma_.base->CHCTRL[dma_.channel];
         ctrl.SRCADDR = reinterpret_cast<uintptr_t>(src);
         ctrl.TRANSIZE = size;
@@ -236,7 +226,7 @@ private:
     }
 
     UART_Type* uart_base_;
-    // Placed in AHB SRAM by the caller — naturally non-cached.
+    // 由调用方放入 AHB SRAM -- 天然非缓存。
     std::byte* data_buffer_;
     dma_mgr_linked_descriptor_t* linked_descriptor_;
     dma_resource_t dma_;

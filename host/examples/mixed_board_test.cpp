@@ -21,7 +21,7 @@
 //   ./mixed_board_test link
 //   ./mixed_board_test latency <tx_bus> <rx_bus> [samples]
 //   ./mixed_board_test rate    <tx_bus> <rx_bus> [seconds] [frames_per_packet]
-//   ./mixed_board_test uart    [rounds]
+//   ./mixed_board_test uart    [baud=115200] [rounds=20]
 //
 // HCS_BOARD_A / HCS_BOARD_B select the two boards by USB serial; without them
 // the first two project boards found are used, in sysfs order.
@@ -436,13 +436,10 @@ struct Rig {
     }
 };
 
-// HCS_CAN_FD=1 sends CAN-FD (1 Mbit/s arbitration + 5 Mbit/s data with BRS)
-// instead of classic CAN, so the probes can tell a format problem apart from a
-// wiring one.
-bool use_fdcan() {
-    const char* value = std::getenv("HCS_CAN_FD");
-    return value && value[0] == '1';
-}
+// The HCS_CAN_FD=1 opt-in is gone with the per-frame is_fdcan flag: the frame
+// type is a property of the BUS, fixed by the firmware's port table and read
+// back over EP0, so there is nothing left for an environment variable to
+// choose. Every probe below sends in whatever mode the target bus runs.
 
 // HCS_CAN_EXT=1 uses a 29-bit identifier, so the probes cover the extended-ID
 // path as well as the FD/classic split.
@@ -457,8 +454,7 @@ void send_frame(examples::BoardSession& board, int bus, uint32_t sequence, uint3
     put_u32_le(payload + 4, mix(sequence));
     const bool ext = use_extended_id();
     board.transmit([&](examples::BoardTransmitter& tx) {
-        tx.can(bus, {.can_id = ext ? (0x1AB0000U | can_id) : can_id, .can_data = payload,
-                     .is_fdcan = use_fdcan(), .is_extended_can_id = ext});
+        tx.can(bus, {.can_id = ext ? (0x1AB0000U | can_id) : can_id, .can_data = payload, .is_extended_can_id = ext});
     });
 }
 
@@ -486,7 +482,7 @@ int run_canpack(
     const uint32_t id_b = kCanIdBase + 0x31;
     printf("\nboard %c: CAN%d(id %03X) + CAN%d(id %03X) in ONE packet, %u rounds (%s)\n",
         which == 0 ? 'A' : 'B', bus_a, id_a, bus_b, id_b, frames,
-        use_fdcan() ? "CAN-FD" : "classic");
+        "frames follow the bus mode");
 
     for (Sink* s : {&rig.sink_a, &rig.sink_b}) {
         s->reset_can_ids();
@@ -505,15 +501,15 @@ int run_canpack(
             // Same two frames, two separate transmit() calls. Isolates "two CAN
             // fields in ONE packet" from "two frames close together in time".
             board.transmit([&](examples::BoardTransmitter& tx) {
-                tx.can(bus_a, {.can_id = id_a, .can_data = payload, .is_fdcan = use_fdcan()});
+                tx.can(bus_a, {.can_id = id_a, .can_data = payload});
             });
             board.transmit([&](examples::BoardTransmitter& tx) {
-                tx.can(bus_b, {.can_id = id_b, .can_data = payload, .is_fdcan = use_fdcan()});
+                tx.can(bus_b, {.can_id = id_b, .can_data = payload});
             });
         } else {
             board.transmit([&](examples::BoardTransmitter& tx) {
-                tx.can(bus_a, {.can_id = id_a, .can_data = payload, .is_fdcan = use_fdcan()});
-                tx.can(bus_b, {.can_id = id_b, .can_data = payload, .is_fdcan = use_fdcan()});
+                tx.can(bus_a, {.can_id = id_a, .can_data = payload});
+                tx.can(bus_b, {.can_id = id_b, .can_data = payload});
             });
         }
         std::this_thread::sleep_for(std::chrono::milliseconds{pace_ms});
@@ -571,7 +567,7 @@ int run_canloop(int which, int tx_bus, int rx_bus, uint32_t frames) {
     }
 
     printf("\nboard %c CAN%d -> CAN%d, %u frames (%s)\n", which == 0 ? 'A' : 'B', tx_bus, rx_bus,
-        frames, use_fdcan() ? "CAN-FD" : "classic");
+        frames, "frames follow the bus mode");
 
     const uint32_t can_id = kCanIdBase + 0x20 + static_cast<uint32_t>(tx_bus);
     sink.reset_can_ids();
@@ -766,7 +762,7 @@ int run_rate(int tx_bus, int rx_bus, uint32_t seconds, int frames_per_packet) {
 
     printf(
         "\npacket-rate sweep (%s): A.CAN%d -> B.CAN%d, %d frame(s) per USB packet, %u s/step\n",
-        use_fdcan() ? "CAN-FD" : "classic CAN", tx_bus, rx_bus, frames_per_packet, seconds);
+        "frames follow the bus mode", tx_bus, rx_bus, frames_per_packet, seconds);
     printf("%10s %12s %12s %12s   %s\n", "packets/s", "frames/s", "sent", "delivered", "loss");
 
     // Classic CAN 8-byte frames run ~120 us on the wire, so the bus itself caps
@@ -790,8 +786,7 @@ int run_rate(int tx_bus, int rx_bus, uint32_t seconds, int frames_per_packet) {
             put_u32_le(payload + 4, mix(static_cast<uint32_t>(index)));
             rig.a->transmit([&](examples::BoardTransmitter& tx) {
                 for (int repeat = 0; repeat < frames_per_packet; ++repeat)
-                    tx.can(tx_bus, {.can_id = kCanIdBase + tx_bus, .can_data = payload,
-                                    .is_fdcan = use_fdcan()});
+                    tx.can(tx_bus, {.can_id = kCanIdBase + tx_bus, .can_data = payload});
             });
             next += period;
             while (Clock::now() < next) {}
@@ -1061,7 +1056,7 @@ int run_both(uint32_t frames_per_sec, uint32_t seconds) {
 
     printf(
         "\nboth buses, %u frames/s each, %u s (%s)\n", frames_per_sec, seconds,
-        use_fdcan() ? "CAN-FD" : "classic CAN");
+        "frames follow the bus mode");
 
     const auto period = std::chrono::nanoseconds{1'000'000'000ULL / frames_per_sec};
     const uint64_t total = static_cast<uint64_t>(frames_per_sec) * seconds;
@@ -1073,7 +1068,7 @@ int run_both(uint32_t frames_per_sec, uint32_t seconds) {
         rig.a->transmit([&](examples::BoardTransmitter& tx) {
             for (int bus = 0; bus < 2; ++bus)
                 tx.can(bus, {.can_id = kCanIdBase + static_cast<uint32_t>(bus),
-                             .can_data = payload, .is_fdcan = use_fdcan()});
+                             .can_data = payload});
         });
         next += period;
         while (Clock::now() < next) {}
@@ -1571,7 +1566,7 @@ int run_arbitrate(uint32_t frames_each, uint32_t rate_hz) {
 
     printf(
         "\n3-node arbitration: A.CAN1 + B.CAN1 + B.CAN2 all sending %u frames at %u Hz (%s)\n",
-        frames_each, rate_hz, use_fdcan() ? "CAN-FD" : "classic");
+        frames_each, rate_hz, "frames follow the bus mode");
 
     // Distinct CAN ids so each sender's frames are attributable, and so the
     // arbitration order is deterministic (lower id wins).
@@ -1598,8 +1593,7 @@ int run_arbitrate(uint32_t frames_each, uint32_t rate_hz) {
             try {
                 board.transmit([&](examples::BoardTransmitter& tx) {
                     for (size_t k = 0; k < buses.size(); ++k)
-                        tx.can(buses[k], {.can_id = ids[k], .can_data = payload,
-                                          .is_fdcan = use_fdcan()});
+                        tx.can(buses[k], {.can_id = ids[k], .can_data = payload});
                 });
                 for (auto* counter : counters)
                     counter->fetch_add(1, std::memory_order_relaxed);

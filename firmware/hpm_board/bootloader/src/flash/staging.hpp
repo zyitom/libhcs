@@ -24,29 +24,23 @@ inline bool clear_staging_record() {
 
 } // namespace detail
 
-// Install a firmware image the running app staged for us, if one is there and
-// intact. Returns true only when the app slot now holds the staged image.
+// 安装运行中的 app 暂存的固件镜像(若存在且完好)。仅当 app 槽已装好暂存镜像时
+// 返回 true。
 //
-// Ordering is the whole design; every step below is placed for one reason:
+// 顺序即设计本身, 下面每一步的位置都有其原因:
 //
-//  1. Validate the STAGED copy first. Everything after this erases the app slot,
-//     so a corrupt download must be rejected while the installed app is still
-//     the one that boots. This is why validate_image_at() exists.
+//  1. 先校验暂存副本。此后所有步骤都会擦除 app 槽, 损坏的下载必须在已装 app
+//     仍是可启动镜像时被拒。这正是 validate_image_at() 存在的原因。
 //
-//  2. Clear the staging record on a validation failure. Otherwise a permanently
-//     bad image would be re-examined, and re-rejected, on every single boot --
-//     an unbootable-looking device whose app is in fact fine.
+//  2. 校验失败时清除 staging 记录。否则永久坏的镜像会在每次启动都被重新
+//     检查并拒绝 -- 设备看起来无法启动, 实际上 app 是好的。
 //
-//  3. Clear it on SUCCESS only after the app metadata has committed. Between the
-//     erase and that commit the app slot holds a half-written image, and the
-//     staging record is the only thing that can rebuild it. Losing power there
-//     with the record already cleared is the one way to brick this path, so the
-//     clear must come last -- see common/foe_staging.hpp.
+//  3. 成功路径上, 清除必须放在 app metadata 提交之后。擦除到提交之间 app 槽
+//     是写了一半的镜像, staging 记录是重建它的唯一凭据; 记录已清后掉电是唯一
+//     能让这条路变砖的方式, 故清除必须最后 -- 见 common/foe_staging.hpp。
 //
-// A failure anywhere after step 1 leaves the staging record intact and the app
-// metadata un-committed, so the next boot retries. Writer skips sectors whose
-// content already matches, which makes that retry cheap rather than a full
-// rewrite.
+// 步骤 1 之后任何一步失败都保持 staging 记录完好、app metadata 未提交, 下次
+// 启动重试。Writer 会跳过内容已一致的扇区, 重试因此廉价, 无需整体重写。
 inline bool install_staged_image_if_ready() {
     if (!XpiNor::instance().available())
         return false;
@@ -56,9 +50,9 @@ inline bool install_staged_image_if_ready() {
 
     const uint32_t size = foe::staging_record()->image_size;
 
-    // (1) Prove the candidate before touching anything.
+    // (1) 动任何东西之前先证明候选镜像。
     if (!validate_image_at(foe::kStagingImageStart, size, kStagingMaxImageSize)) {
-        // (2) Drop it; the installed app is untouched and still boots.
+        // (2) 丢弃; 已装 app 未被触碰, 仍可启动。
         (void)detail::clear_staging_record();
         return false;
     }
@@ -86,13 +80,12 @@ inline bool install_staged_image_if_ready() {
     if (!metadata.finish_flashing(size))
         return false;
 
-    // Re-validate what actually landed in the app slot. The staged copy passing
-    // does not prove the write did: this is the only check that covers the copy
-    // itself, and it runs while the staging record is still available to retry.
+    // 重验实际落进 app 槽的内容。暂存副本通过不能证明写入正确: 这是唯一覆盖
+    // 写入结果本身的检查, 且此时 staging 记录仍可用于重试。
     if (!validate_candidate_image(size))
         return false;
 
-    // (3) Committed and proven -- the staged copy has no further job.
+    // (3) 已提交且验证通过 -- 暂存副本再无用处。
     (void)detail::clear_staging_record();
     return true;
 }

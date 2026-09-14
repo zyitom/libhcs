@@ -20,61 +20,39 @@
 
 namespace libhcs::firmware::board {
 
-// ONE IMAGE, TWO PCBs
+// 一份镜像服务两块 PCB: 单 CAN 板与双 CAN 板, 仅 CAN 端口数、RGB LED 引脚与
+// 每 CAN 指示灯引脚不同, 其余(board.c、.yaml、UART、时钟树、USB)完全一致。
 //
-// This board_app serves both HPM5321 variants -- the single-CAN board and the
-// dual-CAN board -- from a single binary. They were separate `boards/`
-// directories with ~700 duplicated lines carrying about fifteen lines of real
-// difference: how many CAN ports exist, the RGB LED pins, and the per-CAN
-// indicator pins. Everything else (board.c, the .yaml, the UART, the clock
-// tree, USB) was already identical.
+// 板型在上电时由 OTP shadow word 25 判定, 该字的证据强度与未识别值为何直接
+// 拒绝启动见 common/board_identity.hpp。bootloader 在 word 25 非两个已知值时
+// 拒绝跳进本 app, 故此处任何代码运行时板型必已确认。
 //
-// The variant is decided at run time from OTP shadow word 25 -- see
-// common/board_identity.hpp for what that word is, what the evidence for it
-// actually supports, and why an unrecognized value stops the boot rather than
-// picking a default. The bootloader refuses to jump to this app at all unless
-// the word is one of the two known values, so by the time any code here runs the
-// identity is already known-good.
+// 表为何是运行时而非编译期: PA30/PA31 在单 CAN 板上是绿/红 LED 阴极, 在双 CAN
+// 板上是 MCAN3 RXD/TXD, 两种引脚分配在同一组焊盘上互斥, 不存在可无条件配置的
+// 超集; 每个焊盘只能按板型一次性选定一个 FUNC_CTL。
 //
-// WHY THE TABLES ARE RUNTIME AND NOT COMPILE-TIME
-//
-// PA30 and PA31 are the green and red LED cathodes on the single-CAN board and
-// MCAN3 RXD/TXD on the dual board. The two pinouts are mutually exclusive on the
-// same pads, so this is not a superset that could be configured unconditionally:
-// each pad gets exactly one FUNC_CTL, chosen once, from the identity.
-//
-// The tables are therefore sized for the maximum (two CAN controllers) and
-// populated for the maximum, with a runtime count gating which entries are
-// actually brought up. That costs one extra MCAN message-RAM slice in AHB SRAM
-// (MCAN_MSG_BUF_SIZE_IN_WORDS = 640 words, about 2.5 KiB of the 32 KiB) on the
-// single-CAN board, where it goes unused. Making it dynamic instead would buy
-// back 2.5 KiB in exchange for losing the static placement the SoC requires --
-// not a good trade at 8% of AHB SRAM.
+// 表按上限(两个 CAN 控制器)定尺寸并填充, 运行时以端口数决定实际启用哪些条目。
+// 代价是单 CAN 板多占一片闲置的 MCAN message RAM(即 MCAN_MSG_BUF_SIZE_IN_WORDS
+// = 640 words, 32 KiB AHB SRAM 中约 2.5 KiB); 改为动态布局只能省回这 2.5 KiB,
+// 却失去 SoC 要求的静态放置, 不划算。
 
-// The HPM5321 USB always runs at high speed.
+// HPM5321 的 USB 始终以高速运行。
 bool usb_use_high_speed();
 
-// Maximum CAN controllers across both variants. The single-CAN board uses only
-// entry 0; kCanPorts is sized and populated for the dual board, and
-// can_port_count() reports how many are live on this board.
+// 两种板型下 CAN 控制器数的上限。单 CAN 板只用条目 0; kCanPorts 按双 CAN 板
+// 定尺寸并填充, can_port_count() 报告本板实际存在的端口数。
 constexpr size_t kCanPortCapacity = 2;
 
-// CAN ports in table order. Silkscreen CAN1 = kCanPorts[0] = DataId::kCan1;
-// silkscreen CAN2 = kCanPorts[1] = DataId::kCan2.
+// CAN 端口按表序排列: 丝印 CAN1 = kCanPorts[0] = DataId::kCan1, 丝印
+// CAN2 = kCanPorts[1] = DataId::kCan2。
 //
-// Both variants run CAN-FD, so the table is the same for both PCBs and the
-// single-CAN board simply brings up one fewer port. FD is a strict superset of
-// classic CAN 2.0: an FD-enabled M_CAN sends and receives classic frames too,
-// with the format chosen per element from the FDF/BRS bits, which can.cpp
-// drives from the host's per-frame is_fdcan flag. Nothing switches mode at run
-// time -- the controller is configured once and stays FD-capable.
-//
-// This replaces an earlier classic-only MCAN0 on the single-CAN board, which
-// existed only to keep that board byte-identical to what shipped. Classic mode
-// is strictly weaker with no upside: it cannot receive FD frames at all
-// (measured 0/50 from an FD peer, versus 50/50 classic). What still needs
-// on-target confirmation is the single-CAN PCB's transceiver at the 5 Mbit data
-// phase -- see README.md.
+// 两种板型都跑 CAN-FD, 表对两块 PCB 相同, 单 CAN 板只是少使能一路。接收方向
+// FD 是经典 CAN 2.0 的严格超集: 开启 FD 的 M_CAN 仍能解码对端的经典帧。发送
+// 方向不再逐帧选择 -- 帧类型跟随总线, 本板发出的每一帧都是 FD(见 can.cpp 与
+// core/src/protocol/protocol.hpp 中已废弃的 IsFdCan 头部位)。运行时不切换
+// 模式: 控制器配置一次, 保持 FD 能力。经典模式完全收不到 FD 帧(实测 FD 对端
+// 0/50, 经典帧 50/50); 单 CAN 板收发器在 5 Mbit 数据段的时序仍待上板确认,
+// 见 README.md。
 constexpr CanPort kCanPorts[] = {
     {.base = HPM_MCAN0_BASE,
      .irq_num = IRQn_MCAN0,
@@ -87,39 +65,34 @@ constexpr CanPort kCanPorts[] = {
 };
 static_assert(std::size(kCanPorts) == kCanPortCapacity);
 
-// Number of CAN controllers actually present: 2 on the dual board, 1 on the
-// single-CAN board. Every loop over the CAN array must bound on this rather than
-// on std::size(kCanPorts), or it will bring up an MCAN3 that has no transceiver
-// and whose pads are LED cathodes.
+// 实际存在的 CAN 控制器数: 双 CAN 板为 2, 单 CAN 板为 1。遍历 CAN 数组的
+// 循环必须以它而非 std::size(kCanPorts) 为界, 否则会初始化一路没有收发器、
+// 焊盘实为 LED 阴极的 MCAN3。
 inline size_t can_port_count() { return board_identity().dual_can() ? 2U : 1U; }
 
-// The port at `index`. Entries at or above can_port_count() are not valid on
-// this board.
+// 下标 index 处的端口。>= can_port_count() 的条目在本板上无效。
 constexpr CanPort can_port(size_t index) { return kCanPorts[index]; }
 
 uint32_t init_can(MCAN_Type* ptr);
 void can_irq_handler(size_t board_can_index);
 
-// MCAN message RAM region for the CAN controller at the given logical index
-// (an .ahb_sram-placed array on this SoC, see board_app.cpp).
+// 逻辑下标 can_index 对应 CAN 控制器的 MCAN message RAM 区域
+// (本 SoC 上为 .ahb_sram 段中的数组, 见 board_app.cpp)。
 mcan_msg_buf_attr_t can_message_ram(size_t can_index);
 
-// PTPC (the shared CAN timestamp timebase) runs on the 160 MHz AHB clock:
-// reported-nanosecond step is 6 ns, so true microseconds = reported
-// nanoseconds / (160 * 6). The CAN driver asserts this against the clock tree
-// at init.
+// PTPC(共享的 CAN 时间戳时基)运行在 160 MHz AHB 时钟: 报告的纳秒步进为
+// 6 ns, 故真实微秒 = 报告纳秒 / (160 * 6)。CAN 驱动在 init 时会对照时钟树
+// 断言这一点。
 constexpr uint32_t kCanTimestampNsPerUs = 960;
 
-// The application runs on core0: its machine timer is MCHTMR0, clocked at the
-// 4 MHz the shared Timer driver expects (board.c).
+// 应用运行在 core0: 其 machine timer 为 MCHTMR0, 时钟为共享 Timer 驱动所
+// 要求的 4 MHz(见 board.c)。
 constexpr clock_name_t kMchtmrClockName = clock_mchtmr0;
 
-// DMA ring storage section for the shared UART driver: AHB SRAM is naturally
-// non-cached on this SoC.
+// 共享 UART 驱动的 DMA 环形缓冲所在 section: AHB SRAM 在本 SoC 上天然非缓存。
 #define libhcs_DMA_BUFFER_SECTION ".ahb_sram"
 
-// UART ports in logical order. Both variants have a single data UART (UART2) and
-// no DBUS receiver.
+// UART 端口按逻辑序。两种板型都只有一个数据 UART(UART2), 无 DBUS 接收器。
 constexpr UartPort kUartPorts[] = {
     {
         .base = HPM_UART2_BASE,
@@ -136,13 +109,11 @@ constexpr UartPort kUartPorts[] = {
 uint32_t init_uart(UART_Type* ptr);
 void uart_irq_handler(size_t board_uart_index);
 
-// Plain GPIO RGB LED, active-low (common-anode: drive the pad LOW to light the
-// channel). The last template argument is active_high = false.
+// 普通 GPIO RGB LED, 低电平有效(共阳: 拉低焊盘点亮通道)。模板末参为
+// active_high = false。
 //
-// The two variants wire the LED to different pads, and on the single-CAN board
-// two of them (PA30, PA31) are the very pads the dual board gives to MCAN3 --
-// which is why these cannot be a single table. led_red_pin() and friends pick the
-// set at run time.
+// 两种板型的 LED 接在不同焊盘, 且单 CAN 板上的 PA30/PA31 正是双 CAN 板给
+// MCAN3 的焊盘, 因此不能合并成一张表。led_red_pin() 等在运行时选择引脚组。
 constexpr GpioPin kSingleCanLedBluePin = make_gpio_pin<gpiom_soc_gpio0, 'A', 29, false>();
 constexpr GpioPin kSingleCanLedGreenPin = make_gpio_pin<gpiom_soc_gpio0, 'A', 30, false>();
 constexpr GpioPin kSingleCanLedRedPin = make_gpio_pin<gpiom_soc_gpio0, 'A', 31, false>();
@@ -163,10 +134,9 @@ inline GpioPin led_blue_pin() {
     return board_identity().dual_can() ? kDualCanLedBluePin : kSingleCanLedBluePin;
 }
 
-// Per-CAN indicator LEDs: two on the dual board (active-high), none on the
-// single-CAN board. Sized for the maximum; can_indicator_count() reports how many
-// exist on this board, and the shared Led driver skips the indicator logic
-// entirely when that is zero.
+// 每 CAN 指示灯: 双 CAN 板两颗(高电平有效), 单 CAN 板没有。按上限定尺寸;
+// can_indicator_count() 报告本板实际数量, 为 0 时共享 Led 驱动完全跳过指示灯
+// 逻辑。
 constexpr std::array<GpioPin, 2> kCanIndicatorPins{
     make_gpio_pin<gpiom_soc_gpio0, 'B', 14, true>(),
     make_gpio_pin<gpiom_soc_gpio0, 'B', 15, true>(),

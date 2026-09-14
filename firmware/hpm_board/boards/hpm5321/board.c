@@ -63,7 +63,7 @@ bool board_check_bootloader_force_stay_requested(void) {
         }
     }
 
-    // Restore PA07 back to JTAG TMS so the debugger can attach while bootloader stays active.
+    // 把 PA07 还原为 JTAG TMS, 使 bootloader 驻留期间调试器仍能连接。
     restore_bootloader_force_stay_button_pin();
     return pressed;
 }
@@ -77,7 +77,7 @@ void board_init(void) {
 }
 
 static inline void init_py_pins_as_soc_gpio(void) {
-    // Switch all PY00-PY01 back to SoC GPIO domain
+    // 把 PY00-PY01 全部切回 SoC GPIO 域
     HPM_PIOC->PAD[IOC_PAD_PY00].FUNC_CTL = PIOC_PY00_FUNC_CTL_SOC_GPIO_Y_00;
     HPM_PIOC->PAD[IOC_PAD_PY01].FUNC_CTL = PIOC_PY01_FUNC_CTL_SOC_GPIO_Y_01;
 }
@@ -86,14 +86,14 @@ static inline void board_init_clock(void) {
     uint32_t cpu0_freq = clock_get_frequency(clock_cpu0);
 
     if (cpu0_freq == PLLCTL_SOC_PLL_REFCLK_FREQ) {
-        /* Configure the External OSC ramp-up time: ~9ms */
+        /* 配置外部 OSC 起振爬升时间: 约 9 ms */
         pllctlv2_xtal_set_rampup_time(HPM_PLLCTLV2, 32UL * 1000UL * 9U);
 
-        /* Select clock setting preset1 */
+        /* 选择时钟预设 preset1 */
         sysctl_clock_set_preset(HPM_SYSCTL, 2);
     }
 
-    /* group0[0] */
+    /* 加入 group0[0] */
     clock_add_to_group(clock_cpu0, 0);
     clock_add_to_group(clock_ahb, 0);
     clock_add_to_group(clock_lmm0, 0);
@@ -105,27 +105,27 @@ static inline void board_init_clock(void) {
     clock_add_to_group(clock_xpi0, 0);
     clock_add_to_group(clock_ptpc, 0);
 
-    /* Connect Group0 to CPU0 */
+    /* 将 Group0 连接到 CPU0 */
     clock_connect_group_to_cpu(0, 0);
 
-    /* Bump up DCDC voltage to 1275mv */
+    /* 把 DCDC 电压提到 1275 mV */
     pcfg_dcdc_set_voltage(HPM_PCFG, 1275);
 
-    /* Configure CPU to 480MHz, AXI/AHB to 160MHz */
+    /* 配置 CPU 480 MHz, AXI/AHB 160 MHz */
     sysctl_config_cpu0_domain_clock(HPM_SYSCTL, clock_source_pll0_clk0, 2, 3);
-    /* Configure PLL0 Post Divider */
+    /* 配置 PLL0 后分频 */
     pllctlv2_set_postdiv(
-        HPM_PLLCTLV2, pllctlv2_pll0, pllctlv2_clk0, pllctlv2_div_1p0); /* PLL0CLK0: 960MHz */
+        HPM_PLLCTLV2, pllctlv2_pll0, pllctlv2_clk0, pllctlv2_div_1p0); /* PLL0CLK0 输出 960 MHz */
     pllctlv2_set_postdiv(
-        HPM_PLLCTLV2, pllctlv2_pll0, pllctlv2_clk1, pllctlv2_div_1p6); /* PLL0CLK1: 600MHz */
+        HPM_PLLCTLV2, pllctlv2_pll0, pllctlv2_clk1, pllctlv2_div_1p6); /* PLL0CLK1 输出 600 MHz */
     pllctlv2_set_postdiv(
-        HPM_PLLCTLV2, pllctlv2_pll0, pllctlv2_clk2, pllctlv2_div_2p4); /* PLL0CLK2: 400MHz */
-    /* Configure PLL0 Frequency to 960MHz */
+        HPM_PLLCTLV2, pllctlv2_pll0, pllctlv2_clk2, pllctlv2_div_2p4); /* PLL0CLK2 输出 400 MHz */
+    /* 配置 PLL0 频率为 960 MHz */
     pllctlv2_init_pll_with_freq(HPM_PLLCTLV2, pllctlv2_pll0, 960000000);
 
     clock_update_core_clock();
 
-    /* Configure mchtmr to 4MHz */
+    /* 配置 mchtmr 为 4 MHz */
     clock_set_source_divider(clock_mchtmr0, clk_src_osc24m, 6);
 }
 
@@ -133,7 +133,7 @@ static inline void board_init_usb_dp_dm_pins(void) {
     HPM_IOC->PAD[IOC_PAD_PA25].FUNC_CTL = IOC_PAD_FUNC_CTL_ANALOG_MASK;
     HPM_IOC->PAD[IOC_PAD_PA24].FUNC_CTL = IOC_PAD_FUNC_CTL_ANALOG_MASK;
 
-    /* Disconnect usb dp/dm pins pull down 45ohm resistance */
+    /* 断开 USB DP/DM 引脚上的 45 欧下拉电阻 */
 
     while (sysctl_resource_any_is_busy(HPM_SYSCTL)) {}
 
@@ -158,7 +158,7 @@ static inline void board_init_usb_dp_dm_pins(void) {
 }
 
 void board_init_usb(void) {
-    // No USB_ID & USB_OC & USB_VBUS pinout in this board
+    // 本板没有 USB_ID、USB_OC、USB_VBUS 引脚
     clock_add_to_group(clock_usb0, 0);
 
     usb_hcd_set_power_ctrl_polarity(HPM_USB0, true);

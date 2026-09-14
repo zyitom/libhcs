@@ -33,7 +33,7 @@
 namespace {
 
 constexpr unsigned kBusCount = 2;        // CAN bus 0 + bus 1
-constexpr bool kUseCanFd = false;        // classic CAN 2.0; set true only with an FD partner
+// No classic/FD switch any more: frames go out in the bus's compiled mode.
 // Must be unique on the bus: two transmitters sending the SAME id with different
 // data collide after arbitration -> bit errors -> SIGNAL (double blink).  Pick an
 // id no other node (e.g. the USB2CAN) uses.
@@ -55,7 +55,7 @@ public:
             std::byte{0x00}, std::byte{0x11}, std::byte{0x22}, std::byte{0x33}};
         board_->transmit([&](examples::BoardTransmitter& tx) {
             tx.can(static_cast<int>(bus),
-                {.can_id = kTestCanId, .can_data = frame, .is_fdcan = kUseCanFd});
+                {.can_id = kTestCanId, .can_data = frame});
         });
     }
 
@@ -75,7 +75,7 @@ private:
 int main() {
     std::signal(SIGINT, on_sigint);
 
-    printf("CAN error light-code test (CAN-FD=%s)\n", kUseCanFd ? "on" : "off");
+    printf("CAN error light-code test (frames follow the bus mode)\n");
     printf("  Transmitting id 0x%03X on CAN bus 0 and bus 1 at ~200 Hz.\n", kTestCanId);
     printf("  Watch the per-bus indicator LEDs:\n");
     printf("    disconnected bus -> 1 pulse (ACK error)\n");

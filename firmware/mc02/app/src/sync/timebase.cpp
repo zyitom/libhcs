@@ -12,68 +12,54 @@
 namespace libhcs::firmware::sync::timebase {
 namespace {
 
-// The microframe axis is 14 bits wide on every board in this repo, whatever the
-// hardware counter underneath looks like. An EHCI FRINDEX is 14 bits of
-// microframes; DWC2 at full speed gives 11 bits of frames, which times eight is
-// the same 16384-microframe (2.048 s) modulus. Keeping them identical is what
-// lets one host anchor serve every board unchanged.
+// 微帧轴在全仓库所有板上是 14 位宽, 与底层硬件计数器的形态无关。EHCI FRINDEX
+// 是 14 位微帧; DWC2 全速给 11 位帧, 乘 8 同为 16384 微帧(2.048 s)模数。两者
+// 一致才让一个主机锚点对所有板通用。
 constexpr std::uint32_t kMicroframeMask = 0x3FFFU;
 constexpr std::uint64_t kMicroframeModulus = 0x4000U;
 
-// DSTS.ENUMSPD, DWC2 encoding: 0 high speed, 1 full speed on a 30/60 MHz PHY,
-// 2 low speed, 3 full speed on the 48 MHz internal PHY. mc02 always enumerates
-// as 3; the high-speed branch exists so the module is not silently wrong if this
-// code is ever reused on a part with a ULPI PHY.
+// DSTS.ENUMSPD 的 DWC2 编码: 0 高速, 1 全速(30/60 MHz PHY), 2 低速, 3 全速
+// (内置 48 MHz PHY)。mc02 恒枚举为 3; 保留高速分支, 以免此代码被复用到带 ULPI
+// PHY 的芯片上时悄悄出错。
 constexpr std::uint32_t kEnumSpeedHigh = 0U;
 
 constexpr std::uint32_t kFitPeriodMs = 20U;
 
-// Acceptance window for the fitted slope. A value more than a few percent off
-// nominal is not a crystal offset, it is a broken window; refusing it keeps a
-// bad fit from being published at all.
+// 拟合斜率的接受窗口。偏离标称几个百分点以上不是晶振偏差, 是坏窗口; 拒绝它,
+// 坏拟合才不会发布出去。
 constexpr std::int64_t kNominalQ16 = static_cast<std::int64_t>(kNominalCyclesPerMicroframe) << 16U;
 
-// Sum of (x - mean)^2 for x = 0..N-1, which for evenly spaced samples is a
-// constant the fit never has to compute: N(N^2-1)/12.
+// x = 0..N-1 等距样本的 sum((x - mean)^2), 是拟合无需计算的常数: N(N^2-1)/12。
 constexpr std::int64_t kSxx = static_cast<std::int64_t>(kSampleCount)
                             * ((static_cast<std::int64_t>(kSampleCount) * kSampleCount) - 1) / 12;
 
-// ------------------------------------------------------------------
-// ISR-owned state. Written only by note_sof(); read by the main loop under
-// utility::InterruptLockGuard. Plain scalars rather than atomics because every
-// reader takes that guard -- and unlike a counter, these have to be read as a
-// consistent SET, which no per-variable atomic would give.
-// ------------------------------------------------------------------
+// ==== ISR 专有状态: 仅 note_sof() 写, 主循环在 utility::InterruptLockGuard 下读 ====
+// 用普通标量而非 atomic: 每个读者都持该锁; 且与计数器不同, 这些量必须作为一致
+// 的整组读取, 单变量原子性提供不了这一点。
 
-// Local, boot-relative microframe count. Seeded from the first frame reading so
-// that (counter mod 16384) equals the hardware counter's contribution forever
-// after, which is what lets the anchor be a pure multiple of 16384.
+// 本地、自上电起算的微帧计数。以首个帧读数播种, 使 (counter mod 16384) 从此恒
+// 等于硬件计数器的贡献, 锚点才得以是 16384 的纯倍数。
 std::uint64_t counter = 0;
 bool counter_seeded = false;
 std::uint32_t previous_index = 0;
 
-// 64-bit extension of DWT->CYCCNT. The counter wraps every 7.81 s at 550 MHz;
-// SOF arrives every 1 ms, so "the low word went backwards" is an unambiguous
-// wrap detector here with three and a half orders of margin.
+// DWT->CYCCNT 的 64 位扩展。550 MHz 下每 7.81 s 回绕; SOF 每 1 ms 到来, 故低字
+// 变小的情形在此是明确的回绕判据, 余量达三个半数量级。
 std::uint32_t previous_time = 0;
 std::uint32_t time_high = 0;
 bool time_seeded = false;
 
-// TIM5, sampled in the same interrupt, purely so the status report can pair a
-// microframe with a reading of the clock the REST of this firmware timestamps
-// with.
+// TIM5, 在同一中断内采样, 纯粹为了让状态报告能把微帧与本固件其余部分打时间戳
+// 所用的时钟配成一对。
 //
-// The fit runs on CYCCNT because TIM5 quantizes to 1 us (timer.hpp: 1 MHz, read
-// as CNT << 2), which is the same order as the jitter being measured. But every
-// other uplink record -- IMU, timestamped GPIO -- carries a TIM5 quarter-us
-// stamp, and CYCCNT and TIM5 have unrelated origins that change every boot. If
-// the status published a CYCCNT-derived time instead, the host would hold two
-// clocks it could never relate, and no telemetry record could be placed on the
-// microframe axis at all. Publishing TIM5 is what makes the axis usable for
-// anything other than the time base itself.
+// 拟合跑在 CYCCNT 上, 因为 TIM5 量化到 1 us(timer.hpp: 1 MHz, 按 CNT << 2 读),
+// 与被测抖动同量级。但其余所有上行记录 -- IMU、带时间戳的 GPIO -- 带的都是
+// TIM5 的 quarter-us 戳, 且 CYCCNT 与 TIM5 每次上电的起点互不相关。若状态发布
+// CYCCNT 派生的时间, 主机将持有两个永远无法互相关联的时钟, 任何遥测记录都无法
+// 落到微帧轴上。发布 TIM5 才让该轴对时间基准之外的用途可用。
 //
-// Sampled AFTER the cycle counter, so the extra peripheral read (about 0.25 us
-// on this D2 bus) cannot lengthen the timestamp path. 1 kHz.
+// 在周期计数器之后采样, 使这次额外的外设读(D2 总线上约 0.25 us)不会拉长时间戳
+// 路径。1 kHz。
 std::uint32_t previous_timer_quarter_us = 0;
 
 data::TimeState state = data::TimeState::kInvalid;
@@ -81,38 +67,31 @@ std::uint32_t anomaly_count = 0;
 std::int64_t anchor_offset = 0;
 bool anchored = false;
 
-// Fit ring. sample[i] is the low 32 bits of the cycle counter at microframe
-// (ring_oldest_microframe + i * kSampleDecimation), in insertion order starting
-// at ring_head.
+// 拟合样本环形缓冲。sample[i] 是周期计数器在微帧 (ring_oldest_microframe +
+// i * kSampleDecimation) 处的低 32 位, 自 ring_head 起按插入顺序排列。
 std::uint32_t sample[kSampleCount];
 std::uint32_t ring_head = 0;
 std::uint32_t ring_count = 0;
 std::uint64_t ring_oldest_microframe = 0;
 
-// ------------------------------------------------------------------
-// Fit result. Written only by poll(), read by everything; guarded the same way.
-// ------------------------------------------------------------------
-// The reference is a whole cycle (1.8 ns) rather than Q16: the fit averages 128
-// samples precisely so the PHASE is better than one sample's jitter, and 1.8 ns
-// of rounding is three orders below the jitter it is averaging. The SLOPE stays
-// Q16, because there a part per million compounds over the extrapolation.
+// ==== 拟合结果: 仅 poll() 写, 所有读者持同一把锁 ====
+// 参考点取整个周期(1.8 ns)而非 Q16: 拟合平均 128 个样本正是为了让相位优于单个
+// 样本的抖动, 1.8 ns 的舍入比被平均的抖动低三个数量级。斜率保持 Q16: 那里百万
+// 分之几会随外推累积。
 //
-// Q16 cycles per microframe is 68750 * 65536 = 4.5e9, which does NOT fit in the
-// uint32 hpm_board uses for its 4 MHz timer. It is held in 64 bits here and
-// narrowed only on the way out, after conversion to quarter-microseconds brings
-// it back to 500 * 65536.
+// Q16 cycles per microframe = 68750 * 65536 = 4.5e9, 装不进 hpm_board 4 MHz
+// 定时器所用的 uint32。此处以 64 位持有, 仅在换算成 quarter-us(回到 500 * 65536)
+// 之后、输出途中收窄。
 bool fit_valid = false;
 std::uint64_t fit_reference_microframe = 0;
 std::uint64_t fit_reference_time = 0;
 std::uint64_t fit_cycles_per_microframe_q16 = 0;
 
-// Out-of-sample prediction error, accumulated between reports, in Q16 cycles.
+// 样本外预测误差, 两次报告之间累积, 单位 Q16 cycles。
 //
-// Every decimated sample is first PREDICTED from the fit currently published --
-// a fit computed before this sample existed -- and only then added to the
-// window. So the residual is a genuine forecast error, which is exactly what a
-// scheduled action would experience, rather than the in-sample residual of a
-// line fitted through the point being tested.
+// 每个抽取样本先按当前已发布的拟合(在本样本存在之前算出)预测, 然后才入窗。
+// 因此残差是真正的预报误差 -- 正是定时动作会经历的 -- 而非用被测点自身拟合出
+// 的线内残差。
 std::int64_t residual_sum_q16 = 0;
 std::uint32_t residual_count = 0;
 std::uint64_t residual_abs_max_q16 = 0;
@@ -151,37 +130,32 @@ std::uint32_t enumerated_speed() {
         >> static_cast<std::uint32_t>(USB_OTG_DSTS_ENUMSPD_Pos);
 }
 
-// Microframes one count of DSTS.FNSOF is worth at the current port speed.
+// 当前端口速度下 DSTS.FNSOF 一个计数折合的微帧数。
 //
-// This is the whole full-speed difference in one function. DWC2 documents FNSOF
-// as "frame or microframe number of the received SOF": a microframe number when
-// the core enumerated at high speed, a FRAME number otherwise. mc02 is always
-// the latter, so each count is eight microframes and the register only ever
-// carries the 11-bit frame number the host put on the wire.
+// 全速差异全在此函数。DWC2 手册对 FNSOF 的描述是收到 SOF 的帧或微帧号: 高速
+// 枚举时是微帧号, 否则是帧号。mc02 恒为后者, 每个计数折合 8 微帧, 寄存器只承载
+// 主机送上总线的 11 位帧号。
 //
-// Masking to 11 bits at full speed rather than to the register's full 14 is not
-// a conservative guess, it is the measured width. FNSOF is a 14-bit FIELD, but
-// at full speed only the 11 bits the host puts on the wire are populated:
-// probing the raw register for 30 s (about 14 full wraps) gave a maximum of
-// exactly 2047, so bits 13..11 are always zero and there is no wider counter to
-// exploit. [Measured 2026-09-07.] hpm_board gets 14 real bits only because at
-// HIGH speed the field is 11 frame bits plus 3 microframe bits.
+// 全速下掩到 11 位而非寄存器满 14 位不是保守猜测, 是实测宽度。FNSOF 是 14 位
+// 字段, 但全速下只有主机送上总线的那 11 位被填充: 探测原始寄存器 30 s(约 14 个
+// 整回绕), 最大值恰为 2047, 故 bit 13..11 恒为 0, 没有更宽的计数器可用。
+// [实测 2026-09-07。] hpm_board 有真实 14 位, 只因其高速下该字段是 11 位帧号
+// 加 3 位微帧号。
 //
-// So the wrap the host anchor has to resolve is 2048 frames = 16384 microframes
-// = 2.048 s on both boards, and it could not have been made longer here.
+// 故主机锚点需消解的回绕在两板上同为 2048 帧 = 16384 微帧 = 2.048 s, 本板无法
+// 把它做得更长。
 std::uint32_t frame_scale() { return enumerated_speed() == kEnumSpeedHigh ? 1U : 8U; }
 
-// Integer division that rounds toward negative infinity. C++ truncates toward
-// zero, which would make the wrap resolution below asymmetric about zero and let
-// two boards straddling the origin pick different wraps.
+// 向负无穷取整的整除。C++ 向零截断, 会让下面的回绕消解关于 0 不对称, 跨在原点
+// 两侧的两块板可能选中不同的回绕。
 std::int64_t floor_div(std::int64_t numerator, std::int64_t denominator) {
     const std::int64_t quotient = numerator / denominator;
     const std::int64_t remainder = numerator % denominator;
     return (remainder != 0 && ((remainder < 0) != (denominator < 0))) ? quotient - 1 : quotient;
 }
 
-// Cycles to quarter-microseconds. Exact for whole microframes (68750 -> 500) and
-// truncating otherwise; used only where the protocol's unit is required.
+// cycles 换算成 quarter-us。整微帧时精确(68750 -> 500), 其余截断; 仅在协议要求
+// 该单位处使用。
 std::int64_t cycles_to_quarter_us(std::int64_t cycles) {
     return cycles * 4 / static_cast<std::int64_t>(kCyclesPerMicrosecond);
 }
@@ -195,25 +169,33 @@ std::int64_t quarter_us_to_cycles(std::int64_t quarter_us) {
 std::uint32_t microframes_per_sof() { return frame_scale(); }
 
 std::uint32_t sof_packet_delay_ns() {
-    // 64 bit times at 480 Mbit, 35 bit times at 12 Mbit.
+    // 480 Mbit 下 64 个 bit time, 12 Mbit 下 35 个。
     return enumerated_speed() == kEnumSpeedHigh ? 133U : 2917U;
 }
 
 void note_sof(std::uint32_t frame, std::uint32_t now_cycles) {
-    // Cycle-counter wrap extension, before anything that uses the timestamp.
+    // 对齐到包起始。SOF-received 在包收完才置位, 时间戳比包起始晚包传输耗时
+    // (全速 2917 ns, 高速 133 ns)。不减的话, "微帧 k 的本地时刻"逐板带一个
+    // 速率相关常数, 混速舰队差 ~2.8 us; pulse(hpm_board)与 timebase(hpm_board)
+    // 都按同一理由减过, 这里把本板对齐到包起始的约定。整数周期换算精确, 无
+    // 量化残差; 中断进入延迟由拟合吸收为常数, 混速残差只剩两板进入延迟之差。
+    now_cycles -= sof_packet_delay_ns() * kCyclesPerMicrosecond / 1000U;
+
+    // 周期计数器回绕扩展, 先于一切使用时间戳的代码。
     if (!time_seeded) {
         time_seeded = true;
     } else if (now_cycles < previous_time) {
         time_high++;
     }
     previous_time = now_cycles;
-    previous_timer_quarter_us = timer::timer->timepoint().time_since_epoch().count();
+    // 与 previous_time 同一包起始约定, 桥接锚点才内部自洽。TIM5 量化到 1 us,
+    // 舍入残差是常数, 进不了残差统计。
+    previous_timer_quarter_us = timer::timer->timepoint().time_since_epoch().count()
+                              - (sof_packet_delay_ns() + 500U) / 1000U * 4U;
 
-    // How much the microframe axis is expected to move per SOF interrupt, and
-    // the mask that keeps the hardware counter's own wrap from being read as a
-    // jump. One SOF per 1 ms frame at full speed, so the axis steps by 8 --
-    // exactly, every time, with the low three bits pinned at zero. Treating that
-    // as an anomaly is what kept a full-speed HPM board permanently kInvalid.
+    // 每 SOF 中断微帧轴的期望步进, 以及防止硬件计数器自身回绕被误读为跳变的
+    // 掩码。全速下每 1 ms 帧恰一个 SOF, 轴恰步进 8, 低三位恒为 0; 不把偏离此值
+    // 当异常, 曾让一块全速 HPM 板永久停在 kInvalid。
     const std::uint32_t scale = frame_scale();
     const std::uint32_t index =
         (frame & ((static_cast<std::uint32_t>(kMicroframeModulus) / scale) - 1U)) * scale;
@@ -221,9 +203,8 @@ void note_sof(std::uint32_t frame, std::uint32_t now_cycles) {
     if (!counter_seeded) {
         counter_seeded = true;
         previous_index = index;
-        // Seeding WITH the frame index, not with zero: the low 14 bits of the
-        // counter must equal the hardware reading for the anchor arithmetic to
-        // reduce to a multiple of 16384.
+        // 以帧号播种而非以 0 播种: 计数器低 14 位必须等于硬件读数, 锚点运算才能
+        // 化简为 16384 的倍数。
         counter = index;
         state = data::TimeState::kWaitingAnchor;
         reset_fit_window();
@@ -238,16 +219,13 @@ void note_sof(std::uint32_t frame, std::uint32_t now_cycles) {
     if (delta != scale) [[unlikely]] {
         anomaly_count++;
         if (delta > scale && delta < scale * 8U) {
-            // A few missed interrupts. The counter is still right -- it advanced
-            // by the real delta -- so the timeline survives; only the fit window
-            // is spoiled, because the samples either side of the gap would tilt
-            // the line.
+            // 漏了几次中断。计数器仍正确 -- 它按真实 delta 前进 -- 时间线无恙;
+            // 仅拟合窗口作废: 缺口两侧的样本会使直线倾斜。
             reset_fit_window();
             ring_oldest_microframe = counter;
         } else {
-            // Delta 0 (the bus is not running: this is what the enumeration
-            // window looks like) or eight frames and more unaccounted for.
-            // Either way the counter is no longer trustworthy.
+            // delta 为 0(总线未运行, 枚举窗口即如此)或 8 帧及以上无法解释。
+            // 无论哪种, 计数器都不再可信。
             invalidate();
         }
         return;
@@ -263,11 +241,9 @@ void note_sof(std::uint32_t frame, std::uint32_t now_cycles) {
         return;
 
     if (fit_valid) {
-        // Both sides taken RELATIVE to the fit reference before the Q16 shift.
-        // Shifting the absolute cycle count would overflow int64 after about six
-        // days of uptime -- a 550 MHz counter leaves 48 bits of headroom where
-        // hpm_board's 4 MHz timer leaves 61. Differences are bounded by the fit
-        // window, so this form has no such horizon.
+        // 两侧都先取相对拟合参考的差值, 再做 Q16 移位。对绝对周期计数移位会在
+        // 开机约六天后溢出 int64: 550 MHz 计数器只留 48 位余量, 而 hpm_board 的
+        // 4 MHz 定时器留 61 位。差值受拟合窗口约束, 此形式没有这种时限。
         const auto distance = static_cast<std::int64_t>(counter - fit_reference_microframe);
         const std::int64_t predicted_q16 =
             distance * static_cast<std::int64_t>(fit_cycles_per_microframe_q16);
@@ -305,11 +281,9 @@ void poll(std::uint32_t tick_ms) {
     std::uint64_t now = 0;
 
     {
-        // Bounded and short: 128 word copies, well under a microsecond at
-        // 550 MHz, once per 20 ms. Masking rather than a lock-free snapshot
-        // because the fit needs the ring and its origin to be mutually
-        // consistent, and the established pattern in this firmware for that is
-        // the interrupt guard.
+        // 有界且短: 128 个字的拷贝, 550 MHz 下远不足 1 us, 每 20 ms 一次。用屏蔽
+        // 中断而非无锁快照: 拟合要求 ring 与其原点相互一致, 本固件对此的既定
+        // 手法就是中断锁。
         const utility::InterruptLockGuard guard;
         count = ring_count;
         oldest_microframe = ring_oldest_microframe;
@@ -321,15 +295,13 @@ void poll(std::uint32_t tick_ms) {
     if (count < kSampleCount)
         return;
 
-    // Least squares against evenly spaced x = 0..N-1, with y taken relative to
-    // the first sample so the arithmetic stays inside 32 bits before widening.
-    // Sxy is accumulated in the doubled form sum((2x - (N-1)) * y) to keep the
-    // half-integer mean out of integer arithmetic.
+    // 对等距 x = 0..N-1 做最小二乘; y 取相对首样本的差, 使加宽前算术留在 32 位
+    // 内。Sxy 以 sum((2x - (N-1)) * y) 的倍增形式累加, 把半整均值挡在整数运算
+    // 之外。
     //
-    // Widths, since the cycle counter makes these an order larger than
-    // hpm_board's: y spans one window, 1.024 s * 550 MHz = 5.6e8, inside
-    // int32; sum_xy2 tops out near 9e12 and its Q16 shift near 6e17, both inside
-    // int64 with a decade to spare.
+    // 位宽说明 -- 周期计数器使这些量比 hpm_board 大一个量级: y 跨一个窗口,
+    // 1.024 s * 550 MHz = 5.6e8, 在 int32 内; sum_xy2 峰值约 9e12, 其 Q16 移位
+    // 约 6e17, 均在 int64 内且还余一个数量级。
     const std::uint32_t base = local_sample[0];
     std::int64_t sum_y = 0;
     std::int64_t sum_xy2 = 0;
@@ -340,27 +312,24 @@ void poll(std::uint32_t tick_ms) {
         sum_xy2 += ((2LL * index) - static_cast<std::int64_t>(count - 1U)) * y;
     }
 
-    // Cycles per decimated sample, then per microframe, both Q16.
+    // 每抽取样本的周期数, 再折算成每微帧, 均为 Q16。
     const std::int64_t slope_q16 = (sum_xy2 << 16U) / (2 * kSxx);
     const std::int64_t per_microframe_q16 = slope_q16 / kSampleDecimation;
 
-    // A slope more than a few percent off nominal is not a crystal offset, it is
-    // a broken window; refusing it keeps a bad fit from being published at all.
+    // 斜率偏离标称超过约 3%(1/32)不是晶振偏差而是坏窗口; 拒绝它, 坏拟合才不会
+    // 发布出去。
     if (per_microframe_q16 < kNominalQ16 - (kNominalQ16 / 32)
         || per_microframe_q16 > kNominalQ16 + (kNominalQ16 / 32))
         return;
 
-    // The ring holds only the low 32 bits of the cycle counter. Rebuild the
-    // oldest sample's full value by hanging it off the current time, which is at
-    // most one window (1.024 s) later and therefore at most one wrap away --
-    // the 7.81 s wrap period is what makes that claim true.
+    // ring 里只有周期计数器的低 32 位。借当前时间重建最老样本的完整值: 它至多比
+    // now 早一个窗口(1.024 s), 因而至多差一次回绕 -- 7.81 s 的回绕周期保证这一点。
     std::uint64_t base_extended = (now & ~static_cast<std::uint64_t>(0xFFFFFFFFU)) | base;
     if (base_extended > now)
         base_extended -= static_cast<std::uint64_t>(1) << 32U;
 
-    // Evaluate the fitted line at the NEWEST sample rather than at the centroid:
-    // every query extrapolates forward from now, so anchoring the reference at
-    // the leading edge is what keeps the extrapolation arm short.
+    // 拟合线在最新样本处而非质心处求值: 每次查询都从 now 向前外推, 把参考锚在
+    // 前沿才能让外推臂最短。
     const auto newest_index = static_cast<std::int64_t>(count - 1U);
     const std::int64_t mean_y_q16 = (sum_y << 16U) / count;
     const std::int64_t offset_q16 = mean_y_q16 + ((slope_q16 * newest_index) / 2);
@@ -381,9 +350,8 @@ void apply_anchor(std::uint64_t host_microframe) {
     if (state == data::TimeState::kInvalid && !counter_seeded)
         return;
 
-    // Resolve the wrap: pick the multiple of 16384 that puts the counter closest
-    // to the host's estimate. Rounding rather than truncating is what makes the
-    // decision insensitive to which side of the estimate the counter sits on.
+    // 消解回绕: 选使计数器最接近主机估计的 16384 倍数。四舍五入而非截断, 判定
+    // 才对计数器落在估计值哪一侧不敏感。
     const auto difference = static_cast<std::int64_t>(host_microframe - counter);
     const std::int64_t wraps = floor_div(
         difference + static_cast<std::int64_t>(kMicroframeModulus / 2),
@@ -394,10 +362,9 @@ void apply_anchor(std::uint64_t host_microframe) {
         anchor_offset = offset;
         anchored = true;
     } else if (offset != anchor_offset) {
-        // A changed wrap on a live timeline cannot be accepted quietly. Either
-        // the counter lost more than a second or the host's estimate did, and
-        // both mean everything scheduled since the last anchor was scheduled
-        // against the wrong second.
+        // 存活时间线上回绕改变不能静默接受: 要么计数器丢了超过一秒, 要么主机的
+        // 估计丢了超过一秒, 两者都意味着自上次锚点以来的全部定时都定在了错误的
+        // 秒上。
         anomaly_count++;
         invalidate();
         return;
@@ -420,22 +387,20 @@ Snapshot snapshot_locked() {
         .microframe = anchored ? static_cast<std::uint64_t>(
                                      static_cast<std::int64_t>(counter) + anchor_offset)
                                : counter,
-        // TIM5 at the last SOF, NOT the cycle counter: this is the pair the host
-        // needs to convert an IMU or GPIO record's own quarter-us stamp onto the
-        // microframe axis, and from there onto its own clock.
+        // 最后一次 SOF 时的 TIM5, 而非周期计数器: 主机正需要这一对, 把 IMU 或
+        // GPIO 记录自带的 quarter-us 戳换到微帧轴、再到它自己的时钟。
         .timestamp_quarter_us = previous_timer_quarter_us,
-        // Converted to the protocol's quarter-microsecond tick on the way out,
-        // so 68750 cycles per microframe is published as the same 500 * 65536
-        // every other board reports and the host needs no per-board scaling.
+        // 输出途中换算成协议的 quarter-us tick, 使 68750 cycles/microframe 与
+        // 其他板一样发布为 500 * 65536, 主机无需按板缩放。
         .ticks_per_microframe_q16 = static_cast<std::uint32_t>(
             cycles_to_quarter_us(static_cast<std::int64_t>(fit_cycles_per_microframe_q16))),
-        .anomaly_count = anomaly_count,
+        // 线上字段 24 位, 钳位而非截断: 静默回绕会把持续的异常流伪装成小计数。
+        .anomaly_count = anomaly_count > 0xFFFFFFU ? 0xFFFFFFU : anomaly_count,
         .residual_mean_q16 = static_cast<std::int32_t>(cycles_to_quarter_us(mean_cycles_q16)),
         .residual_abs_max_q16 = static_cast<std::uint32_t>(
             cycles_to_quarter_us(static_cast<std::int64_t>(residual_abs_max_q16))),
-        // Clamped, not truncated: the protocol field is 16 bits, and a silent
-        // wrap would turn "the host stopped anchoring for a minute" into a
-        // plausible-looking small count.
+        // 钳位而非截断: 协议字段 16 位, 静默回绕会把主机一分钟未锚定的事实变成
+        // 貌似合理的小计数。
         .residual_count = residual_count > 0xFFFFU ? 0xFFFFU : residual_count,
     };
 }
@@ -450,27 +415,23 @@ Snapshot snapshot() {
 Snapshot report() {
     const utility::InterruptLockGuard guard;
     const Snapshot result = snapshot_locked();
-    // Cleared here rather than left free-running: the mean is only meaningful
-    // over a bounded window, and a sum that spans a re-anchor would blend two
-    // different fits.
+    // 在此清零而非任其自由运行: 均值只在有界窗口内才有意义, 跨越重锚定的累加会
+    // 把两个不同拟合混在一起。
     residual_sum_q16 = 0;
     residual_count = 0;
     residual_abs_max_q16 = 0;
     return result;
 }
 
-// Both directions speak TIM5 QUARTER-MICROSECONDS -- the unit every other uplink
-// record on this board is stamped in -- while the fit itself stays on the cycle
-// counter. The bridge between them is the pair captured in the SOF interrupt:
-// (previous_time cycles, previous_timer_quarter_us). Both counters ride the same
-// 550 MHz PLL and TIM5 is exactly SYSCLK/550, so the only error in crossing is
-// TIM5's own 1 us quantization -- which is also the resolution of the timestamps
-// being converted, so nothing is lost.
+// 两个方向都以 TIM5 的 quarter-us 为单位 -- 本板其余上行记录打戳所用的单位 --
+// 而拟合本身留在周期计数器上。两者之桥是 SOF 中断里捕获的一对: (previous_time
+// cycles, previous_timer_quarter_us)。两个计数器同挂 550 MHz PLL, TIM5 恰为
+// SYSCLK/550, 跨换的唯一误差是 TIM5 自身的 1 us 量化 -- 这也正是被换算时间戳的
+// 分辨率, 故毫无损失。
 namespace {
 
-// Cycle-counter value corresponding to a TIM5 reading, using the last SOF as the
-// anchor. The subtraction is deliberately done in int32 so it is correct across
-// TIM5's wrap; a telemetry record is converted within seconds of being taken.
+// 由 TIM5 读数求对应的周期计数器值, 以最后一次 SOF 为锚。减法刻意用 int32, 使
+// 其在 TIM5 回绕下依然正确; 遥测记录总在采集后几秒内换算。
 std::int64_t cycles_at_quarter_us(std::uint32_t quarter_us) {
     const auto delta_quarter_us = static_cast<std::int32_t>(quarter_us - previous_timer_quarter_us);
     return static_cast<std::int64_t>(now_extended(previous_time))
@@ -479,8 +440,8 @@ std::int64_t cycles_at_quarter_us(std::uint32_t quarter_us) {
 
 std::uint32_t quarter_us_at_cycles(std::int64_t cycles) {
     const std::int64_t delta = cycles - static_cast<std::int64_t>(now_extended(previous_time));
-    // Wraps with the counter, which is what the caller wants: TIM5 quarter-us is
-    // a free-running 32-bit value and every consumer takes differences.
+    // 随计数器一起回绕, 这正是调用方想要的: TIM5 quarter-us 是自由运行的 32 位
+    // 值, 所有消费者都取差值。
     return previous_timer_quarter_us + static_cast<std::uint32_t>(cycles_to_quarter_us(delta));
 }
 

@@ -4,35 +4,29 @@
 
 namespace libhcs::firmware::diag::usb_rx_hist {
 
-// Distribution of the interval between consecutive bulk OUT transfer
-// completions, measured on the board's own DWT cycle counter.
+// 相邻两次 bulk OUT 传输完成间隔的分布, 用板载 DWT 周期计数器测量。
 //
-// The question this was built to settle: the DWC2 controller's internal DMA cost
-// about 1 us per packet of achieved rate while making the board's CPU work
-// strictly smaller (the switch is gone now; see firmware/mc02/AGENTS.md). An
-// average is compatible with two very different mechanisms, and they call for
-// opposite fixes:
+// 要回答的问题: 改用 DWC2 控制器内部 DMA 后, 达成速率平均每包多花约 1 us,
+// 而 CPU 的工作量严格变小(该切换已成过去, 见 firmware/mc02/AGENTS.md)。
+// 平均值与两种机制都相容, 而两者需要的修复相反:
 //
-//   uniform shift -- every packet really is ~1 us slower, so the cost is in the
-//       controller's own per-transfer work (DMA arbitration, endpoint re-arm).
-//   bimodal       -- almost every packet costs the same as before, and a small
-//       fraction misses the host's next transaction window and waits a whole
-//       125 us microframe. Then the fix is anything that shortens the path from
-//       packet arrival to the endpoint being re-armed, not the copy itself.
+//   均匀后移 -- 每一包真的都慢约 1 us: 成本在控制器自身的每次传输开销
+//               (DMA 仲裁、endpoint 重新武装)。
+//   双峰分布 -- 几乎每包与从前同价, 只有一小部分错过主机的下一个事务窗口,
+//               整整等一个 125 us microframe。此时修法是缩短从包到达到
+//               endpoint 重新武装的路径, 而不是优化拷贝本身。
 //
-// Sampling point is tud_vendor_rx_cb, i.e. usbd task context in the main loop,
-// not the interrupt. That adds up to one loop pass (about 8 us here) of jitter
-// to each sample -- irrelevant for telling a 1 us shift from a 125 us step, and
-// it keeps the instrument out of bsp/ code.
+// 采样点在 tud_vendor_rx_cb, 即主循环里的 usbd 任务上下文而非中断。每个样本
+// 因此最多混入一轮循环(本板约 8 us)的抖动 -- 对区分 1 us 后移与 125 us 跳变
+// 无关紧要, 且让测量代码不必进 bsp/。
 //
-// Occupies DataId::kUart0 like the other diagnostic channels, so it is mutually
-// exclusive with them. Compiled out entirely by default.
+// 与其他诊断通道一样占用 DataId::kUart0, 彼此互斥。默认整体编译剔除。
 
 #if defined(libhcs_APP_USB_RX_HIST) && libhcs_APP_USB_RX_HIST
 
 inline constexpr bool kEnabled = true;
 
-// One completed bulk OUT transfer. Emits a record every 500 ms.
+// 记录一次完成的 bulk OUT 传输, 每 500 ms 发出一条记录。
 void note();
 
 #else

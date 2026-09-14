@@ -10,12 +10,11 @@ namespace libhcs::firmware::timer {
 
 namespace {
 
-// The STM32 DWT (Data Watchpoint and Trace) cycle counter drives an accurate
-// busy-wait. Unlike timer::timer (TIM5), it works before that timestamp source is
-// started and with interrupts disabled -- HAL_Delay is invoked from the HAL clock
-// and peripheral init that runs in App() (under an interrupt lock) before
-// timer.init(). Sensor-init delays that run after timer.init() use
-// timer::timer->spin_wait() instead; this stays DWT-based only for HAL_Delay.
+// 忙等由 STM32 DWT(Data Watchpoint and Trace)周期计数器驱动。与 timer::timer
+// (TIM5)不同, 它在该时间戳源启动之前、以及中断关闭时都能工作 -- HAL_Delay 被
+// App() 里运行于中断锁下的 HAL 时钟与外设初始化调用, 那时 timer.init() 还没跑。
+// timer.init() 之后的传感器初始化延时改用 timer::timer->spin_wait(); 本文件保留
+// DWT 方案只为 HAL_Delay。
 constexpr uint32_t kSystemFrequency = 550'000'000;
 using SysFreqDuration = std::chrono::duration<uint32_t, std::ratio<1, kSystemFrequency>>;
 
@@ -55,15 +54,10 @@ void delay(std::chrono::duration<Rep, Period> d) {
 
 } // namespace
 
-// Rewrite the HAL_Delay function to ensure that it works when interrupts are
-// disabled, while significantly improving accuracy.
 extern "C" void HAL_Delay(uint32_t ms) {
 	delay(std::chrono::milliseconds(ms));
 }
 
-// Minimal HAL_IncTick: only advances the millisecond counter. All low-priority
-// periodic work (LED animation) has been moved to the main loop so the SysTick
-// ISR stays fast and bounded.
 extern "C" void HAL_IncTick() {
 	uwTick += 1;
 }

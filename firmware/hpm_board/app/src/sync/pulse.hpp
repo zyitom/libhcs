@@ -1,55 +1,43 @@
 #pragma once
 
-// Direct cross-board skew measurement over the existing UART0 wires, using
-// GPTMR hardware compare and capture -- no CPU in either the send or the
-// receive instant.
+// 用现有 UART0 走线直接测量跨板偏差: GPTMR 硬件比较输出与捕获, 收发两个
+// 瞬间都不经过 CPU。
 //
-// WHY THIS EXISTS. Every earlier attempt measured the timeline through the CAN
-// timestamp unit, whose timebase is PTPC. PTPC hangs off PLL0, which the
-// HPM5300 datasheet describes as fractional-N with spread-spectrum support, and
-// its instantaneous rate wanders by hundreds of ppm. That wander -- not the
-// timeline, and not the boards -- is what produced every bogus figure from
-// 452 us down to 30 us.
+// 为何存在: 此前的测量都经 CAN 时间戳单元, 其时基是 PTPC。PTPC 挂在 PLL0
+// 下, HPM5300 手册称其为 fractional-N 且支持扩频, 瞬时速率漂移达数百 ppm --
+// 从 452 us 到 30 us 的每个错误数字都源于这段漂移, 而非时间线或板子本身。
 //
-// GPTMR is in CLK_SRC_GROUP_COMMON, so it can be clocked straight from the
-// 24 MHz crystal, the same source the machine timer divides by 6. No PLL, no
-// fractional divider, no spread spectrum: the rate is as steady as the crystal.
+// GPTMR 属于 CLK_SRC_GROUP_COMMON, 可直接用 24 MHz 晶振驱动 -- 正是机器
+// 定时器六分频前的同一信号源。无 PLL、无小数分频、无扩频, 速率与晶振同样
+// 稳定。
 //
-// WHAT IT IS NOT: an exact 3000 ticks per microframe. The microframe axis is the
-// USB HOST's clock (SOF), the GPTMR counter is THIS BOARD's crystal, and the two
-// are independent oscillators -- measured about +80 ppm apart, i.e. ~3000.25
-// ticks per microframe. Assuming 3000 puts 4 us of error into a 50 ms lead, so
-// the ratio is FITTED here, exactly as timebase.cpp fits the machine timer.
-// (An earlier revision of this file assumed the exact 3000 on the grounds that
-// "both come from the crystal". Only one of them does.)
+// 注意它不是精确的每 microframe 3000 tick。microframe 轴来自 USB 主机时钟
+// (SOF), GPTMR 计数器来自本板晶振, 是两颗独立振荡器 -- 实测相差约 +80 ppm,
+// 即 ~3000.25 tick/microframe。按 3000 假定会在 50 ms 提前量里引入 4 us
+// 误差, 故比值在此拟合, 与 timebase.cpp 对机器定时器的做法相同("两者都
+// 出自晶振"的假设不成立, 只有一方如此)。
 //
-// WIRING: none to add. UART0 already crosses between the two boards
-// (A.TXD<->B.RXD both ways), and those pins carry GPTMR0 channel 1's compare
-// output and capture input as ALT1:
+// 布线: 无需新增。UART0 本就跨板互连(A.TXD<->B.RXD 双向), 这些引脚以 ALT1
+// 复用为 GPTMR0 通道 1 的比较输出与捕获输入:
 //
-//   PB08  UART0 TXD  /  GPTMR0_COMP_1   -- pulse out
-//   PB09  UART0 RXD  /  GPTMR0_CAPT_1   -- pulse in
+//   PB08  UART0 TXD  /  GPTMR0_COMP_1   -- 脉冲出
+//   PB09  UART0 RXD  /  GPTMR0_CAPT_1   -- 脉冲入
 //
-// So the existing cable becomes a bidirectional hardware timing link. UART0 is
-// unavailable while this is enabled, which is why it is its own build option.
+// 于是现有线缆成为双向硬件定时链路。开启本选项期间 UART0 不可用, 故单列
+// 编译选项。
 //
-// MEASUREMENT. Each board fires a pulse at an agreed microframe and captures
-// the other's. Board A's pulse leaves at microframe a_tx and is captured at
-// b_rx; board B's leaves at b_tx and is captured at a_rx. Then
+// 测量方法: 各板在约定的 microframe 发脉冲并捕获对方的。A 板脉冲于
+// microframe a_tx 发出、在 b_rx 被捕获; B 板则为 b_tx 与 a_rx。于是
 //
-//     skew = ((b_rx - a_tx) - (a_rx - b_tx)) / 2
+//     skew = ((b_rx - a_tx) - (a_rx - b_tx)) / 2   -- 双向差分取半
 //
-// Cable propagation and the pad/synchroniser delay appear with the same sign in
-// both directions and cancel in the difference -- the standard two-way
-// exchange. What survives is the difference between the two boards' own ideas of
-// when microframe k happens, which is exactly what an action scheduled on the
-// shared axis would inherit.
+// 线缆传播与焊盘/同步器延迟在两个方向符号相同, 在差分中相消 -- 标准的
+// 双向交换法。剩下的正是两板各自认定的 microframe k 时刻之差, 也就是共享
+// 轴上的定时动作将继承的量。
 //
-// Resolution is one GPTMR tick, 41.7 ns. That is coarse against the ~42 ns the
-// timeline is expected to achieve, but it is coarse in a harmless way: the
-// quantisation is zero-mean and dithered by the real jitter, so over a thousand
-// exchanges the MEAN converges to well under a nanosecond, and the SPREAD only
-// grows by the quadrature term (42 -> 44 ns), which can be subtracted out.
+// 分辨率为一个 GPTMR tick, 41.7 ns, 对时间线瞄准的 ~42 ns 而言偏粗, 但无害:
+// 量化误差均值为零且被真实抖动扰动, 上千次交换后均值收敛到 1 ns 以下, 分布
+// 宽度只增加正交项(42 -> 44 ns), 且该项可被扣除。
 
 #include <cstdint>
 
@@ -59,46 +47,42 @@ namespace libhcs::firmware::sync::pulse {
 
 inline constexpr bool kEnabled = true;
 
-// Nominal ticks per microframe: 24 MHz GPTMR, 125 us microframe. The starting
-// point of the fit and the sanity bound around it, never the value used.
+// 标称每 microframe tick 数: 24 MHz GPTMR, microframe 125 us。只作拟合
+// 初值与其周界的合理性界限, 绝非最终使用的值。
 inline constexpr std::uint32_t kNominalTicksPerMicroframe = 3000;
 
-// Same shape as the machine-timer fit in timebase.cpp, for the same reason: the
-// BASELINE (128 x 64 microframes = 1.024 s) sets the slope accuracy and the
-// sample COUNT averages the SOF interrupt's entry jitter down. Scheduling off a
-// single SOF sample instead -- what the first revision did -- puts that one
-// sample's +-0.5 us straight into the pulse, ten times the effect being
-// measured.
+// 与 timebase.cpp 的机器定时器拟合同构, 理由相同: 基线(128 x 64
+// microframe = 1.024 s)决定斜率精度, 样本数负责把 SOF 中断的进入抖动平均
+// 下去。若只凭单个 SOF 样本排程(初版做法), 该样本 +-0.5 us 的抖动会直接
+// 进脉冲, 是被测效应的十倍。
 inline constexpr std::uint32_t kSampleDecimation = 64;
 inline constexpr std::uint32_t kSampleCount = 128;
 
-// Pin mux, GPTMR clock, channel setup. Must run after the UART driver, whose
-// pin mux this deliberately overrides.
+// 引脚复用、GPTMR 时钟、通道配置。必须在 UART 驱动之后运行: 本模块刻意
+// 覆盖的正是后者的引脚复用。
 void init();
 
-// SOF interrupt: record where the GPTMR counter stood at this microframe.
+// SOF 中断: 记录本 microframe 处 GPTMR 计数器的值。
 void note_sof(std::uint64_t microframe);
 
-// Main loop, 1 kHz tick: recomputes the microframe-to-tick line. Does real work
-// only every refit period.
+// 主循环 1 kHz tick: 重算 microframe 到 tick 的直线。仅在重拟合周期内做
+// 实事。
 void poll(std::uint32_t tick_ms);
 
-// Arm a hardware pulse for the given absolute microframe. False when the fit is
-// not ready, or the target is too near (the compare must be written before the
-// counter reaches it) or too far to trust.
+// 为给定绝对 microframe 布防硬件脉冲。拟合未就绪, 或目标太近(比较寄存器
+// 必须在计数器越过之前写入)、太远不可信时返回 false。
 bool schedule(std::uint64_t microframe);
 
-// Main loop: hands back one captured pulse, converted to the shared axis in
-// Q16 microframes. False when nothing new arrived.
+// 主循环: 取回一条已捕获脉冲, 换算成 Q16 microframe 的共享轴坐标。无新
+// 到数据时返回 false。
 bool take_capture(std::uint64_t& microframe_q16);
 
-// Capture interrupt entry point (bound to IRQn_GPTMR0 in the .cpp).
+// 捕获中断入口(在 .cpp 中绑定到 IRQn_GPTMR0)。
 void isr_handler();
 
-// The fitted ticks per microframe, Q16. Published so the clock relationship is
-// verified on hardware rather than trusted. Expect ~196624000 (3000.25), NOT
-// 3000<<16: the excess is the board crystal running fast against the host's USB
-// clock, and it must agree with the +80 ppm the machine-timer fit reports.
+// 拟合出的每 microframe tick 数, Q16。发布出来供实机核验时钟关系而非
+// 盲信。期望 ~196624000(即 3000.25), 而非 3000<<16: 超出部分是本板晶振
+// 相对主机 USB 时钟偏快, 且应与机器定时器拟合报出的 +80 ppm 相符。
 std::uint32_t measured_ticks_per_microframe_q16();
 
 #else

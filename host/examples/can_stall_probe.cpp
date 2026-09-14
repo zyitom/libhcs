@@ -273,8 +273,7 @@ struct Stream {
 
     void verify(const libhcs::data::CanDataView& data, uint32_t expected_can_id) {
         rx.fetch_add(1, std::memory_order_relaxed);
-        if (data.can_data.size() != kPayloadBytes || !data.is_fdcan
-            || data.can_id != expected_can_id) {
+        if (data.can_data.size() != kPayloadBytes || data.can_id != expected_can_id) {
             corrupt.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -384,9 +383,9 @@ int main(int argc, char** argv) {
                 encode(b, static_cast<uint32_t>(sent));
                 board.start_transmit()
                     .can_transmit(
-                        CanPort::kCan0, {.can_id = kCanId0, .can_data = a, .is_fdcan = true})
+                        CanPort::kCan0, {.can_id = kCanId0, .can_data = a})
                     .can_transmit(
-                        CanPort::kCan2, {.can_id = kCanId2, .can_data = b, .is_fdcan = true});
+                        CanPort::kCan2, {.can_id = kCanId2, .can_data = b});
                 rx.pair01.tx.fetch_add(1, std::memory_order_relaxed);
                 rx.pair23.tx.fetch_add(1, std::memory_order_relaxed);
                 ++sent;

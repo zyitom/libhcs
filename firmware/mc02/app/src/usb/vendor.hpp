@@ -9,6 +9,7 @@
 
 #include <class/vendor/vendor_device.h>
 #include <device/usbd.h>
+#include <device/usbd_pvt.h> // usbd_edpt_busy: 审计钩子用, 此 fork 未在 usbd.h 声明
 #include <main.h>
 #include <tusb.h>
 
@@ -39,23 +40,20 @@ public:
     using Lazy = utility::Lazy<Vendor>;
 
     static constexpr size_t kMaxPacketSize = 64;
-    static constexpr auto kSessionLease = std::chrono::milliseconds{1000};
+    // 主机轮次为 1 s(kSessionRefreshInterval), 租期 4 s = 四个轮次未到即失效。
+    static constexpr auto kSessionLease = std::chrono::milliseconds{4000};
 
     Vendor() {
         usb::usb_descriptors.init();
 
-        // Pin the USB interrupt priority here, because nothing else does, and
-        // do it before the controller can raise one: tusb_rhport_init ->
-        // dcd_init -> dcd_int_enable only calls NVIC_EnableIRQ, so setting the
-        // priority afterwards would leave a window at the reset value. The
-        // CubeMX HAL_PCD_MspInit that would have set a priority belongs to the
-        // ST device stack, which this firmware does not link. NVIC priority
-        // registers reset to 0, so without this line OTG_HS would run at
-        // preempt priority 0 -- above FDCAN (1) -- and every CAN RX ISR could be
-        // delayed by a full dwc2 interrupt (FIFO drain plus the endpoint state
-        // machine). Setting it to 2 makes the documented FDCAN(1) > USB(2) >
-        // UART/DMA(3) hierarchy true in the image, and keeps ownership of it
-        // here where it cannot silently regress.
+        // 在此固定 USB 中断优先级: 没有别处会做, 且必须赶在控制器能触发中断之前
+        // -- tusb_rhport_init -> dcd_init -> dcd_int_enable 只调 NVIC_EnableIRQ,
+        // 之后再设优先级会留下处于复位值的窗口。本应设置优先级的 HAL_PCD_MspInit
+        // 属于 ST 设备栈, 本固件没有链接它。NVIC 优先级寄存器复位为 0, 不设此行则
+        // OTG_HS 将运行在抢占优先级 0 -- 高于 FDCAN(1) -- 每次 CAN RX ISR 都可能被
+        // 一整个 dwc2 中断(FIFO 搬运加端点状态机)推迟。设为 2 才让既定的
+        // FDCAN(1) > USB(2) > UART/DMA(3) 层级在镜像中成立, 且所有权留在本处,
+        // 不会悄然回退。
         HAL_NVIC_SetPriority(OTG_HS_IRQn, 2, 0);
 
         core::utility::assert_always(tusb_rhport_init(0, nullptr));
@@ -63,21 +61,102 @@ public:
 
     core::protocol::Serializer& serializer() { return serializer_; }
 
-    // Session keepalive, lifted out of try_transmit().
+    // 会话保活检查, 独立于 try_transmit()。
     //
-    // kSessionLease is 1 s, so testing it once per main-loop pass is already
-    // about a thousand times finer than the thing it measures. It used to run at
-    // the top of try_transmit(), i.e. nine times a pass, and each run read TIM5's
-    // CNT through Timer::timepoint() -- a D2 peripheral access, in the domain USB
-    // shares, on the board's hottest loop. Single call site is app.cpp's loop.
+    // kSessionLease 为 4 s, 每趟主循环检查一次已比被测对象精细约千倍。放在
+    // try_transmit() 顶部则每趟执行九次, 每次都经 Timer::timepoint() 读 TIM5 的
+    // CNT -- 在全板最热的循环上做一次 D2 外设访问。唯一调用点在 app.cpp 主循环。
     void poll_session() { refresh_session_state(); }
 
-    // True once the host has completed the nonce handshake and is holding the
-    // keepalive lease, i.e. data is actually being forwarded. Distinct from mere
-    // USB enumeration, which says nothing about whether a host is talking.
+    // ---- USB 下行流控(移植自 hpm_board 的同名机制) ----
+    //
+    // 重新挂载 bulk OUT 端点, 除非 CAN 软件发送队列水位太高、再收一个包也装不下。
+    //
+    // 为什么要背压: 不加干预时类驱动在 tud_vendor_rx_cb() 返回后立刻重挂端点,
+    // 软件队列已满的板子会继续收下只能丢弃的帧 -- 丢帧无声, 主机也永远学不会
+    // 放慢。这是本协议唯一的背压手段 -- 线上没有任何流控字段。
+    //
+    // 与 hpm_board 的关键差异: 那边(ChipIdea)不重挂端点控制器就自动回 NAK; 这边
+    // 的 DWC2 实测不会 -- 未挂载的 transfer 之后, 后续包仍被 ACK 进接收 FIFO 然后
+    // 在 dcd 层无声丢弃(实测 2026-09-12: 不重挂时主机全速灌 24k 帧/s 零阻塞)。
+    // 所以这里必须显式置 DOEPCTL.SNAK 才能真正扣住端点, 恢复时 CNAK 后再挂。
+    // 只碰 vendor OUT 这一个端点, EP0 与其余端点不受影响。
+    //
+    // 为什么不是无损保证: 一个包最多装若干条 CAN 记录, 而进入节流时最多已有
+    // RX_XFER_SIZE/64 个包在途。它只约束持续速率, 杜绝不了溢出; 按最坏包深定
+    // 水位会把限流压到队列的 1/4 以下, 每次正常突发都损失吞吐。
+    //
+    // 稳态只是两次 bool 读取加一次返回: rx 完成回调早已重挂端点, 通常既无欠账
+    // 也无节流。策略评估缓存给接收回调使用(在回调里逐包评估实测损 2.3% 包率,
+    // 见 hpm_board 同名机制), 原则上任何重活都不进接收路径。
+    void poll_downlink_arm() {
+#if CFG_TUD_VENDOR_RX_MANUAL_XFER
+        // 挂载前不碰端点: SET_CONFIGURATION 之前 ep_out 尚未建立, 而此处的
+        // DOEPCTL 写与 USB ISR 的端点配置并发(枚举期 ISR 频繁触发)。
+        if (!vendor_mounted_)
+            return;
+        // 只读主循环钩子缓存的结论, 不在这里遍历 CAN 队列: 本函数运行在接收完成
+        // 回调里, 该路径上新增的耗时按 1.2-1.4 倍折损包率。
+        if (throttle_active_) {
+            arm_pending_ = true;
+            vendor_out_nak(true); // 扣住: DWC2 必须显式 SNAK, 不重挂是不够的
+            return;
+        }
+        // 端点暂时挂不上(尚未打开, 或已有一个 transfer 在飞)时保留欠账, 由
+        // poll_downlink_arm_if_pending() 重试。首次挂载也由这里完成: manual 模式
+        // 把它留给应用, 别处无人负责。
+        vendor_out_nak(false); // CNAK 先于重挂, 否则挂上的 transfer 收不到包
+        arm_pending_ = !tud_vendor_n_read_xfer(0);
+#endif
+    }
+
+    // 主循环钩子。重估节流策略(避开接收热路径)、把结论缓存给接收回调, 然后结清
+    // 尚未完成的挂载。
+    void poll_downlink_arm_if_pending() {
+#if CFG_TUD_VENDOR_RX_MANUAL_XFER
+        if (arm_pending_ || throttle_active_ || (++throttle_tick_ & 0xFU) == 0U)
+            throttle_active_ = downlink_throttled();
+        audit_downlink_arm();
+        if (arm_pending_)
+            poll_downlink_arm();
+#endif
+    }
+
+    // 端点重新可用后的初次挂载入口。欠账只由回调设置 -- mount、suspend、会话
+    // 拆除。任何不经过这些回调就取消已挂 transfer 的路径都会让板子永久失聪:
+    // arm_pending_ 为 false, 钩子不再动作, 而硬件上没有挂任何 transfer。总线
+    // 复位会摧毁硬件持有的 transfer, 而上面的逻辑都不会再设置欠账 -- 所以不再
+    // 信任欠账, 审计钩子直接查端点(hpm_board 2026-09-03 实测的永久失聪案例)。
+    void reset_downlink_arm() {
+#if CFG_TUD_VENDOR_RX_MANUAL_XFER
+        arm_pending_ = true;
+#endif
+    }
+
+    // SET_CONFIGURATION(挂载)/拆除(suspend、umount)时由 TinyUSB 回调设置。
+    // 流控的端点寄存器写只发生在挂载窗口内。
+    void set_vendor_mounted(bool mounted) {
+#if CFG_TUD_VENDOR_RX_MANUAL_XFER
+        vendor_mounted_ = mounted;
+#endif
+    }
+
+    // 主机完成 nonce 握手并持有 keepalive 租约后为 true, 即数据确在转发。
+    // 区别于仅 USB 枚举 -- 枚举成功不代表有主机在通信。
     bool session_established() const { return session_established_; }
 
-    void deactivate_session() { session_established_ = false; }
+    void deactivate_session() {
+        session_established_ = false;
+        // 连同会话一并遗忘 EP0 握手。tud_mount_cb 只在重新枚举时触发, 不重新插拔
+        // 线缆地更换主机程序不会重新枚举 -- 否则从不做握手的新主机会继承上一台
+        // 主机的通行门(实测于 hpm_board: 它径直穿了过去)。
+        ep0_handshake_done_ = false;
+    }
+
+    // 由 EP0 kGetInterface 处理器(usb/vendor_control.cpp)置位: 读接口本身就是
+    // 握手, 走到这一步的主机已被告知通道数与 CAN 模式, 不可能是 EP0 配置通道出现
+    // 之前的旧主机。
+    void set_ep0_handshake_done(bool value) { ep0_handshake_done_ = value; }
 
     void handle_downlink(std::span<const std::byte> buffer, bool finished) {
         deserializer_.feed(buffer);
@@ -87,14 +166,11 @@ public:
 
     void finish_downlink_transfer() { deserializer_.finish_transfer(); }
 
-    // Ordered cheapest-test-first, and deliberately does NOT refresh the session
-    // -- see poll_session() below.
+    // 检查按代价从低到高排序, 且刻意不刷新会话 -- 见下方 poll_session()。
     //
-    // The batch pool is plain RAM; tud_vendor_n_write_available() reads TinyUSB's
-    // endpoint state, also RAM. Neither is worth doing when nothing is staged,
-    // and app.cpp calls this once per traffic source -- several times a pass -- so
-    // anything ahead of the "is there work" test is paid nine times over.
-    // hpm_board's Vendor::try_transmit is ordered the same way.
+    // batch 池是普通 RAM; tud_vendor_n_write_available() 读 TinyUSB 的端点状态,
+    // 同样是 RAM。没有待发内容时两者都不值得执行, 而 app.cpp 对每个数据源各调一次
+    // -- 每趟多次 -- "有没有活"这一测试之前的任何开销都要乘上九倍。
     bool try_transmit() {
         if (!session_established_) {
             return false;
@@ -118,11 +194,10 @@ public:
         if (target_size) {
             core::utility::assert_debug(tud_vendor_n_write(0, src, target_size) == target_size);
         } else {
-            // Terminate a batch whose length is an exact multiple of the endpoint size.
-            // In non-buffered vendor mode (RX/TX_BUFSIZE == 0) TinyUSB submits a
-            // zero-length write straight to the endpoint as a ZLP. The return value is 0
-            // both on success and on a failed endpoint claim, so there is nothing to
-            // assert; write_available() above already confirmed the endpoint is idle.
+            // 为长度恰为端点尺寸整数倍的 batch 收尾。非缓冲 vendor 模式
+            // (RX/TX_BUFSIZE == 0)下, TinyUSB 把零长写直接提交到端点成为 ZLP。
+            // 返回值在成功与端点占用失败时同为 0, 无从 assert; 上方的
+            // write_available() 已确认端点空闲。
             tud_vendor_n_write(0, src, 0);
         }
 
@@ -137,6 +212,82 @@ public:
     }
 
 private:
+#if CFG_TUD_VENDOR_RX_MANUAL_XFER
+    // vendor bulk OUT 端点的每端点 NAK(DWC2 DOEPCTL.SNAK/CNAK)。hpm 的
+    // ChipIdea 不重挂即 NAK, DWC2 必须显式置位 -- 实测见 poll_downlink_arm。
+    // 只作用于 vendor OUT 这一个端点; EP0(配置通道)与其余端点不受影响。
+    static void vendor_out_nak(bool nak) {
+        // 这套 CMSIS 没有 USB_OTG_HS_Device 便捷宏, 也没有 OUTEP_CFG 数组成员;
+        // 按 RM0468 布局由外设基址 + 0x800(设备区) + 0xB00(OUT 端点区) + ep*0x20
+        // 构造, 与 HAL 的 USBx_OUTEP(i) 宏同算术。
+        auto* out_ep = reinterpret_cast<USB_OTG_OUTEndpointTypeDef*>(
+            USB_OTG_HS_PERIPH_BASE + USB_OTG_DEVICE_BASE + 0xB00U
+            + (UsbDescriptors::kEpnumVendorDataOut & 0x0FU) * 0x20U);
+        if (nak)
+            out_ep->DOEPCTL |= USB_OTG_DOEPCTL_SNAK;
+        else
+            out_ep->DOEPCTL |= USB_OTG_DOEPCTL_CNAK; // CNAK 清除 SNAK 状态
+    }
+
+    // 迟滞。在队列接近顶部时限流, 真正排空后才解除: 单阈值会让每次出队后的下一
+    // 轮就重挂端点, 节流恰好在延迟最差的深度上抖动。队列深度与 hpm_board 同为
+    // 64, 水位 1:1 平移。
+    static constexpr size_t kThrottleEngageDepth = can::Can::kTransmitQueueSize * 3 / 4;
+    static constexpr size_t kThrottleReleaseDepth = can::Can::kTransmitQueueSize / 4;
+
+    // 逃生阀。停止排空的总线(bus-off, 或根本没有其他节点应答)会让 OUT 端点永远
+    // 关闭; 而该端点同时承载 UART 下行与会话 keepalive, 一路 CAN 故障就会拖垮
+    // 整条链路, 比丢弃发往该总线的帧糟糕得多。队列在释放水位之上停留这么久后,
+    // 停止扣住端点。健康总线按实测约 19.8k 帧/s 排空全部 64 槽约需 3.2 ms, 20 ms
+    // 只在总线真正卡死时才会耗尽; 会话租期 4000 ms, 余量充分。
+    static constexpr std::chrono::milliseconds kThrottleDeadline{20};
+
+    bool downlink_throttled() {
+        const size_t depth = can::max_transmit_queue_depth();
+
+        // 本轮已放弃背压, 管道保持开放, 直到总线证明自己又在排空 -- 若在启动
+        // 水位重新限流, 只会把同一个 20 ms 停滞循环重演。
+        if (throttle_abandoned_) {
+            if (depth <= kThrottleReleaseDepth)
+                throttle_abandoned_ = false;
+            return false;
+        }
+
+        if (!throttle_active_) {
+            if (depth < kThrottleEngageDepth)
+                return false;
+            throttle_active_ = true;
+            throttle_started_ = timer::timer->timepoint();
+            return true;
+        }
+
+        if (depth <= kThrottleReleaseDepth) {
+            throttle_active_ = false;
+            return false;
+        }
+
+        if (timer::timer->check_expired(throttle_started_, kThrottleDeadline)) {
+            throttle_active_ = false;
+            throttle_abandoned_ = true;
+            return false;
+        }
+
+        return true;
+    }
+
+    // 审计: 不再信任欠账, 每 256 轮约 340 us 采样一次端点真实状态。它捕捉的故障
+    // 是永久性的, 采样率只需快到人眼无感即可。稳态开销是一次自增加一次掩码 --
+    // arm_pending_ 为 false 时短路, 走不到端点查询。
+    void audit_downlink_arm() {
+        if (arm_pending_ || throttle_active_)
+            return;
+        if ((++arm_audit_tick_ & 0xFFU) != 0U)
+            return;
+        if (!usbd_edpt_busy(0, UsbDescriptors::kEpnumVendorDataOut))
+            arm_pending_ = true;
+    }
+#endif
+
     void activate_session(uint32_t nonce) {
         if (transmitting_batch_) {
             transmit_buffer_.release_batch(transmitting_batch_);
@@ -182,17 +333,16 @@ private:
         core::protocol::FieldId id, const data::UartConfigView& data) override {
         if (!session_established_)
             return true;
-        switch (id) {
-        case data::DataId::kUartDbusConfig: return uart::uart_dbus->handle_config(data);
-        case data::DataId::kUart1Config: return uart::uart1->handle_config(data);
-#ifdef libhcs_APP_RS485_ENABLE
-        case data::DataId::kUart2Config: return uart::uart2->handle_config(data);
-        case data::DataId::kUart3Config: return uart::uart3->handle_config(data);
-#endif
-        case data::DataId::kUart7Config: return uart::uart7->handle_config(data);
-        case data::DataId::kUart10Config: return uart::uart10->handle_config(data);
-        default: return false;
-        }
+        // 已弃用(2026-09-12): 配置移到 EP0, 由 status stage 原生携带板端应答。
+        // 本回调返回的 bool 含义是"该字段 id 已识别"而非"操作成功", 因此被除数
+        // 求解拒绝的波特率对主机不可见 -- 本板上这个故障模式真实发生过(见
+        // AGENTS.md: HAL_RCCEx_GetPeriphCLKFreq() 返回 0, 所有运行时波特率请求被
+        // 静默忽略, 同板回环也检测不到)。拒绝而非忽略: 返回 false 会让反序列化器
+        // 在本次传输的剩余部分进入丢弃模式, 旧主机以为波特率已生效的假设会在此
+        // 显式失败。
+        (void)id;
+        (void)data;
+        return false;
     }
 
     bool gpio_digital_data_deserialized_callback(
@@ -260,6 +410,13 @@ private:
     void session_control_deserialized_callback(const data::SessionControlView& data) override {
         switch (data.type) {
         case data::SessionType::kStart: {
+            // 主机完成 EP0 接口握手之前静默拒绝。会话协议没有否定应答, 开不了
+            // 会话的主机约一秒后自行触发 ack 超时并给出自己的报错; 沉默是本层
+            // 唯一能说的话。没有这道门, EP0 通道之前的旧主机会带着线路上已不再
+            // 逐帧协商的 CAN 帧类型假设直接开会话。
+            if (!ep0_handshake_done_)
+                return;
+
             const bool same_session = session_established_ && data.nonce == current_session_nonce_;
 
             if (!same_session)
@@ -289,24 +446,9 @@ private:
         }
     }
 
-    // Shared time base. The anchor rides the session field precisely because it
-    // must live and die with the session: a board that lost its host has no
-    // business keeping a timeline that the host may later assume is still
-    // aligned. Nonce-checked like the keepalive, and answered in the same
-    // exchange so the host gets the board's state without a second round trip.
-    //
-    // The PTPC fields are hpm_board's CAN-timestamp-to-microframe bridge, which
-    // has no counterpart on this part: the H723's FDCAN timestamp counter is not
-    // fed by a disciplinable 1588 clock, and nothing here captures CAN frames on
-    // the shared axis. Sent as zeros rather than omitted, because the payload
-    // layout is shared by every board.
-    //
-    // The one exception is ptpc_units_per_microframe, which carries the exact
-    // analogue of what it means on hpm_board: the rate of the board's HARDWARE
-    // capture clock against the microframe axis. Here that is TIM2, and zero
-    // means the capture is not being used because it is too coarse to beat the
-    // interrupt path (sync/sof.cpp). It is the one field that tells the host
-    // whether the .ioc still has TIM2 at the servo prescaler.
+    // 共享时基。时间锚搭乘会话字段, 正因它必须随会话存亡: 失去主机的板没有理由
+    // 继续维护主机日后可能以为仍对齐的时间线。与 keepalive 一样校验 nonce, 并在
+    // 同一次交互中应答, 主机无需第二个往返即可取得板端状态。
     void time_anchor_deserialized_callback(const data::TimeAnchorView& data) override {
         if (!session_established_ || data.nonce != current_session_nonce_)
             return;
@@ -315,24 +457,18 @@ private:
 
         const auto snapshot = sync::timebase::report();
 
-        // Report the pair as of NOW, not as of the last SOF.
+        // 上报"此刻"的配对, 而非最后一次 SOF 时的。
         //
-        // snapshot.microframe is the counter latched at the last Start-of-Frame,
-        // which at full speed is 0..1 ms in the past -- uniform, mean 500 us.
-        // The host pairs whatever we send with the MIDPOINT of this round trip,
-        // so reporting the last SOF makes it associate that microframe with an
-        // instant ~450 us later than the microframe actually was, and adds the
-        // uniform 1 ms of that delay as noise on top.
-        // [Measured 2026-09-07 by the causality probe in
-        //  host/examples/mc02_time_sync_test.cpp --causality: the conversion
-        //  landed +440..+491 us outside its own send/reply bracket on 100% of
-        //  2185 probes, and the placement residual was uniform over exactly
-        //  1 ms with sigma 288 us = 1000/sqrt(12).]
+        // snapshot.microframe 是上一次 Start-of-Frame 锁存的计数, full speed 下
+        // 落后 0..1 ms -- 均匀分布, 均值 500 us。主机把收到的值与本往返的中点配对,
+        // 若上报最后一次 SOF, 它会把该微帧关联到比实际晚约 450 us 的时刻, 并额外
+        // 叠加均匀分布的 1 ms 延迟噪声。
+        // [实测 2026-09-07, host/examples/mc02_time_sync_test.cpp --causality 的
+        //  因果探针: 2185 次探测中 100% 的换算落在其自身 send/reply 括区之外
+        //  +440..+491 us, 位置残差恰为 1 ms 均匀分布, sigma 288 us = 1000/sqrt(12)。]
         //
-        // Interpolating to the current instant costs one TIM5 read and one
-        // multiply, and it is what microframe_at() is for. Falls back to the
-        // latched pair when the timeline is not valid, which is the only case
-        // where interpolation would be meaningless.
+        // 插值到当前时刻只花一次 TIM5 读加一次乘法, microframe_at() 正是为此存在。
+        // 时间线无效时回退到锁存值 -- 唯一插值无意义的情形。
         auto reported_microframe = snapshot.microframe;
         auto reported_quarter_us = static_cast<uint32_t>(snapshot.timestamp_quarter_us);
         {
@@ -355,23 +491,11 @@ private:
             .residual_mean_q16 = snapshot.residual_mean_q16,
             .residual_abs_max_q16 = snapshot.residual_abs_max_q16,
             .residual_count = static_cast<uint16_t>(snapshot.residual_count),
-            .ptpc_units_per_microframe = sync::sof_capture_active()
-                                           ? sync::timebase::kNominalCyclesPerMicroframe
-                                                 / sync::sof_capture_cycles_per_tick()
-                                           : 0,
-            .ptpc_reference_units = 0,
-            .ptpc_reference_microframe = 0,
-            .ptpc_residual_mean = 0,
-            .ptpc_residual_abs_max = 0,
-            .ptpc_step_min = 0,
-            .ptpc_step_max = 0,
-            .ptpc_raw_ns = 0,
-            .ptpc_raw_microframe = 0,
         });
     }
 
     void error_callback() override {
-        // TODO: Report USB downlink deserialization errors through a dedicated error path.
+        // TODO: 经专用错误路径上报 USB 下行反序列化错误。
     }
 
     void refresh_session_state() {
@@ -392,12 +516,24 @@ private:
     const InterruptSafeBuffer::Batch* transmitting_batch_ = nullptr;
     size_t transmitted_size_ = 0;
     bool session_established_ = false;
+    bool ep0_handshake_done_ = false;
+
+#if CFG_TUD_VENDOR_RX_MANUAL_XFER
+    // 下行流控状态, 见 public 区同名方法。
+    bool vendor_mounted_ = false; // SET_CONFIGURATION 之后才允许碰端点寄存器
+    bool arm_pending_ = true;     // manual 模式的初次挂载欠账, 上电即欠
+    bool throttle_active_ = false;
+    bool throttle_abandoned_ = false;
+    uint32_t throttle_tick_ = 0;
+    uint32_t arm_audit_tick_ = 0;
+    timer::Timer::TimePoint throttle_started_ = timer::Timer::TimePoint::min();
+#endif
     uint32_t current_session_nonce_ = 0;
     timer::Timer::TimePoint last_session_refresh_ = timer::Timer::TimePoint::min();
 };
 
-// Placed in zero-wait DTCM (.dtcm, copied at boot) so the forwarding ISR writes
-// the serializer/USB batch buffers without ever touching the AXI bus.
+// 置于零等待 DTCM(.dtcm, 开机复制): 转发 ISR 写 serializer/USB batch 缓冲时
+// 全程不触碰 AXI 总线。
 [[gnu::section(".dtcm")]] inline constinit Vendor::Lazy vendor;
 
 } // namespace libhcs::firmware::usb

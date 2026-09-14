@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -19,14 +20,64 @@
 
 namespace libhcs::firmware::can {
 
+// 帧类型是总线的属性, 不属于单个帧。曾按主机设置的头部位逐帧选择, 该位已废弃
+// (见 core/src/protocol/protocol.hpp 的 CanHeaderLayout); 模式现固定于此, 主机
+// 在构造握手时经 EP0 配置通道(usb/vendor_control.cpp)读回, 并据此校验其预期。
+//
+// 控制器本身无论如何都保持 FD 能力: CubeMX 将每个 FDCAN 配为
+// FrameFormat = FDCAN_FRAME_FD_BRS, 且开启 FD 的 M_CAN 仍能接收对端的经典帧,
+// 因此 kCanFd 条目在接收方向零成本, 只决定本板往总线上发什么。三路总线均运行
+// CAN-FD(仲裁 1 Mbit/s / 数据段 5 Mbit/s), 正是本板驱动的电机所要求的;
+// 某路总线的对端不支持 FD 时, 修改这里的条目即可, 不做运行时切换。
+enum class CanMode : uint8_t {
+    kClassic,
+    kCanFd,
+};
+
+struct CanPort {
+    FDCAN_HandleTypeDef* handle;
+    data::DataId data_id; // 该连接器的丝印编号
+    CanMode mode;
+};
+
+// 表序即总线序: 下标 0 对应丝印 CAN1(kCan1), 依此类推, 与
+// core/include/libhcs/spec/mc02/can.hpp 及 can.cpp 的 ISR 分发一致。三处需同步维护。
+inline constexpr CanPort kCanPorts[] = {
+    {&hfdcan1, data::DataId::kCan1, CanMode::kCanFd},
+    {&hfdcan2, data::DataId::kCan2, CanMode::kCanFd},
+    {&hfdcan3, data::DataId::kCan3, CanMode::kCanFd},
+};
+inline constexpr size_t kCanCount = std::size(kCanPorts);
+static_assert(kCanCount == 3);
+
 class Can : private core::utility::Immovable {
 public:
     using Lazy = utility::Lazy<Can, FDCAN_HandleTypeDef*, uint32_t>;
 
     Can(FDCAN_HandleTypeDef* hal_can_handle, uint32_t hal_filter_index)
         : hal_can_handle_(hal_can_handle) {
+        // 防呆: 表引用的控制器必须是 CubeMX 真的初始化过的(MX_FDCANx_Init 后
+        // State=READY; 从未初始化则为 RESET)。kCanPorts 表与 .ioc 漂移在此即刻
+        // 报错, 而不是等到线上行为诡异。
+        core::utility::assert_always(hal_can_handle_->State != HAL_FDCAN_STATE_RESET);
+        canfd_ = kCanPorts[diag_index()].mode == CanMode::kCanFd;
         config_can(hal_filter_index);
     }
+
+    // 本总线当前实际发送的帧型, 可经 EP0 配置通道在运行时切换
+    // (usb/vendor_control.cpp 的 kSetCanConfig + kCanConfigApply)。控制器自身保持
+    // FD 能力 -- CubeMX 以 FDCAN_FRAME_FD_BRS 启动它, 这里不进 INIT 模式 -- 切换
+    // 只改本驱动写进 Tx 元素的 FDF/BRS 标志; 收方向两个模式都是超集。
+    [[nodiscard]] bool fd_mode() const { return canfd_; }
+    void set_fd_mode(bool fd) { canfd_ = fd; }
+
+    // 软件 TX 环的深度。usb/vendor.hpp 的下行流控按它推导水位, 因此公开。
+    static constexpr size_t kTransmitQueueSize = 64;
+
+    // 本控制器软件 TX 环里的待发帧数。USB 下行流控 (vendor.hpp 的
+    // poll_downlink_arm_if_pending) 读它决定是否继续接收 OUT 包: 任一路接近满
+    // 就该让主机减速, 而不是收下只能丢弃的帧。
+    [[nodiscard]] size_t transmit_queue_depth() const { return transmit_buffer_.readable(); }
 
     // CAN 转发热路径。函数体在 can.cpp 中定义并放入零等待 ITCM(.itcm 段),
     // 使最坏转发延迟不受 I-cache miss 和 FLASH-XIP 取指抖动影响。
@@ -34,44 +85,76 @@ public:
     void handle_downlink(const data::CanDataView& data);
     void handle_uplink(data::DataId field_id, core::protocol::Serializer& serializer);
 
-    // Drain this controller's software queue into the hardware Tx FIFO. The
-    // queue only fills when the FIFO was full, so it is almost always empty, and
-    // the test is inline so an empty queue costs no call. The main loop uses
-    // drain_pending_transmits() instead; this per-bus form stays for callers
-    // that want a single controller.
+    // 控制器错误状态, 供 EP0 状态查询(usb/vendor_control.cpp)使用。每次调用直接
+    // 读硬件: PSR 的 LEC/DLEC 读后自清为"无变化", 缓存副本会永远报旧错误, 而跳过
+    // 读取则会对唯一的另一读者隐瞒错误。那个读者是 bus-off 恢复路径, 它读的是
+    // 协议状态里的 BusOff -- 电平标志, 不会自清 -- 因此两者不会互相抹掉对错误
+    // 锁存的观察。
+    struct Status {
+        uint8_t tec, rec, last_error, data_last_error, flags;
+        uint32_t tx_occurred, tx_cancelled, rx_frames, rx_fifo_level;
+    };
+
+    [[nodiscard]] Status status() const;
+
+    // 把本控制器的软件队列排入硬件 Tx FIFO。只有 FIFO 满过队列才会有内容, 故
+    // 几乎总为空; 判空内联在此, 空队列零调用开销。主循环走
+    // drain_pending_transmits(), 这个单总线形式留给只关心单个控制器的调用方。
     bool try_transmit() {
         if (transmit_buffer_.readable() == 0) [[likely]]
             return false;
         return drain_transmit_queue();
     }
 
-    // Main-loop entry for all three controllers. transmit_pending_mask_ has one
-    // bit per controller whose queue may hold frames, so a pass with nothing
-    // queued on any bus -- nearly every pass -- is one load and one branch.
+    // 三路控制器共用的主循环入口。transmit_pending_mask_ 每控制器一位, 表示其
+    // 队列可能仍有帧, 三路全空的常见情况因此只需一次加载加一次分支。
     //
-    // The mask is plain data rather than an atomic because every reader and
-    // writer runs in the main loop: handle_downlink is reached only from
-    // tud_task() (the TinyUSB vendor class registers no xfer_isr, so
-    // tud_vendor_rx_cb never runs in the USB interrupt), and the drains run from
-    // here. Invariant: a controller's bit is set whenever its queue is
-    // non-empty. handle_downlink sets it after every enqueue attempt, and
-    // drain_transmit_queue clears it only after finding the queue empty. Debug
-    // builds check the invariant on the idle path.
+    // mask 是普通数据而非原子量: 读写双方都只在主循环运行 -- handle_downlink 仅
+    // 经 tud_task() 到达(TinyUSB vendor class 未注册 xfer_isr, tud_vendor_rx_cb
+    // 不会在 USB 中断里运行), 排空也只发生在这里。不变量: 队列非空时对应位必为 1。
+    // handle_downlink 在每次入队尝试后置位, drain_transmit_queue 确认队列已空才
+    // 清位。debug 构建在空闲路径上校验该不变量。
     static void drain_pending_transmits() {
         if (transmit_pending_mask_ == 0) [[likely]] {
             core::utility::assert_debug_lazy([]() noexcept { return transmit_queues_empty(); });
-            return;
+        } else {
+            drain_pending_transmits_slow();
         }
-        drain_pending_transmits_slow();
+
+        // ES0491 2.22.3 守护: 每 kStuckCheckPassInterval 趟主循环查一次各控制器的
+        // 挂起发送请求(50-85 kHz 循环下约每 6-10 ms), 详见 recover_stuck_transmits()。
+        // 三次 D2 域寄存器读摊在 512 趟上; 热路径只在命中检查的那一趟多付一次分支。
+        if ((++stuck_check_phase_ & (kStuckCheckPassInterval - 1U)) == 0U) [[unlikely]]
+            recover_all_stuck_transmits();
     }
+
+    // 仅 HAL_FDCAN_ErrorStatusCallback(IR.BO 的置位/清零两个沿, 中断上下文)调用。
+    // bus-off 恢复期间(129*11 个隐性位, 约 1.4 ms)挂起的发送请求合法地保持 TXBRP
+    // 非零, 守护以该标志为屏蔽位; DTCM 内对齐字节写在 M7 上是原子的。
+    void note_bus_off(bool bus_off) { bus_off_ = bus_off; }
 
 private:
     bool drain_transmit_queue();
     static void drain_pending_transmits_slow();
     static bool transmit_queues_empty();
 
-    // Bit diag_index() set while that controller's queue may hold frames, in
-    // zero-wait DTCM next to the controllers. See drain_pending_transmits().
+    // ES0491 (STM32H72x/73x) 2.22.3 的软件守护, 机制见 can.cpp 的
+    // recover_stuck_transmits()。逐控制器跑一遍; 定义在 can.cpp, 因为 can1/2/3
+    // 声明在本类之后, 类内看不到。
+    static void recover_all_stuck_transmits();
+    void recover_stuck_transmits();
+
+    bool bus_off_ = false;
+
+    // 非 0 表示"TXBRP 非零且非 bus-off"自该 HAL_GetTick 毫秒起持续; 0 表示无。
+    uint32_t stuck_request_since_ms_ = 0;
+
+    // 守护检查的节流相位与间隔: 主循环每 512 趟查一次。
+    static constexpr uint32_t kStuckCheckPassInterval = 512;
+    [[gnu::section(".dtcm")]] static inline constinit uint32_t stuck_check_phase_ = 0;
+
+    // diag_index() 对应的位, 置位表示该控制器的队列可能仍有帧; 放在控制器旁的
+    // 零等待 DTCM。见 drain_pending_transmits()。
     [[gnu::section(".dtcm")]] static inline constinit uint32_t transmit_pending_mask_ = 0;
 
     void config_can(uint32_t hal_filter_index) {
@@ -153,6 +236,13 @@ private:
 
     FDCAN_HandleTypeDef* hal_can_handle_;
 
+    // 本控制器往总线上发送的帧格式, 构造时由 kCanPorts 固定。
+    bool canfd_ = false;
+
+    // 开机以来交给 serializer 的帧数, 由 EP0 状态查询上报。仅 RX 中断写、仅主
+    // 循环读; Cortex-M 上对齐的 32 位读写是原子的, 且这里只关心数值变化, 无需同步。
+    uint32_t forwarded_frames_ = 0;
+
     struct TransmitMailboxData {
         uint32_t identifier; // Tx 元素 T0: ID + XTD/RTR 标志
         uint32_t control;    // Tx 元素 T1: DLC + FDF/BRS 标志
@@ -168,8 +258,7 @@ private:
     // 否则 handle_downlink 直接写控制器。16 是从 c_board 继承的: 那边 bxCAN 只有
     // 三个发送邮箱, 16 深确有收益; 本芯片光 FIFO 就有 32, 旧的无条件入队反而把单个
     // 下行包限制在 16 帧 -- 只有直写 FIFO 的一半。64 与 hpm_board 一致,
-    // 每路总线占 1 KB DTCM。
-    static constexpr size_t kTransmitQueueSize = 64;
+    // 每路总线占 1 KB DTCM。深度常量在 public 区(kTransmitQueueSize)。
     utility::RingBuffer<TransmitMailboxData, kTransmitQueueSize> transmit_buffer_;
 };
 
@@ -178,5 +267,28 @@ private:
 [[gnu::section(".dtcm")]] inline constinit Can::Lazy can1{&hfdcan1, 0};
 [[gnu::section(".dtcm")]] inline constinit Can::Lazy can2{&hfdcan2, 0};
 [[gnu::section(".dtcm")]] inline constinit Can::Lazy can3{&hfdcan3, 0};
+
+// 取 EP0 总线序(kCanPorts 顺序)对应的控制器。init() 之前返回 nullptr --
+// EP0 处理器对这种总线直接 STALL 请求而不解引用, 与 hpm_board 未构造尾部槽位的
+// 策略一致。
+inline Can* can_by_index(size_t index) {
+    switch (index) {
+    case 0: return can1.get();
+    case 1: return can2.get();
+    case 2: return can3.get();
+    default: return nullptr;
+    }
+}
+
+// 三路控制器中最深的软件 TX 队列。USB 下行流控按它节流: 任一路背压即足够 --
+// 主机无从知道帧发往哪条总线, 也没有必要知道。
+inline size_t max_transmit_queue_depth() {
+    size_t depth = 0;
+    for (size_t i = 0; i < kCanCount; ++i) {
+        if (const Can* can = can_by_index(i))
+            depth = std::max(depth, can->transmit_queue_depth());
+    }
+    return depth;
+}
 
 } // namespace libhcs::firmware::can

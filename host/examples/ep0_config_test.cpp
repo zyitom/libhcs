@@ -18,6 +18,12 @@
 //      producing frames of the other type on the wire.
 //   6. Construction-time configuration works, and a board object that finished
 //      constructing is a board whose configuration is known.
+//   7. The board's CAN timing identity reads back as one coherent truth: mode,
+//      rates and sample points, plus the capability bits (this board clears
+//      kCapCanModeSettable -- mode application is an mc02 feature).
+//   8. UART framing (stop bits here) applies, reads back from the live
+//      registers, and restores -- the same apply-then-verify contract the
+//      baudrate checks above exercise.
 //
 // Needs one HPM5321 dual-CAN-FD board (PID 0x5322). No CAN or UART wiring: every
 // check is a control transfer plus the board's own read-back. Pass a serial
@@ -28,6 +34,7 @@
 #include <exception>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include <libhcs/board/hpm5321.hpp>
 
@@ -35,6 +42,9 @@ namespace {
 
 using libhcs::board::AdvancedOptions;
 using libhcs::board::Hpm5321;
+
+// The EP0 channel's host-side helpers and wire enums (CanMode, UartParity, ...).
+namespace hcs = libhcs::board::hcs;
 
 int g_failures = 0;
 
@@ -178,6 +188,71 @@ int main(int argc, char** argv) {
         check(
             within_tolerance(kDefaultBaudrate, effective),
             "the constructor left the port at 921600");
+    } catch (const std::exception& error) {
+        std::printf("  [FAIL] unexpected exception: %s\n", error.what());
+        ++g_failures;
+    }
+
+    std::printf("7. CAN timing identity reads back as one coherent truth\n");
+    try {
+        AdvancedOptions options;
+        options.set_dangerously_skip_version_checks(true);
+        Hpm5321 board{callback, filter, options};
+        const auto config = board.can_config(hcs::CanPort::kCan1);
+        std::printf(
+            "   mode=%u arb=%u data=%u nominal_sp=%u data_sp=%u\n", config.mode,
+            config.arbitration_baudrate, config.data_baudrate, config.nominal_sample_point,
+            config.data_sample_point);
+        using hcs::vc::CanMode;
+        check(config.mode == std::to_underlying(CanMode::kCanFd), "bus 1 runs CAN-FD");
+        check(config.arbitration_baudrate == 1'000'000U, "arbitration phase is 1 Mbit/s");
+        check(config.data_baudrate == 5'000'000U, "data phase is 5 Mbit/s");
+        check(config.nominal_sample_point == 875U, "nominal sample point is 87.5%");
+        check(config.data_sample_point == 875U, "data sample point is 87.5%");
+        check(
+            !board.interface().can_mode_settable,
+            "and this board does NOT offer host-driven mode changes (mc02 does)");
+    } catch (const std::exception& error) {
+        std::printf("  [FAIL] unexpected exception: %s\n", error.what());
+        ++g_failures;
+    }
+
+    std::printf("8. UART framing applies, reads back, and restores\n");
+    try {
+        AdvancedOptions options;
+        options.set_dangerously_skip_version_checks(true);
+        Hpm5321 board{callback, filter, options};
+        board.configure_uart0(kBaseBaudrate);
+
+        hcs::UartSetting two_stops;
+        two_stops.baudrate = kBaseBaudrate;
+        two_stops.stop_bits = hcs::vc::UartStopBits::kUartStopBits2;
+        board.configure_uart0(two_stops);
+        const auto applied = board.read_uart_setting(0);
+        std::printf(
+            "   rate=%u word=%u parity=%u stop=%u\n", applied.baudrate,
+            std::to_underlying(applied.word_length), std::to_underlying(applied.parity),
+            std::to_underlying(applied.stop_bits));
+        check(
+            applied.stop_bits == hcs::vc::UartStopBits::kUartStopBits2,
+            "2 stop bits applied and read back from the live registers");
+        check(
+            applied.word_length == hcs::vc::UartWordLength::kUartWordLength8,
+            "untouched fields stay as they were (8 data bits)");
+        check(
+            applied.parity == hcs::vc::UartParity::kUartParityNone,
+            "untouched fields stay as they were (no parity)");
+
+        // Restore 1 stop bit so a peer on this port is not left behind. The
+        // rate-only form cannot do it BY DESIGN (sparse patch: zero fields are
+        // left untouched), so the restore is an explicit full setting.
+        hcs::UartSetting restore;
+        restore.baudrate = kBaseBaudrate;
+        restore.stop_bits = hcs::vc::UartStopBits::kUartStopBits1;
+        board.configure_uart0(restore);
+        check(
+            board.read_uart_setting(0).stop_bits == hcs::vc::UartStopBits::kUartStopBits1,
+            "explicit full setting restores the default framing");
     } catch (const std::exception& error) {
         std::printf("  [FAIL] unexpected exception: %s\n", error.what());
         ++g_failures;

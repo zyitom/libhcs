@@ -44,9 +44,22 @@ std::vector<std::string> boards() {
     DIR* dir = opendir("/sys/bus/usb/devices");
     while (const dirent* e = readdir(dir)) {
         std::string b = std::string{"/sys/bus/usb/devices/"} + e->d_name;
-        auto rd = [&](const char* l) { std::string p = b + "/" + l; FILE* fp = fopen(p.c_str(), "re");
-            if (!fp) return std::string{}; char buf[128]{}; if (!fgets(buf, sizeof buf, fp)) { fclose(fp); return std::string{}; }
-            fclose(fp); std::string v{buf}; while (!v.empty() && (v.back()=='\n'||v.back()=='\r')) v.pop_back(); return v; };
+        auto rd = [&](const char* l) {
+            std::string p = b + "/" + l;
+            FILE* fp = fopen(p.c_str(), "re");
+            if (!fp)
+                return std::string{};
+            char buf[128]{};
+            if (!fgets(buf, sizeof buf, fp)) {
+                fclose(fp);
+                return std::string{};
+            }
+            fclose(fp);
+            std::string v{buf};
+            while (!v.empty() && (v.back() == '\n' || v.back() == '\r'))
+                v.pop_back();
+            return v;
+        };
         if (rd("idVendor") == "a511" && rd("idProduct") == "5322") { auto s = rd("serial"); if (!s.empty()) f.push_back(s); }
     }
     closedir(dir); std::sort(f.begin(), f.end()); return f;
@@ -62,7 +75,7 @@ int main() {
     const std::array<std::byte, 8> payload{};
     for (int i = 0; i < 20; i++) {
         { auto tx = a.start_transmit(); tx.can_transmit(
-            CanPort::kCan1, {.can_id = 0x321, .can_data = payload, .is_fdcan = true}); }
+            CanPort::kCan1, {.can_id = 0x321, .can_data = payload}); }
         std::this_thread::sleep_for(std::chrono::milliseconds{20});
     }
     std::this_thread::sleep_for(std::chrono::milliseconds{300});

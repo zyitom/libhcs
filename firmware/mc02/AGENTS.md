@@ -24,6 +24,8 @@ cmake --preset debug -S firmware/mc02
 cmake --build firmware/mc02/build --target mc02_app mc02_bootloader
 ```
 - preset：`debug` / `release`。target：`mc02_app`、`mc02_bootloader`。
+- 烧录与调试探针**只用 J-Link**（bootloader 首烧 / GDB / Ozone），不用 ST-Link /
+  OpenOCD；日常烧 app 走 DFU，见 [仓库根 README.md](../../README.md#固件编译与烧录)。
 
 ### build 目录已存在时，`option()` 的默认值不生效 [实测 2026-08-12]
 
@@ -83,12 +85,32 @@ arm-none-eabi-nm firmware/mc02/build/app/mc02_app.elf | grep -c bmi088   # IMU: 
   USB 聚合上限约 800 KB/s。于是 **1-2 条总线跑满时卡在 CAN 线速**（298 / 596 KB/s），
   **3 条一起跑满时才卡在 USB**（894 KB/s > 800）。分界点约 2.7 条总线，即聚合 53000 帧/s。
   `[推断，基于 800 KB/s 与 19870 帧/s 两项实测]`
-- CAN：FDCAN1/2/3 常驻 FD+BRS，逐帧按 host `is_fdcan` 切换，不做 INIT 重配。
+- CAN：FDCAN1/2/3 控制器常驻 FD+BRS（收方向恒为超集）；**发送帧型默认跟随 `kCanPorts`
+  表（三条总线全 FD），且可由主机经 EP0 在构造期/运行时切换**——应用即改 Tx 元素的
+  FDF/BRS 标志，控制器不进 INIT 重配。每帧 `is_fdcan` 位已废弃（2026-09-12），设计
+  细节见 [README.md](README.md)「低延迟设计」。
+- **配置通道：EP0 vendor_control v2**（`app/src/usb/vendor_control.cpp`）：kGetInterface
+  握手（握手完成前 kStart 被静默拒绝）+ CAN 模式配置（本板置 `kCapCanModeSettable`，
+  host 经 kSetCanConfig+apply 位切换 TX 帧型并经 kGetCanConfig 读回）/状态查询 +
+  UART 波特率与帧格式（字长 7/8、校验无/偶/奇、停止位 1/2，稀疏 patch + apply 位，
+  先全量校验后统一提交，STALL 严格等于零改动；9 位字长不提供——RX 环是字节 DMA）。
+  payload 里的 CAN 仲裁/数据段速率与采样点字段是**核对不是配置**（位时序是本板
+  实测整定值、速率由对端电机硬件决定，只能断言）。请求码与 payload 见
+  [core vendor_control.hpp](../../core/include/libhcs/protocol/vendor_control.hpp)。
+  in-band `kUart*Config` 字段已退役（收到即拒绝并进 discard mode），运行时切波特率走
+  host 侧 `configure_uartN()`；EP0 的 UART 索引固定为 DBUS=0、UART1=1、UART2=2、
+  UART3=3、UART7=4、UART10=5（`libhcs_APP_RS485_ENABLE=OFF` 时 2/3 stall 而非重编号）。
 - **CAN 的协议与速率由电机硬件决定，不是可调参数**：仲裁段 1 Mbit/s / 数据段
   5 Mbit/s 的上限、能否上 FD，都由总线对端电机固件决定，本仓库**无法修改**
   `[硬件事实，用户确认 2026-09-12]`。吞吐/延迟优化**不要**以「升级 CAN-FD /
   提高波特率 / 改采样点」为建议方向；可行杠杆在成帧、软件路径与主机侧（见上方
   「瓶颈」分析与 [PACKET_RATE_LOG.md](PACKET_RATE_LOG.md)）。
+- **DAR 发送请求卡死有软件守护**：`AutoRetransmission=DISABLE` 命中 ST 勘误
+  ES0491 §2.22.3——仲裁在前两个 ID 位失败时，发送请求可能既不发也不取消，槽位
+  永久挂起，反复命中会让该路 TX 静默瘫痪。`Can::recover_stuck_transmits()`
+  （`app/src/can/`）每 512 趟主循环查一次 TXBRP，挂起超 20 ms 且非 bus-off 就按
+  workaround 取消释放槽位，刻意不重发（槽位复用竞态，理由在 can.cpp 注释）。
+  `[实测 2026-09-12：烧录后 mc02<->5321 双总线延迟/48 帧深突发与改前持平，0% 丢帧]`
 - **下行 CAN 帧直写硬件 FIFO，只有 FIFO 满了才进队列** [2026-08-24 修复]。
   `handle_downlink` 由 `tud_vendor_rx_cb` 在 `tud_task()` 里调用，与 `try_transmit()`
   同线程，所以直写是安全的（队列非空时必须让路，否则会插队）。
@@ -118,9 +140,17 @@ arm-none-eabi-nm firmware/mc02/build/app/mc02_app.elf | grep -c bmi088   # IMU: 
   `thread_setup`，事件线程没绑核**，而这是 [HOST_TUNING.md](../../HOST_TUNING.md) 1.3
   记的尾部最差一档。**要评估板级抖动，得先给测量工具加上绑核能力**，否则测的是主机调度。
   `[实测 2026-08-24，mc02 <-> 5321，已调优主机、事件线程未绑核]`
-- **未做**：hpm_board 那套下行流控（`transmit_queue_depth()` 决定是否再 arm OUT 包）
-  没有移植。所以队列真被打满时，mc02 仍然是静默丢弃 + 点 LED，主机无感——
-  `diag::note_tx_fail()` 在默认构建下是空实现（`libhcs_APP_CAN_DIAG` 默认 OFF）。
+- **下行流控：机制已移植但被控制器阻断，默认关闭** `[实测 2026-09-12]`。
+  hpm 的机制（`CFG_TUD_VENDOR_RX_MANUAL_XFER=1` + `usb/vendor.hpp` 四件套：手动重挂、
+  迟滞水位、20ms 逃生阀、审计钩子）已完整移植进本板源码（`usb/vendor.hpp`，宏置 1 启用），
+  但**不能在这块芯片上用**：hpm 的 ChipIdea 控制器不重挂端点就自动回 NAK，而本板的
+  DWC2 **不重挂时照样把包 ACK 进接收 FIFO 然后在 dcd 层无声丢弃**（实测：主机全速灌
+  24k 帧/s 零阻塞）；显式写 `DOEPCTL.SNAK` 扣住端点则与 TinyUSB dcd 的状态机冲突，
+  上电即死/USB 退化（`[实测 2026-09-12]`，两轮 DFU 恢复后搁置）。**正确出路**是在
+  TinyUSB fork 的 dcd_dwc2 层加每端点 NAK API（`dcd_edpt_nak/cnak`，fork 是本仓库
+  自己的），应用侧策略已就绪等它；启用前 `MANUAL_XFER` 保持 0。-->
+  `diag::note_tx_fail()` 在默认构建下仍是空实现（`libhcs_APP_CAN_DIAG` 默认 OFF），
+  过载行为维持静默丢弃 + LED。
 - 热路径 `Can::handle_uplink/handle_downlink` 与排空发送队列的
   `drain_transmit_queue`/`drain_pending_transmits_slow` 等放 `.itcm`，启动时从 FLASH 拷入；
   `try_transmit()` 已改为头文件内联的空队列快测，主循环入口是 `drain_pending_transmits()`。
@@ -134,7 +164,7 @@ arm-none-eabi-nm firmware/mc02/build/app/mc02_app.elf | grep -c bmi088   # IMU: 
 **结论先行：本版 HAL 的 `HAL_RCCEx_GetPeriphCLKFreq()` 对两个 UART 组都返回 0**
 （if/else 链只覆盖 SAI / SPI / ADC / SDMMC / SPI6 / FDCAN，`RCC_PERIPHCLK_USART16910`
 和 `RCC_PERIPHCLK_USART234578` 一个分支都没有；那两个宏本身存在，所以编译期没有任何
-提示）。后果是 `handle_config()` 拿到 0 后提前返回，**`BRR` 一次都没写过**，运行时
+提示）。后果是波特率求解路径（时名 `handle_config()`，现拆为 `solve_brr()` + `commit_brr()`）拿到 0 后提前返回，**`BRR` 一次都没写过**，运行时
 波特率请求被静默忽略，端口永远停在 CubeMX 的 115200。
 
 **正确做法**（已改成这样）：用 HAL 自己的 `UART_GETCLOCKSOURCE(handle, src)` 宏——

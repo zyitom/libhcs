@@ -262,6 +262,9 @@ int main(int argc, char** argv) {
 
     printf("\n  using %s for usb%d\n", source.pci_device().c_str(), bus);
     printf("  validated at %.1f Hz (nominal 8000)\n", source.validated_rate_hz());
+    printf(
+        "  counter modulus: %u (%d-bit wrap)\n", source.counter_modulus(),
+        source.counter_modulus() == 1024 ? 10 : 14);
 
     printf("\n=== 3. cost of one read ===\n");
     printf("  MFINDEX read      : %lld ns\n", static_cast<long long>(source.read_cost().count()));

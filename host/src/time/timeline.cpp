@@ -1,9 +1,8 @@
-#include <libhcs/time/timeline.hpp>
-
-#include <libhcs/time/microframe_timebase.hpp>
-
 #include <cmath>
 #include <cstddef>
+
+#include <libhcs/time/microframe_timebase.hpp>
+#include <libhcs/time/timeline.hpp>
 
 namespace libhcs::host::time {
 namespace {
@@ -106,8 +105,8 @@ void Timeline::refit_locked() {
     double sum_xy = 0.0;
     for (std::size_t index = 0; index < sample_count_; index++) {
         const Sample& sample = samples_[(sample_head_ + index) % kSampleCapacity];
-        const auto x = static_cast<double>(
-            static_cast<int64_t>(sample.microframe - base.microframe));
+        const auto x =
+            static_cast<double>(static_cast<int64_t>(sample.microframe - base.microframe));
         const auto y = static_cast<double>(sample.host_ns - base.host_ns);
         sum_x += x;
         sum_y += y;
@@ -143,9 +142,8 @@ std::size_t Timeline::sample_count() const {
     return sample_count_;
 }
 
-Timeline::Clock::time_point Timeline::host_time_of(uint64_t microframe) const {
-    const std::scoped_lock guard{mutex_};
-
+// Callers must hold mutex_.
+Timeline::Clock::time_point Timeline::host_time_of_locked(uint64_t microframe) const {
     // Prefer the controller's own counter when it is locked. It is the same
     // axis, read without a round trip, and it is not an estimate of the fit
     // below -- it is the quantity the fit below is trying to estimate.
@@ -157,7 +155,7 @@ Timeline::Clock::time_point Timeline::host_time_of(uint64_t microframe) const {
     if (!fitted_) {
         return origin_
              + std::chrono::nanoseconds{
-                   static_cast<int64_t>(microframe) * kMicroframePeriod.count()};
+                 static_cast<int64_t>(microframe) * kMicroframePeriod.count()};
     }
     const double ns =
         fit_reference_ns_
@@ -166,25 +164,34 @@ Timeline::Clock::time_point Timeline::host_time_of(uint64_t microframe) const {
     return Clock::time_point{std::chrono::nanoseconds{static_cast<int64_t>(std::llround(ns))}};
 }
 
+Timeline::Clock::time_point Timeline::host_time_of(uint64_t microframe) const {
+    const std::scoped_lock guard{mutex_};
+    return host_time_of_locked(microframe);
+}
+
 Timeline::Clock::time_point Timeline::host_time_of(double microframe) const {
     // Deliberately expressed as two calls to the integer form rather than as its
     // own arithmetic: whichever source is answering -- the MFINDEX counter or the
     // round-trip fit -- both endpoints come from the SAME one, so the
-    // interpolation cannot straddle a switch between them.
+    // interpolation cannot straddle a switch between them. "Same one" is
+    // enforced here, not assumed: a single mutex acquisition covers both
+    // endpoints, so a timebase attaching or dropping lock between two
+    // independent calls cannot mix sources into one interpolation.
     const double whole = std::floor(microframe);
-    const auto base = host_time_of(static_cast<uint64_t>(whole));
-    const auto next = host_time_of(static_cast<uint64_t>(whole) + 1);
+    const std::scoped_lock guard{mutex_};
+    const auto base = host_time_of_locked(static_cast<uint64_t>(whole));
+    const auto next = host_time_of_locked(static_cast<uint64_t>(whole) + 1);
     const double step_ns = std::chrono::duration<double, std::nano>{next - base}.count();
     return base
          + std::chrono::nanoseconds{
-               static_cast<int64_t>(std::llround(step_ns * (microframe - whole)))};
+             static_cast<int64_t>(std::llround(step_ns * (microframe - whole)))};
 }
 
 std::chrono::system_clock::time_point Timeline::unix_time_of(uint64_t microframe) const {
     const auto host = host_time_of(microframe);
     const std::scoped_lock guard{mutex_};
-    return unix_origin_ + std::chrono::duration_cast<std::chrono::system_clock::duration>(
-                              host - origin_);
+    return unix_origin_
+         + std::chrono::duration_cast<std::chrono::system_clock::duration>(host - origin_);
 }
 
 uint64_t Timeline::microframe_at_unix(std::chrono::system_clock::time_point when) const {

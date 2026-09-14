@@ -28,9 +28,8 @@ public:
         update_board_identity_strings();
     }
 
-    // Non-static because idProduct is decided at run time: an unrecognized board
-    // enumerates under a sentinel PID so the fault is visible in plain `lsusb`
-    // and no host tool mistakes the device for a flashable board.
+    // 非静态: idProduct 在运行时决定。未识别的板以哨兵 PID 枚举, 使故障在
+    // 朴素的 `lsusb` 里可见, 且主机工具不会把设备误认成可刷写的板。
     uint8_t const* get_device_descriptor() const {
         return reinterpret_cast<uint8_t const*>(&device_descriptor_);
     }
@@ -93,27 +92,21 @@ private:
         utility::assert_debug(cursor == serial_string_.data() + serial_string_.size());
     }
 
-    // Patch the runtime-decided half of the descriptors from the OTP board
-    // identity. A recognized board is indistinguishable from the old separate
-    // builds: it enumerates under the PID its own PCB has always used, and shows
-    // the plain bootloader product string.
+    // 用 OTP 板型身份修补描述符中运行时决定的部分。被识别的板与单板型构建
+    // 无法区分: 以其 PCB 一直使用的 PID 枚举, 显示普通 bootloader 的 product string。
     //
-    // Reporting the variant PID rather than the compile-time one matters here,
-    // not just in the app. One bootloader binary now serves both HPM5321 PCBs,
-    // and its compile-time PID can only be one of them (0x5321). Leaving it at
-    // that would make a dual board enumerate its DFU interface as 0x5321, which
-    // breaks every `dfu-util -d 0xa511:0x5322` command line in the repo
-    // (tools/flash.sh hpm5321, flash-dual-bootloader.sh, BUILD_ENVIRONMENT.md) and any
-    // udev rule keyed on it. The merge is supposed to be invisible from the host
-    // side; the PID is the one field that makes that true.
+    // 必须上报板型 PID 而非编译期 PID, 这一点在 bootloader 比在 app 更要紧:
+    // 一个 bootloader 二进制同时服务两块 HPM5321 PCB, 而编译期 PID 只能是其中
+    // 之一(0x5321)。若维持不变, 双 CAN 板的 DFU 接口会以 0x5321 枚举, 仓库里
+    // 所有 `dfu-util -d 0xa511:0x5322` 命令(tools/flash.sh hpm5321、
+    // flash-dual-bootloader.sh、BUILD_ENVIRONMENT.md)及以其为键的 udev 规则
+    // 全部失效。合并本应对主机侧不可见, PID 正是保证这一点的字段。
     //
-    // An unrecognized board deliberately becomes conspicuous instead. `lsusb`
-    // shows the sentinel PID, and the product string -- which `lsusb -v` prints
-    // and which needs no host-side support at all -- carries the offending word
-    // 25 value, so the first diagnostic step needs nothing but a USB cable. The
-    // sentinel is outside the allocated PID range, so no host tool in this repo
-    // matches it (host/src/transport/usb/device_scanner.hpp requires an exact
-    // PID) and DFU refuses the download besides.
+    // 未识别的板则刻意醒目: `lsusb` 显示哨兵 PID, product string(`lsusb -v`
+    // 可见, 无需任何主机侧支持)携带肇事 word 25 值, 首步诊断只需一根 USB 线。
+    // 哨兵 PID 在分配区间之外, 本仓库没有主机工具会匹配它
+    // (host/src/transport/usb/device_scanner.hpp 要求 PID 精确匹配), DFU 也会
+    // 拒绝下载。
     void update_board_identity_strings() {
         const auto& identity = board::board_identity();
         if (identity.recognized()) {
@@ -177,17 +170,15 @@ private:
         return buffer;
     }
 
-private: // Device Descriptor
-    // The two HPM5321 PCBs' allocated PIDs, reported from the OTP identity so one
-    // binary enumerates each PCB under its own PID. Only reachable on a board
-    // that enables the identity check; a single-variant board resolves to
-    // BoardVariant::kFixed and keeps libhcs_USB_PID below untouched.
+private: // 设备描述符
+    // 两块 HPM5321 PCB 分配到的 PID, 由 OTP 身份决定上报哪个, 使一个二进制让
+    // 每块 PCB 以自己的 PID 枚举。仅在启用身份检查的板上可达; 单板型板解析为
+    // BoardVariant::kFixed, 下面 libhcs_USB_PID 保持不动。
     static constexpr uint16_t kSingleCanProductId = 0x5321;
     static constexpr uint16_t kDualCanFdProductId = 0x5322;
 
-    // PID reported when OTP word 25 held neither known value. Stays in the 53xx
-    // block with the 5321 PCBs but is neither 0x5321 nor 0x5322, so no host tool
-    // in this repo will bind to it.
+    // OTP word 25 非任一已知值时上报的 PID。留在与 5321 PCB 同一个 53xx 段,
+    // 但既非 0x5321 也非 0x5322, 仓库内没有主机工具会绑定它。
     static constexpr uint16_t kUnknownBoardProductId = 0x53FF;
 
     static constexpr tusb_desc_device_t kDeviceDescriptor = {
@@ -207,11 +198,11 @@ private: // Device Descriptor
         .bNumConfigurations = 0x01,
     };
 
-    // Mutable copy: the constructor overrides idProduct on an unrecognized
-    // board. Everything else stays exactly as the constant above declares it.
+    // 可变副本: 构造函数在未识别板上覆写 idProduct, 其余字段与上面的常量
+    // 完全一致。
     tusb_desc_device_t device_descriptor_ = kDeviceDescriptor;
 
-private: // Configuration Descriptor
+private: // 配置描述符
     static constexpr uint8_t kItfNumDfu = 0U;
     static constexpr uint8_t kItfNumTotal = 1U;
     static constexpr size_t kConfigTotalLen = TUD_CONFIG_DESC_LEN + TUD_DFU_DESC_LEN(1);
@@ -222,7 +213,7 @@ private: // Configuration Descriptor
     };
     static_assert(sizeof(kConfigurationDescriptorFs) == kConfigTotalLen);
 
-private: // String Descriptor
+private: // 字符串描述符
     static constexpr std::array<uint8_t, 2> kLanguageId = {0x09, 0x04};
     static constexpr std::string_view kManufacturerString = "Helios";
     static constexpr std::string_view kProductString = "HCS DFU Bootloader";
@@ -230,15 +221,13 @@ private: // String Descriptor
     std::array<char, 43> serial_string_{"AF-0000-0000-0000-0000-0000-0000-0000-0000"};
     std::array<uint16_t, 128> descriptor_string_buffer_{};
 
-    // Error product string for an unrecognized board. The eight X's are
-    // overwritten with word 25 in hex by update_board_identity_strings(); the
-    // literal's length is what sizes the array, so the two cannot drift apart.
+    // 未识别板的错误 product string。八个 X 由 update_board_identity_strings()
+    // 覆写为 word 25 的十六进制; 数组大小取自该字面量的长度, 两者不会失配。
     static constexpr std::string_view kUnknownBoardPrefix = "HCS DFU UNKNOWN BOARD OTP25=0x";
     std::array<char, 39> unknown_board_string_{"HCS DFU UNKNOWN BOARD OTP25=0xXXXXXXXX"};
     static_assert(kUnknownBoardPrefix.size() + 8U == 38U);
 
-    // Product string actually reported. Points at the constant on a recognized
-    // board and at unknown_board_string_ otherwise.
+    // 实际上报的 product string。被识别时指向常量, 否则指向 unknown_board_string_。
     std::string_view product_string_{kProductString};
 };
 

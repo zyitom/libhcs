@@ -22,7 +22,6 @@ enum class DataId : uint8_t {
     kCan2 = 4,
     kCan3 = 5,
 
-
     // UART field ids match silkscreen numbers. HPM boards print UART0;
     // mc02 prints UART1/2/3/7/10 plus DBUS. Compact ids 6-12 are consecutive
     // so every UART stream uses a 1-byte field header.
@@ -52,7 +51,6 @@ enum class DataId : uint8_t {
     kCan2Config = 19,
     kCan3Config = 20,
 
-
     kUart0Config = 21,
     kUart1Config = 22,
     kUart2Config = 23,
@@ -80,7 +78,11 @@ enum class SessionType : uint8_t {
     // sends kTimeAnchor only to a board that was opened with time sync enabled.
     kTimeAnchor = 4,
     kTimeStatus = 5,
-    kSyncSample = 6,
+
+    // kSyncSample = 6 was the PTPC capture report, retired 2026-09-13 together
+    // with the SOF->PTPC measurement path it served (SOF_TIMEBASE.md 5.4: the
+    // capture-ownership premise does not hold). The number is deliberately not
+    // reused; kPulseSchedule/Report keep their values for the test builds.
 
     // Hardware pulse exchange over the GPTMR compare/capture pins (see
     // firmware/hpm_board/app/src/sync/pulse.hpp). Host asks both boards to fire
@@ -89,18 +91,18 @@ enum class SessionType : uint8_t {
     kPulseReport = 8,
 };
 
-// CAN identifier reserved for cross-board synchronisation probes. A frame with
-// this id is forwarded to the host exactly like any other, but a board running
-// the time base ALSO reports the hardware Start-of-Frame capture of it, placed
-// on the shared microframe axis.
+// Wire-layout version of the session payloads that follow a SessionHeader.
+// The EP0 fingerprint in libhcs/protocol/vendor_control.hpp folds this in, so
+// a host and a board that disagree about the session payload layout fail the
+// EP0 version check instead of corrupting stream framing.
 //
-// The point of using a CAN frame as the probe: with every controller on one
-// bus, a single transmitted frame is captured in hardware by every other
-// controller, on every board, through identical receive paths. The difference
-// between two boards' reports of the SAME frame is the cross-board skew,
-// measured rather than derived -- and because the capture is in the TSU, no
-// software path, serialization included, is inside it.
-inline constexpr uint32_t kSyncProbeCanId = 0x7DE;
+// NOT hand-bumped: the value is the generated session_layout_fingerprint()
+// from core/src/protocol/protocol.hpp, where a static_assert pins this
+// constant to the computed value -- edit a session payload and the build
+// fails until this constant is updated to the fingerprint it prints.
+// History: 1 = pre-2026-09-13 (TimeStatus carried the PTPC diagnostics block,
+// 78 B); 2 = PTPC block removed (30 B), kSyncSample retired.
+inline constexpr uint16_t kSessionWireVersion = 20862; // session_layout_fingerprint(), 2026-09-14
 
 enum class TimeState : uint8_t {
     // No usable timeline: nothing may be scheduled against it. This is the state
@@ -176,25 +178,11 @@ struct PulseReportView {
     uint8_t flags;
 };
 
-// Board -> host, unsolicited: one hardware Start-of-Frame capture of a
-// kSyncProbeCanId frame, expressed on the shared axis.
-struct SyncSampleView {
-    uint32_t nonce;
-    // First four payload bytes of the probe frame, so the host can tell which
-    // physical frame two boards are both reporting.
-    uint32_t tag;
-    // Arrival on the shared axis, Q16 microframes. One LSB is 1.9 ns, well
-    // below the ~6.25 ns the timestamp unit itself resolves.
-    uint64_t microframe_q16;
-    // Which controller captured it; only useful for spotting a bus that is not
-    // wired the way the test assumes.
-    uint8_t bus;
-    // The hardware capture before the board's own conversion, so the host can
-    // redo that conversion independently.
-    uint32_t ptpc_ns;
-};
-
 // Board -> host, answering a kTimeAnchor.
+//
+// 30 bytes on the wire since 2026-09-13: the PTPC diagnostics block (48 bytes
+// of fields that only the retired SOF->PTPC measurement path consumed) moved
+// out together with that path. Fits one 64-byte full-speed bulk packet.
 struct TimeStatusView {
     uint32_t nonce;
     // Absolute microframe once anchored; the board's own origin before that.
@@ -208,9 +196,9 @@ struct TimeStatusView {
     // USB clock. Zero while the fit has not converged.
     uint32_t ticks_per_microframe_q16;
     TimeState state;
-    // Free-running count of microframe deltas that were not exactly 1. Any
-    // increase invalidates the timeline; the host watches it to tell a clean
-    // re-anchor from a recurring hazard.
+    // Free-running count of microframe deltas that were not exactly the
+    // expected step. Any increase invalidates the timeline; the host watches it
+    // to tell a clean re-anchor from a recurring hazard.
     uint32_t anomaly_count;
 
     // How far the board's own fit was wrong, measured against SOF samples the
@@ -227,29 +215,16 @@ struct TimeStatusView {
     int32_t residual_mean_q16;
     uint32_t residual_abs_max_q16;
     uint16_t residual_count;
-    // Fitted PTPC units per microframe (nominal 120000). Zero before the fit
-    // converges.
-    uint32_t ptpc_units_per_microframe;
-    uint64_t ptpc_reference_units;
-    uint64_t ptpc_reference_microframe;
-    // Out-of-sample prediction error of the PTPC fit, in PTPC units (~1.04 ns
-    // each). Read exactly like the machine-timer residual above.
-    int32_t ptpc_residual_mean;
-    uint32_t ptpc_residual_abs_max;
-    // Raw modular step between consecutive PTPC samples, 8 ms apart. Expected
-    // 7'680'000 units; anything else means the rollover is not where the
-    // unwrapping assumes.
-    uint32_t ptpc_step_min;
-    uint32_t ptpc_step_max;
-    // Raw, unfitted sample pair from the interrupt.
-    uint32_t ptpc_raw_ns;
-    uint64_t ptpc_raw_microframe;
 };
 
 struct CanDataView {
     uint32_t can_id;
     std::span<const std::byte> can_data;
-    bool is_fdcan = false;
+    // No frame-type flag here, by design: classic-vs-FD is a property of the BUS
+    // the frame lives on, fixed by the firmware at init and read over the EP0
+    // configuration channel (libhcs/protocol/vendor_control.hpp). The per-frame
+    // header bit that used to carry it was retired 2026-09-12 -- see
+    // CanHeaderLayout in core/src/protocol/protocol.hpp.
     bool is_extended_can_id = false;
     bool is_remote_transmission = false;
     // Hardware TSU timestamp in microseconds (1 tick = 1 us, wraps ~71.6 min).
@@ -364,9 +339,6 @@ public:
     // the individual reports -- libhcs::host::time::timeline() is fed
     // regardless of whether this is overridden.
     virtual void time_status_callback(const TimeStatusView& data) { (void)data; }
-
-    // One hardware capture of a synchronisation probe frame. See SyncSampleView.
-    virtual void sync_sample_callback(const SyncSampleView& data) { (void)data; }
 
     // One completed hardware pulse exchange. See PulseReportView.
     virtual void pulse_report_callback(const PulseReportView& data) { (void)data; }

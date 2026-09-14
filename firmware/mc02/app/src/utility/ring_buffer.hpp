@@ -10,38 +10,33 @@
 
 namespace libhcs::firmware::utility {
 
-// Lock-free Single-Producer/Single-Consumer (SPSC) ring buffer
-// Inspired by Linux kfifo.
+// 无锁单生产者/单消费者(SPSC)环形队列, 思路借鉴 Linux kfifo。
 //
-// Memory orders. This header is built only by the firmware's GCC cross toolchains
-// (Cortex-M7, RV32), and every queue is used from a single core; the host SDK has its
-// own class. On these parts a memory order is two things at once:
+// memory order 取舍: 本头文件只被固件的 GCC 交叉工具链(Cortex-M7、RV32)编译,
+// 所有队列都在单核上使用(host SDK 另有自己的实现)。在这些平台上 memory order
+// 同时是两件事:
 //
-//   - A barrier instruction for other cores (DMB / FENCE). With one core it
-//     synchronizes nothing and costs one instruction per load or store that asks
-//     for it.
-//   - A constraint on the optimizer, and that is the part this queue needs. The
-//     producer and the consumer may be an interrupt and the code it preempted,
-//     so the emitted code must keep the order the algorithm relies on:
-//       * load the other side's index before touching the slots it guards --
-//         acquire, so nothing after the load is hoisted in front of it;
-//       * finish the slot writes (producer) or reads (consumer) before
-//         publishing this side's index -- release, so nothing before the store
-//         is sunk behind it.
-//     Each side is the only writer of its own index, so that load is relaxed.
-//     GCC -O3 does use the freedom a relaxed order grants: on both boards it
-//     deletes a write that an interrupt could observe between two stores.
+//   - 对其他核的屏障指令(DMB / FENCE)。单核下它什么都不同步, 只让每处需要它的
+//     load/store 多付一条指令。
+//   - 对优化器的约束 -- 这才是本队列需要的部分。生产者与消费者可能是中断与被它
+//     抢占的代码, 生成的代码必须保持算法依赖的顺序:
+//       * 触碰对方索引守护的槽位之前先加载对方索引 -- acquire,
+//         其后的访问不得上提到该加载之前;
+//       * 发布本侧索引之前完成槽位的写入(生产者)/读取(消费者) -- release,
+//         其前的访问不得下沉到该存储之后。
+//     各侧索引只有本侧一个写者, 对它的加载用 relaxed 即可。
+//     GCC -O3 确实会利用 relaxed 给予的自由度: 在两块板上都实测到它删掉了一处
+//     中断可能观察到的写入。
 //
-// std::atomic_signal_fence() could carry the store-side constraint without the
-// instruction, but a separate fence is not documented to pin a relaxed load in
-// place, so both sides keep the per-operation orders and pay the two barriers.
+// std::atomic_signal_fence() 能在不生成指令的情况下携带存储侧约束, 但标准并未
+// 文档化独立 fence 能钉住 relaxed load, 所以两侧都保留逐操作的 memory order,
+// 各付一条屏障。
 //
-// Indices are size_t, the native word. They run free and wrap modulo 2^32, a
-// multiple of every power-of-two capacity, so `in - out` is always the fill level.
-// A narrower index saves a few bytes per queue but promotes to int on subtraction
-// and needs a zero-extension after every one; and a uint32_t index is
-// `unsigned long` on these toolchains while size_t is `unsigned int`, which made
-// std::min() fail to compile for capacities of 65536 and above.
+// 索引类型是 size_t(本机字宽), 自由增长并按 2^32 回绕 -- 它是任何 2 的幂容量的
+// 公倍数, 因此 `in - out` 恒为当前填充量。更窄的索引每个队列只省几个字节, 但
+// 减法会提升为 int, 每次运算后都要零扩展; 而且在这些工具链上 uint32_t 是
+// `unsigned long` 而 size_t 是 `unsigned int`, 容量达到 65536 及以上时
+// std::min() 会编译失败。
 template <typename T, size_t max_size>
 class RingBuffer {
 public:
@@ -60,18 +55,9 @@ public:
     RingBuffer(RingBuffer&&) = delete;
     RingBuffer& operator=(RingBuffer&&) = delete;
 
-    /*!
-     * @brief Destructor
-     * Destroys all elements remaining in the buffer.
-     */
     ~RingBuffer() { clear(); }
 
-    /*!
-     * @brief Number of elements currently readable
-     * @return Count of elements available to the consumer
-     * @note Uses acquire on producer index and relaxed on consumer index to
-     *       ensure visibility of constructed elements to the consumer.
-     */
+    // 消费者侧: 可读元素数。acquire 读 in_, 保证看到生产者已构造完成的元素。
     size_t readable() const {
         const auto in = in_.load(std::memory_order::acquire);
         const auto out = out_.load(std::memory_order::relaxed);
@@ -79,12 +65,7 @@ public:
         return in - out;
     }
 
-    /*!
-     * @brief Number of free slots for producer
-     * @return Count of slots available to write
-     * @note Uses relaxed on producer index and acquire on consumer index to
-     *       avoid overrun while allowing the producer to run without contention.
-     */
+    // 生产者侧: 可写槽位数。acquire 读 out_, 避免覆写消费者尚未取走的槽位。
     size_t writable() const {
         const auto in = in_.load(std::memory_order::relaxed);
         const auto out = out_.load(std::memory_order::acquire);
@@ -92,12 +73,7 @@ public:
         return kMaxSize - (in - out);
     }
 
-    /*!
-     * @brief Peek the first element (consumer side)
-     * @return Pointer to the first element, or nullptr if empty
-     * @warning Do not call from producer thread. The pointer remains valid
-     *          until the element is popped or overwritten.
-     */
+    // 仅消费者侧调用。返回指针在被弹出或覆写前保持有效。
     T* peek_front() {
         const auto out = out_.load(std::memory_order::relaxed);
 
@@ -107,12 +83,7 @@ public:
         return std::launder(reinterpret_cast<T*>(storage_[out & kMask].data));
     }
 
-    /*!
-     * @brief Peek the last produced element (consumer side)
-     * @return Pointer to the last element, or nullptr if empty
-     * @warning Do not call from producer thread. The pointer remains valid
-     *          until the element is popped or overwritten.
-     */
+    // 仅消费者侧调用。返回指针在被弹出或覆写前保持有效。
     T* peek_back() {
         const auto in = in_.load(std::memory_order::acquire);
 
@@ -122,17 +93,9 @@ public:
         return std::launder(reinterpret_cast<T*>(storage_[(in - 1) & kMask].data));
     }
 
-    /*!
-     * @brief Batch-construct elements at the tail (producer)
-     * @tparam F Functor with signature `void(std::byte* storage)` that constructs
-     *         a `T` in-place via placement-new.
-     * @param count Maximum number of elements to construct (defaults to as many as fit)
-     * @param fail_fast If true, this function constructs nothing and returns 0
-     *        unless there is enough space for @p count elements. If false, it
-     *        constructs as many elements as currently fit (up to @p count).
-     * @return Number of elements actually constructed
-     * @note Producer-only. Publishes with release semantics.
-     */
+    // 生产者侧: 在尾部批量原地构造。F 以 `void(std::byte*)` 签名经 placement-new
+    // 构造 T; count 为上限(缺省尽量多构造), fail_fast 为 true 时空间不足则一个都
+    // 不构造并返回 0。返回实际构造数; 发布 in_ 用 release。
     template <typename F>
     requires requires(F& f, std::byte* storage) {
         { f(storage) } noexcept;
@@ -164,10 +127,6 @@ public:
         return count;
     }
 
-    /*!
-     * @brief Construct one element in-place at the tail (producer)
-     * @return true if pushed, false if buffer is full
-     */
     template <typename... Args>
     bool emplace_back(Args&&... args) {
         return emplace_back_n(
@@ -177,15 +136,6 @@ public:
             1);
     }
 
-    /*!
-     * @brief Batch-push using a generator (producer)
-     * @tparam F Functor returning a `T` to be stored
-     * @param count Maximum number to generate/push
-     * @param fail_fast If true, this function pushes nothing and returns 0
-     *        unless there is enough space for @p count elements. If false, it
-     *        pushes as many elements as currently fit (up to @p count).
-     * @return Number of elements actually pushed
-     */
     template <typename F>
     requires requires(F& f) {
         { f() } noexcept;
@@ -200,18 +150,10 @@ public:
             count, fail_fast);
     }
 
-    /*!
-     * @brief Push a copy of value (producer)
-     * @return true if pushed, false if buffer is full
-     */
     bool push_back(const T& value) {
         return emplace_back_n(
             [&](std::byte* storage) noexcept(noexcept(T{value})) { new (storage) T{value}; }, 1);
     }
-    /*!
-     * @brief Push by moving value (producer)
-     * @return true if pushed, false if buffer is full
-     */
     bool push_back(T&& value) {
         return emplace_back_n(
             [&](std::byte* storage) noexcept(noexcept(T{std::move(value)})) {
@@ -220,13 +162,8 @@ public:
             1);
     }
 
-    /*!
-     * @brief Batch-pop elements from the head (consumer)
-     * @tparam F Functor with signature `void(T)` receiving moved-out elements
-     * @param count Maximum number of elements to pop (defaults to all available)
-     * @return Number of elements actually popped
-     * @note Consumer-only. Consumes with release on `out_` and destroys elements.
-     */
+    // 消费者侧: 从头部批量弹出并销毁, F 以 `void(T)` 签名接收移出的元素;
+    // count 缺省为全部可读元素。发布 out_ 用 release。
     template <typename F>
     requires requires(F& f, T& t) {
         { f(std::move(t)) } noexcept;
@@ -257,10 +194,6 @@ public:
         return count;
     }
 
-    /*!
-     * @brief Pop one element (consumer)
-     * @return true if an element was popped, false if empty
-     */
     template <typename F>
     requires requires(F& f, T& t) {
         { f(std::move(t)) } noexcept;
@@ -268,10 +201,6 @@ public:
         return pop_front_n(std::forward<F>(callback_functor), 1);
     }
 
-    /*!
-     * @brief Clear the buffer by consuming all elements
-     * @return Number of elements that were erased
-     */
     size_t clear() {
         return pop_front_n([](const T&) noexcept {});
     }

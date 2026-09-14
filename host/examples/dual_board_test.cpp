@@ -85,10 +85,11 @@ constexpr auto kEchoTimeout = std::chrono::milliseconds{20};
 std::string g_serial_a;
 std::string g_serial_b;
 
-bool use_fdcan() {
-    const char* classic = std::getenv("HCS_CAN_CLASSIC");
-    return !(classic && classic[0] == '1');
-}
+// The HCS_CAN_CLASSIC opt-out this tool used to honour is gone with the
+// per-frame is_fdcan flag: the frame type is a property of the BUS, fixed by
+// the firmware's port table, and every bus on this rig's Hpm5321 boards runs
+// CAN-FD. Frames go out in the bus's mode and the host cannot -- and need not
+// -- choose.
 
 // Opt-in for a rig whose two CAN cables are swapped (A.CAN1 wired to B.CAN2 and
 // A.CAN2 to B.CAN1). Frames still cross a real bus between two independent
@@ -451,7 +452,7 @@ void link_can_handler(void* context, int bus, const libhcs::data::CanDataView& d
 }
 
 bool link_can_direction(
-    Node& source, Node& sink, int bus, const char* label, bool fd, uint32_t token) {
+    Node& source, Node& sink, int bus, const char* label, uint32_t token) {
     LinkProbe probe;
     sink.set_can_handler(&probe, link_can_handler);
     source.set_can_handler(nullptr, nullptr);
@@ -465,8 +466,7 @@ bool link_can_direction(
         transmit_can(
             source.board(), bus,
             {.can_id = kCanIdBase + static_cast<uint32_t>(bus),
-             .can_data = payload,
-             .is_fdcan = fd});
+             .can_data = payload});
         std::this_thread::sleep_for(std::chrono::milliseconds{5});
         if (probe.matched.load(std::memory_order_relaxed) > 0)
             break;
@@ -553,21 +553,20 @@ int run_link() {
     Node board_b{g_serial_b, -1, "hcs-b"};
     std::this_thread::sleep_for(std::chrono::milliseconds{300});
 
-    const bool fd = use_fdcan();
-    printf("link check (%s)\n", fd ? "CAN-FD 1M/5M BRS" : "classic CAN 1M");
+    printf("link check (frames follow the bus mode: CAN-FD 1M/5M BRS)\n");
     // CAN numbers everywhere in this tool are the ones printed on the
     // enclosure, 1-based. They used to be the 0-based logical index, which cost
     // an afternoon of physical-layer debugging on a port that had no cable in
     // it, because "CAN1" meant different connectors to the two people saying it.
     bool all_ok = true;
     all_ok &= link_can_direction(
-        board_a, board_b, 0, "A.CAN1 -> B.CAN1", fd, 0x11110000);
+        board_a, board_b, 0, "A.CAN1 -> B.CAN1", 0x11110000);
     all_ok &= link_can_direction(
-        board_b, board_a, 0, "B.CAN1 -> A.CAN1", fd, 0x22220000);
+        board_b, board_a, 0, "B.CAN1 -> A.CAN1", 0x22220000);
     all_ok &= link_can_direction(
-        board_a, board_b, 1, "A.CAN2 -> B.CAN2", fd, 0x33330000);
+        board_a, board_b, 1, "A.CAN2 -> B.CAN2", 0x33330000);
     all_ok &= link_can_direction(
-        board_b, board_a, 1, "B.CAN2 -> A.CAN2", fd, 0x44440000);
+        board_b, board_a, 1, "B.CAN2 -> A.CAN2", 0x44440000);
     all_ok &= link_uart_direction(board_a, board_b, "A.UART0 -> B.UART0");
     all_ok &= link_uart_direction(board_b, board_a, "B.UART0 -> A.UART0");
 
@@ -640,7 +639,7 @@ private:
             wrong_bus_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        if (data.can_id != expected_id_ || data.is_fdcan != use_fdcan() || data.is_extended_can_id
+        if (data.can_id != expected_id_ || data.is_extended_can_id
             || data.is_remote_transmission || data.can_data.size() != kPayloadSize) {
             invalid_.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -714,11 +713,11 @@ int run_latency(int bus, uint32_t samples, int core_a, int core_b, int core_main
     probe.set_landing_bus(landing_bus);
     board_b.set_can_handler(&probe, LatencyProbe::handler);
 
-    const bool fd = use_fdcan();
     printf(
-        "A.CAN%d -> B.CAN%d, %u samples after %u warm-up (%s)%s\n", bus + 1,
+        "A.CAN%d -> B.CAN%d, %u samples after %u warm-up (frames follow the bus mode: "
+        "CAN-FD 1M/5M BRS)%s\n", bus + 1,
         landing_bus + 1, samples,
-        kWarmupSamples, fd ? "CAN-FD 1M/5M BRS" : "classic CAN 1M",
+        kWarmupSamples,
         crossed_rig() ? "  [HCS_CAN_CROSSED=1: swapped-cable rig]" : "");
 
     std::vector<double> latencies;
@@ -740,8 +739,7 @@ int run_latency(int bus, uint32_t samples, int core_a, int core_b, int core_main
         transmit_can(
             board_a.board(), bus,
             {.can_id = kCanIdBase + static_cast<uint32_t>(bus),
-             .can_data = payload,
-             .is_fdcan = fd});
+             .can_data = payload});
 
         double latency_us = 0.0;
         double uplink_us = 0.0;
@@ -859,7 +857,6 @@ int run_contend(
         static_cast<Sink*>(context)->count.fetch_add(1, std::memory_order_relaxed);
     });
 
-    const bool fd = use_fdcan();
     std::atomic<bool> running{true};
     std::atomic<uint64_t> load_sent{0};
     std::thread load_thread{[&]() {
@@ -876,7 +873,7 @@ int run_contend(
             put_u32_le(payload + 4, mix(static_cast<uint32_t>(sequence)));
             transmit_can(
                 board_b.board(), 1,
-                {.can_id = kCanIdBase + 1, .can_data = payload, .is_fdcan = fd});
+                {.can_id = kCanIdBase + 1, .can_data = payload});
             load_sent.fetch_add(1, std::memory_order_relaxed);
             next += period;
             while (running.load(std::memory_order_relaxed) && Clock::now() < next) {}
@@ -884,8 +881,8 @@ int run_contend(
     }};
 
     printf(
-        "A.CAN1 -> B.CAN1 latency while A.CAN2 -> B.CAN2 runs at %u frames/s (%s)\n", load_hz,
-        fd ? "CAN-FD" : "classic");
+        "A.CAN1 -> B.CAN1 latency while A.CAN2 -> B.CAN2 runs at %u frames/s (CAN-FD)\n",
+        load_hz);
     std::this_thread::sleep_for(std::chrono::milliseconds{200});
 
     std::vector<double> latencies;
@@ -897,7 +894,7 @@ int run_contend(
         put_u32_le(payload + 4, mix(sequence));
         probe.arm(sequence, Clock::now());
         transmit_can(
-            board_a.board(), 0, {.can_id = kCanIdBase, .can_data = payload, .is_fdcan = fd});
+            board_a.board(), 0, {.can_id = kCanIdBase, .can_data = payload});
 
         double latency_us = 0.0, uplink_us = 0.0;
         bool has_uplink = false;
@@ -965,7 +962,6 @@ int run_uart_contend(
     UartLoadSink load_sink;
     board_b.set_uart_handler(&load_sink, uart_load_handler);
 
-    const bool fd = use_fdcan();
     std::atomic<bool> running{true};
     std::atomic<uint64_t> load_sent{0};
     std::thread load_thread{[&]() {
@@ -1007,8 +1003,8 @@ int run_uart_contend(
     }};
 
     printf(
-        "A.CAN1 -> B.CAN1 latency while A.UART0 -> B.UART0 runs at %u kB/s (%s)\n", uart_kbps,
-        fd ? "CAN-FD" : "classic");
+        "A.CAN1 -> B.CAN1 latency while A.UART0 -> B.UART0 runs at %u kB/s (CAN-FD)\n",
+        uart_kbps);
     std::this_thread::sleep_for(std::chrono::milliseconds{200});
 
     const auto start = Clock::now();
@@ -1021,7 +1017,7 @@ int run_uart_contend(
         put_u32_le(payload + 4, mix(sequence));
         probe.arm(sequence, Clock::now());
         transmit_can(
-            board_a.board(), 0, {.can_id = kCanIdBase, .can_data = payload, .is_fdcan = fd});
+            board_a.board(), 0, {.can_id = kCanIdBase, .can_data = payload});
 
         double latency_us = 0.0, uplink_us = 0.0;
         bool has_uplink = false;
@@ -1247,8 +1243,7 @@ int run_dual(uint32_t samples) {
     DualCounter counter;
     board_b.set_can_handler(&counter, dual_handler);
 
-    const bool fd = use_fdcan();
-    printf("both buses in parallel: %u frames per bus (%s)\n", samples, fd ? "CAN-FD" : "classic");
+    printf("both buses in parallel: %u frames per bus (CAN-FD)\n", samples);
 
     for (uint32_t sequence = 0; sequence < samples; ++sequence) {
         std::byte payload[kPayloadSize];
@@ -1259,9 +1254,9 @@ int run_dual(uint32_t samples) {
         // between the two CAN paths would surface.
         auto builder = board_a.board().start_transmit();
         builder.can_transmit(
-            CanPort::kCan1, {.can_id = kCanIdBase + 0, .can_data = payload, .is_fdcan = fd});
+            CanPort::kCan1, {.can_id = kCanIdBase + 0, .can_data = payload});
         builder.can_transmit(
-            CanPort::kCan2, {.can_id = kCanIdBase + 1, .can_data = payload, .is_fdcan = fd});
+            CanPort::kCan2, {.can_id = kCanIdBase + 1, .can_data = payload});
         std::this_thread::sleep_for(std::chrono::microseconds{300});
     }
     std::this_thread::sleep_for(std::chrono::milliseconds{300});
@@ -1493,10 +1488,9 @@ int run_stress(uint32_t frames_per_sec, uint32_t seconds, int buses, int per_pac
         last_rx = record;
     });
 
-    const bool fd = use_fdcan();
     printf(
-        "stress: %u frames/s per bus on %d bus(es) for %u s (%s)\n", frames_per_sec, buses, seconds,
-        fd ? "CAN-FD 1M/5M BRS" : "classic CAN 1M");
+        "stress: %u frames/s per bus on %d bus(es) for %u s (frames follow the bus mode: "
+        "CAN-FD 1M/5M BRS)\n", frames_per_sec, buses, seconds);
 
     // `frames_per_sec` counts FRAMES per bus, and `per_packet` of them ride in
     // one USB packet, so the loop iterates frames_per_sec/per_packet times a
@@ -1533,10 +1527,10 @@ int run_stress(uint32_t frames_per_sec, uint32_t seconds, int buses, int per_pac
                 put_u32_le(payload, static_cast<uint32_t>(sequence));
                 put_u32_le(payload + 4, mix(static_cast<uint32_t>(sequence)));
                 builder.can_transmit(CanPort::kCan1, 
-                    {.can_id = kCanIdBase + 0, .can_data = payload, .is_fdcan = fd});
+                    {.can_id = kCanIdBase + 0, .can_data = payload});
                 if (buses > 1)
                     builder.can_transmit(CanPort::kCan2, 
-                        {.can_id = kCanIdBase + 1, .can_data = payload, .is_fdcan = fd});
+                        {.can_id = kCanIdBase + 1, .can_data = payload});
             }
         }
 
@@ -1601,7 +1595,6 @@ struct FrameEcho {
     std::atomic<bool> got{false};
     std::atomic<uint32_t> can_id{0};
     std::atomic<size_t> length{0};
-    std::atomic<bool> is_fd{false};
     std::atomic<bool> is_extended{false};
     std::atomic<bool> is_rtr{false};
     std::atomic<bool> payload_ok{false};
@@ -1611,7 +1604,6 @@ void frame_handler(void* context, int /*bus*/, const libhcs::data::CanDataView& 
     auto* echo = static_cast<FrameEcho*>(context);
     echo->can_id.store(data.can_id, std::memory_order_relaxed);
     echo->length.store(data.can_data.size(), std::memory_order_relaxed);
-    echo->is_fd.store(data.is_fdcan, std::memory_order_relaxed);
     echo->is_extended.store(data.is_extended_can_id, std::memory_order_relaxed);
     echo->is_rtr.store(data.is_remote_transmission, std::memory_order_relaxed);
     bool ok = true;
@@ -1622,7 +1614,7 @@ void frame_handler(void* context, int /*bus*/, const libhcs::data::CanDataView& 
 }
 
 bool frame_case(
-    Node& source, Node& sink, uint32_t can_id, size_t length, bool fd, bool extended, bool rtr) {
+    Node& source, Node& sink, uint32_t can_id, size_t length, bool extended, bool rtr) {
     FrameEcho echo;
     sink.set_can_handler(&echo, frame_handler);
 
@@ -1636,7 +1628,6 @@ bool frame_case(
             source.board(), 0,
             {.can_id = can_id,
              .can_data = payload,
-             .is_fdcan = fd,
              .is_extended_can_id = extended,
              .is_remote_transmission = rtr});
     } catch (const std::exception&) {
@@ -1656,7 +1647,6 @@ bool frame_case(
         verdict = "DROPPED";
     else if (
         echo.can_id.load(std::memory_order_relaxed) != can_id
-        || echo.is_fd.load(std::memory_order_relaxed) != fd
         || echo.is_extended.load(std::memory_order_relaxed) != extended
         || echo.is_rtr.load(std::memory_order_relaxed) != rtr)
         verdict = "ATTR-MISMATCH";
@@ -1667,13 +1657,15 @@ bool frame_case(
     else
         verdict = "ok";
 
+    // The first column names the WIRE format, which is the bus's compiled mode
+    // -- the host no longer chooses it per frame, so every case here is sent
+    // the same way.
     printf(
-        "  %-8s %-3s id=0x%-8X len=%-2zu %-4s -> %-16s", fd ? "CAN-FD" : "classic",
+        "  %-8s %-3s id=0x%-8X len=%-2zu %-4s -> %-16s", "bus-mode",
         extended ? "ext" : "std", can_id, length, rtr ? "RTR" : "", verdict);
     if (arrived)
         printf(
-            " (rx len=%zu fd=%d ext=%d rtr=%d)", echo.length.load(std::memory_order_relaxed),
-            static_cast<int>(echo.is_fd.load(std::memory_order_relaxed)),
+            " (rx len=%zu ext=%d rtr=%d)", echo.length.load(std::memory_order_relaxed),
             static_cast<int>(echo.is_extended.load(std::memory_order_relaxed)),
             static_cast<int>(echo.is_rtr.load(std::memory_order_relaxed)));
     printf("\n");
@@ -1694,26 +1686,25 @@ int run_frames() {
         ok_count += result ? 1 : 0;
     };
 
-    printf(" classic CAN, payload 0..8:\n");
+    // There is no classic-vs-FD axis any more: every frame goes out in the
+    // bus's compiled mode (CAN-FD on this rig). The payload-0..8 and
+    // extended-ID blocks keep covering the shapes the wire protocol carries.
+    printf(" payload 0..8, standard ids:\n");
     for (size_t length = 0; length <= 8; ++length)
-        check(frame_case(board_a, board_b, 0x100 + length, length, false, false, false));
+        check(frame_case(board_a, board_b, 0x100 + length, length, false, false));
 
-    printf(" CAN-FD, payload 0..8 (message RAM element size):\n");
-    for (size_t length = 0; length <= 8; ++length)
-        check(frame_case(board_a, board_b, 0x200 + length, length, true, false, false));
-
-    printf(" CAN-FD, payload beyond 8 bytes (valid FD DLCs):\n");
+    printf(" payload beyond 8 bytes (valid FD DLCs on the wire; the protocol\n");
+    printf(" caps the host view at 8, so these are rejected before the bus):\n");
     for (const size_t length : {12U, 16U, 20U, 24U, 32U, 48U, 64U})
-        check(frame_case(board_a, board_b, 0x300, length, true, false, false));
+        check(frame_case(board_a, board_b, 0x300, length, false, false));
 
     printf(" extended identifiers:\n");
-    check(frame_case(board_a, board_b, 0x1ABCDEF, 8, false, true, false));
-    check(frame_case(board_a, board_b, 0x1ABCDEF, 8, true, true, false));
-    check(frame_case(board_a, board_b, 0x7FF, 8, false, false, false));
-    check(frame_case(board_a, board_b, 0x1FFFFFFF, 8, false, true, false));
+    check(frame_case(board_a, board_b, 0x1ABCDEF, 8, true, false));
+    check(frame_case(board_a, board_b, 0x7FF, 8, false, false));
+    check(frame_case(board_a, board_b, 0x1FFFFFFF, 8, true, false));
 
-    printf(" remote transmission request (classic only):\n");
-    check(frame_case(board_a, board_b, 0x400, 0, false, false, true));
+    printf(" remote transmission request:\n");
+    check(frame_case(board_a, board_b, 0x400, 0, false, true));
 
     printf("frames: %zu/%zu shapes round-tripped intact\n", ok_count, total);
     return ok_count == total ? 0 : 1;

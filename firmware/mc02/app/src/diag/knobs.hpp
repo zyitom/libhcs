@@ -2,32 +2,23 @@
 
 #include <cstdint>
 
-// Debugger-writable knobs and read-only mirrors, for bringing a peripheral up
-// against real hardware without a host, a protocol change or a rebuild between
-// each attempt. Ozone's Watched Data window updates and accepts writes while the
-// program runs (Cortex-M7 background memory access), so these turn a debug
-// session into a control panel: type a frequency, hear it.
+// 供调试器读写的开关与只读镜像, 用于在没有上位机、不改协议、不重编译的前提下
+// 对着真实硬件反复调外设。Ozone 的 Watched Data 窗口能在程序运行中刷新并接受
+// 写入(Cortex-M7 后台内存访问), 调试会话由此变成一块控制面板: 输入一个频率就能听见。
 //
-// Why mirrors rather than watching the objects directly. The raw samples are
-// already watchable at libhcs::firmware::adc::mc02_samples, but reading a
-// battery voltage from them means averaging sixteen half-words and applying the
-// divider by hand on every glance. millivolts() cannot be watched instead --
-// Ozone evaluates symbol expressions, it does not call target functions, so the
-// only way to see a computed value is for the target to compute it into a
-// variable. That is what battery_mv is.
+// 为何用镜像而不直接观察对象: 原始采样在 libhcs::firmware::adc::mc02_samples
+// 本就可见, 但每次想看电池电压都得手工对 16 个半字求平均再乘分压比; millivolts()
+// 则无法被观察 -- Ozone 只对符号表达式求值, 不会调用目标机函数, 想看到计算值
+// 就只能由目标机把它算进一个变量, battery_mv 即为此而生。
 //
-// Why writing tone_hz beats poking TIM12->ARR from the debugger, which needs no
-// firmware support at all: writing the register tests the transducer and
-// nothing else, while writing a frequency here goes through the same
-// Buzzer::set_tone() the application uses, so the reload arithmetic and the
-// duty-cycle mapping are under test too.
+// 为何写 tone_hz 好过在调试器里改 TIM12->ARR(后者本就无需固件支持): 改寄存器
+// 只测到发声器本身, 而这里写入与应用走同一个 Buzzer::set_tone(), 重装载运算与
+// 占空比映射也一并受测。
 //
-// Compiled out entirely by default. Cost when enabled is one HAL_GetTick() read
-// and a compare per main-loop pass; the work below runs at kPollIntervalMs.
-// That bound is deliberate -- this board's downlink packet rate is a strong,
-// non-monotonic function of the main-loop period (see firmware/mc02/AGENTS.md),
-// so unconditional per-pass work would move throughput benchmarks by more than
-// the effect most of them are trying to measure.
+// 默认整体编译剔除。开启后每轮主循环的开销为一次 HAL_GetTick() 读加一次比较,
+// 其余工作按 kPollIntervalMs 节流。该上限是刻意的: 本板下行包速率对主循环周期
+// 高度敏感且非单调(见 firmware/mc02/AGENTS.md), 无条件的每轮工作带来的偏移
+// 会超过多数基准想要测量的效应本身。
 
 namespace libhcs::firmware::diag::knobs {
 
@@ -35,35 +26,32 @@ namespace libhcs::firmware::diag::knobs {
 
 inline constexpr bool kEnabled = true;
 
-// Write to sound a tone; 0 silences. Anything under Buzzer::kMinFrequencyHz
-// (100 Hz) also silences, which is what set_tone() does with it.
+// 写入即发声, 0 静音; 低于 Buzzer::kMinFrequencyHz(100 Hz)同样静音,
+// 与交给 set_tone() 处理的结果一致。
 inline volatile uint16_t tone_hz = 0;
-// 0..255. 255 maps to a 50% duty cycle, the loudest a passive buzzer gets.
+// 0..255。255 对应 50% 占空比, 即无源蜂鸣器的最响档。
 inline volatile uint8_t tone_loudness = 128;
 
-// Note-name alternative to tone_hz, so a pitch can be typed as a pitch.
-// tone_semitone takes a buzzer::Pitch value (0 = C, 1 = C#, ... 11 = B) and
-// tone_octave a scientific-pitch octave, so {9, 4} is A4 = 440 Hz. They go
-// through the same buzzer::pitch() the kBootMelody constants use, which is the
-// point: the octave shift is under test, not just the PWM.
+// tone_hz 的音名替代, 让音高可以按音高本身输入。tone_semitone 取 buzzer::Pitch
+// 值(0 = C, 1 = C#, ... 11 = B), tone_octave 取 scientific pitch 八度,
+// 如 {9, 4} 即 A4 = 440 Hz。与 kBootMelody 常量同样走 buzzer::pitch(),
+// 重点在于八度换算也一并受测, 而不只是 PWM。
 //
-// The two knobs cannot both drive the channel, so tone_semitone arbitrates:
-// kSemitoneOff, the default, hands control back to tone_hz, which leaves a
-// build that never touches these behaving exactly as it did before they
-// existed. Out-of-range values silence instead -- a debugger writes these bytes
-// with no validation of its own, and pitch() would otherwise index
-// kOctave4Hz[] off its end or shift past what its uint16_t return can hold.
+// 两个开关不能同时驱动通道, 由 tone_semitone 仲裁: 缺省 kSemitoneOff 时把控制权
+// 交还 tone_hz, 从不触碰这些变量的构建行为与从前完全一致。越界值静音而非出错 --
+// 调试器写入这些字节时自身不做任何校验, 否则 pitch() 会越界索引 kOctave4Hz[],
+// 或移位超出其 uint16_t 返回值能表示的范围。
 inline constexpr int8_t kSemitoneOff = -1;
 inline constexpr int8_t kSemitoneMax = 11;
 
-// Above this the 1 MHz counter cannot express the pitch usefully: B9 is
-// 15808 Hz, a reload of 63, and one octave further overflows pitch().
+// 超过此八度, 1 MHz 计数器已无法有效表达音高: B9 为 15808 Hz, 重装载值仅 63,
+// 再高一个八度则溢出 pitch()。
 inline constexpr uint8_t kMaxOctave = 9;
 
 inline volatile int8_t tone_semitone = kSemitoneOff;
 inline volatile uint8_t tone_octave = 5;
 
-// Read-only mirrors of the battery gauge, refreshed at kPollIntervalMs.
+// 电量计的只读镜像, 按 kPollIntervalMs 刷新。
 inline volatile uint32_t battery_raw = 0;
 inline volatile uint32_t battery_mv = 0;
 inline volatile uint8_t battery_started = 0;

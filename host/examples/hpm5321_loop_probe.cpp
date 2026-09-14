@@ -167,13 +167,13 @@ int main(int argc, char** argv) {
                     {
                         auto builder = board_a.start_transmit();
                         builder.can_transmit(CanPort::kCan1, 
-                            {.can_id = kCanIdA, .can_data = payload, .is_fdcan = true});
+                            {.can_id = kCanIdA, .can_data = payload});
                     }
                     packets.fetch_add(1, std::memory_order_relaxed);
                     if (board_b) {
                         auto builder = board_b->start_transmit();
                         builder.can_transmit(CanPort::kCan2, 
-                            {.can_id = kCanIdB, .can_data = payload, .is_fdcan = true});
+                            {.can_id = kCanIdB, .can_data = payload});
                         packets.fetch_add(1, std::memory_order_relaxed);
                     }
                     std::this_thread::sleep_until(next);

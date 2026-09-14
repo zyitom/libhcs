@@ -15,14 +15,10 @@
 #include "firmware/mc02/bootloader/src/utility/jump.hpp"
 
 int main() {
-    // The bootloader runs cache-less, mirroring the c_board (Cortex-M4) design.
-    // With the D-cache enabled, every flash read in the DFU validate path
-    // (CRC32 / SHA-256 / vector-table check) depends on manual cache
-    // invalidation after each flash program; any gap leaves the validator
-    // reading stale data, which makes a freshly-flashed image fail validation
-    // and the device fall back into DFU. The bootloader only drives USB DFU and
-    // flash programming, neither of which benefits from caching, so we leave the
-    // caches and MPU off entirely to keep flash and RAM trivially coherent.
+    // bootloader 无缓存运行。若开 D-cache, DFU 校验路径(SHA-256 / 向量表检查)的
+    // 每次 flash 读取都依赖编程后的手动缓存失效; 一旦遗漏就会读到旧数据, 使刚
+    // 烧写的镜像校验失败、设备退回 DFU。bootloader 只驱动 USB DFU 与 flash 编程,
+    // 均无缓存收益, 因此彻底关闭缓存与 MPU, 让 flash 与 RAM 天然保持一致。
     HAL_Init();
     SystemClock_Config();
 
@@ -37,14 +33,12 @@ int main() {
 
     using namespace libhcs::firmware; // NOLINT(google-build-using-namespace)
 
-    // Holding the user key at reset pins the board in DFU regardless of what the
-    // mailbox says, so a bad image can always be recovered from.
+    // 复位时按住用户按键可无视 mailbox 内容强制停留在 DFU, 坏镜像因此总能救回。
     const bool force_stay = HAL_GPIO_ReadPin(KEY_GPIO_Port, KEY_Pin) == GPIO_PIN_RESET;
 
-    // A single mailbox read covers both directions: the application asks for DFU
-    // with "DFU0", and the DFU download path asks for the freshly flashed image
-    // with "APP1". The latter wins over a stale DFU request so the reset that
-    // follows manifestation lands in the application instead of back in DFU.
+    // 一次 mailbox 读取覆盖两个方向: 应用以 "DFU0" 请求进入 DFU, DFU 下载路径
+    // 以 "APP1" 请求启动刚烧写的镜像。后者优先于残留的 DFU 请求, 使 manifest 后
+    // 的复位落在应用而不是回到 DFU。
     const uint32_t boot_request = utility::boot_mailbox.consume_request();
     const bool force_dfu = boot_request == utility::BootMailbox::kMailboxRequestEnterDfu;
     const bool boot_app_once = boot_request == utility::BootMailbox::kMailboxRequestBootAppOnce;
@@ -53,11 +47,9 @@ int main() {
             utility::jump_to_app(flash::kAppStartAddress);
     }
 
-    // Reaching here means DFU. Report why, in the order the decision above made
-    // it: the key overrides everything, then an explicit host request, then a
-    // half-written previous session, and otherwise the image simply is not
-    // usable. Set before tusb_rhport_init() -- string descriptors are read
-    // during enumeration and never refreshed afterwards.
+    // 走到这里即进入 DFU。按上方判定的优先级上报原因: 按键优先于一切, 其次是
+    // 主机显式请求, 再次是上次半途而废的会话, 其余情况即镜像不可用。必须在
+    // tusb_rhport_init() 之前设置 -- 字符串描述符只在枚举时读取, 此后不再刷新。
     usb::get_usb_descriptors().set_entry_reason(
         force_stay ? usb::DfuEntryReason::kUserKey
         : force_dfu ? usb::DfuEntryReason::kHostRequest

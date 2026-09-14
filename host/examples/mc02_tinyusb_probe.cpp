@@ -28,7 +28,6 @@ struct UartEvent {
 struct CanEvent {
     uint32_t id;
     std::vector<std::byte> payload;
-    bool is_fdcan;
     bool is_extended;
 };
 
@@ -49,9 +48,7 @@ public:
         });
     }
 
-    bool wait_can(
-        int bus, uint32_t id, std::span<const std::byte> expected, bool is_fdcan,
-        bool is_extended) {
+    bool wait_can(int bus, uint32_t id, std::span<const std::byte> expected, bool is_extended) {
         std::unique_lock lock{mutex_};
         return condition_.wait_for(lock, 500ms, [&] {
             auto& queue = can_[static_cast<size_t>(bus)];
@@ -59,7 +56,7 @@ public:
                 auto event = std::move(queue.front());
                 queue.pop_front();
                 if (event.id == id && std::ranges::equal(event.payload, expected)
-                    && event.is_fdcan == is_fdcan && event.is_extended == is_extended) {
+                    && event.is_extended == is_extended) {
                     return true;
                 }
             }
@@ -98,7 +95,6 @@ private:
             can_[static_cast<size_t>(bus)].push_back({
                 data.can_id,
                 {data.can_data.begin(), data.can_data.end()},
-                data.is_fdcan,
                 data.is_extended_can_id
             });
         }
@@ -129,10 +125,11 @@ void transmit_uart(Board& board, int port, std::span<const std::byte> payload) {
 }
 
 void configure_uart_pair(Board& board, uint32_t baudrate) {
-    auto builder = board.start_transmit();
-    builder.uart7_config({.baudrate = baudrate});
-    builder.uart10_config({.baudrate = baudrate});
-    std::this_thread::sleep_for(300ms);
+    // EP0 reconfiguration: synchronous and read-back-verified, so unlike the
+    // retired in-band config field nothing here needs a settle sleep before the
+    // loopback traffic starts.
+    board.configure_uart7(baudrate);
+    board.configure_uart10(baudrate);
 }
 
 class UartRestore final {
@@ -181,14 +178,12 @@ bool run_uart_case(
     return ok;
 }
 
-void transmit_can(
-    Board& board, int bus, uint32_t id, std::span<const std::byte> payload, bool is_fdcan,
+void transmit_can(Board& board, int bus, uint32_t id, std::span<const std::byte> payload,
     bool is_extended) {
     auto builder = board.start_transmit();
     const libhcs::data::CanDataView data{
         .can_id = id,
         .can_data = payload,
-        .is_fdcan = is_fdcan,
         .is_extended_can_id = is_extended,
     };
     if (bus == 1)
@@ -198,20 +193,23 @@ void transmit_can(
 }
 
 bool run_can_case(
-    Board& board, Receiver& receiver, int tx_bus, int rx_bus, bool is_fdcan, bool is_extended,
+    Board& board, Receiver& receiver, int tx_bus, int rx_bus, bool is_extended,
     size_t payload_size, uint32_t rounds) {
+    // The frame type is the TX bus's own compiled mode -- mc02 runs all three
+    // buses CAN-FD -- so the case name reports what the wire actually carries.
+    const bool bus_is_fd = tx_bus == 1 ? board.can2_is_fd() : board.can3_is_fd();
     uint32_t passed = 0;
     for (uint32_t sequence = 0; sequence < rounds; ++sequence) {
         const auto payload = make_payload(payload_size, sequence);
         const uint32_t id = is_extended ? 0x1234500U + sequence : 0x500U + (sequence & 0xFFU);
-        transmit_can(board, tx_bus, id, payload, is_fdcan, is_extended);
-        if (receiver.wait_can(rx_bus, id, payload, is_fdcan, is_extended))
+        transmit_can(board, tx_bus, id, payload, is_extended);
+        if (receiver.wait_can(rx_bus, id, payload, is_extended))
             ++passed;
     }
     const bool ok = passed == rounds;
     std::println(
         "CAN{} -> CAN{} {} {} payload={}: {}/{} {}", tx_bus, rx_bus,
-        is_fdcan ? "FD+BRS" : "classic", is_extended ? "extended" : "standard", payload_size,
+        bus_is_fd ? "FD+BRS" : "classic", is_extended ? "extended" : "standard", payload_size,
         passed, rounds, ok ? "PASS" : "FAIL");
     return ok;
 }
@@ -251,14 +249,10 @@ int main(int argc, char** argv) {
     }
 
     if (mode != "uart") {
-        for (const bool is_fdcan : {false, true}) {
-            for (const bool is_extended : {false, true}) {
-                for (const size_t payload_size : {0U, 8U}) {
-                    ok &= run_can_case(
-                        board, receiver, 1, 2, is_fdcan, is_extended, payload_size, 100);
-                    ok &= run_can_case(
-                        board, receiver, 2, 1, is_fdcan, is_extended, payload_size, 100);
-                }
+        for (const bool is_extended : {false, true}) {
+            for (const size_t payload_size : {0U, 8U}) {
+                ok &= run_can_case(board, receiver, 1, 2, is_extended, payload_size, 100);
+                ok &= run_can_case(board, receiver, 2, 1, is_extended, payload_size, 100);
             }
         }
     }

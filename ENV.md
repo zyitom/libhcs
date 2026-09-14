@@ -31,15 +31,17 @@ MounRiver WCH GCC15，当前机器和 `libhcs-ci` 镜像均已安装。
 ## 本机实际安装状态
 
 **机器相关状态只在这一节维护**，其他文档（根 `AGENTS.md`、各板文档）一律引用这里，
-不要复制。下表 2026-09-11 逐条 `ls` 复核。
+不要复制。下表 2026-09-11 逐条 `ls` 复核；2026-09-12 复核了 ARM / HPM / WCH 三行
+（WCH 本机缺失，`ch32_board` 未能本机编译验证）。
 
 | 工具 | 本机位置 | 状态 |
 |---|---|---|
-| ARM GCC | `/opt/arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi`（**15.2.rel1**，非上方版本表要求的 15.3.rel1；不在 PATH，要手工加） | 已装 |
-| RISC-V GCC（HPM）13.2.0 | `~/3rd_party/hpm/rv32imac_zicsr_zifencei_multilib_b_ext-linux`（含 `bin/` 的工具链根，`GNURISCV_TOOLCHAIN_PATH` 指向它） | 已装 |
-| HPM OpenOCD | `~/3rd_party/hpm/openocd-linux-x86_64`（同目录还有 `openocd-build`、`openocd-src` 和一份 `hpm_sdk` 副本） | 已装 |
-| RISC-V GCC（WCH）15.2.0 | `~/3rd_party/MRS_Toolchain_Linux_X64_V240/Toolchain/RISC-V Embedded GCC15`；同包 `OpenOCD/OpenOCD` 是 WCH OpenOCD | 已装，**`ch32_board` 本机可编可烧** |
+| ARM GCC 15.3.rel1 | `~/3rd_party/arm-gnu-toolchain-15.3.rel1-x86_64-arm-none-eabi`（不在 PATH，要手工加，见下方） | 已装 |
+| RISC-V GCC（HPM）13.2.0 | `~/3rd_party/rv32imac_zicsr_zifencei_multilib_b_ext-linux`（含 `bin/` 的工具链根，`GNURISCV_TOOLCHAIN_PATH` 指向它；注意在 `~/3rd_party/` 顶层，不在 `hpm/` 子目录） | 已装 |
+| HPM OpenOCD | 未找到（`~/3rd_party/hpm/` 下现只有 `HPMicro_Manufacturing_Tool_v0.6.0`）；如需重装见下方 HPM 一节 | **未装**（hpm 调试统一 J-Link，本仓库流程不使用） |
+| RISC-V GCC（WCH）15.2.0 | `~/3rd_party/MRS_Toolchain_Linux_X64_V240/Toolchain/RISC-V Embedded GCC15`；同包 `OpenOCD/OpenOCD` 是 WCH OpenOCD | **未装**，`ch32_board` 本机不可编 |
 | SEGGER | `/opt/SEGGER/JLink`（→ `JLink_V948`）、`/opt/SEGGER/Ozone_V340j` | 已装（J-Link V9.48 / Ozone V3.40j） |
+| LLVM 20 | 仅 `/usr/bin/clangd-20`（未建 `clangd` 软链）；`clang-format-20` / `clang-tidy-20` 未装 | 部分安装。lint 门禁在 Docker/CI 内执行；本机只有 VS Code cpptools 扩展附带的 clang-format 23.1 可做相对检查 |
 | 其他 | `~/3rd_party/Xuantie-900-*`（T-Head GCC）、`~/3rd_party/soem-1.4.0`（EtherCAT 归档遗留）、`nvtop` | 与仓库固件流程无关 |
 
 > 换机器后本表必然过期：按上文各节重装，然后**只更新本表**，不要往别的文档里写
@@ -144,6 +146,10 @@ docker buildx build --platform linux/amd64 --target ci \
   白名单映射 USB；不要把该权限加回通用 CI/开发容器。
 
 ## 宿主机调试工具（可选，不进 Docker）
+
+**探针分工是硬约束** `[用户确认 2026-09-12]`：`c_board` / `mc02` / `hpm_board` 的调试
+与需要调试器的烧录**只用 J-Link**——不要建议 ST-Link，也不要建议 OpenOCD（HPM SDK
+自带的 OpenOCD 流程本仓库不使用）；`ch32_board` 只用 WCH-Link(E)，见本节末尾。
 
 SEGGER 工具只安装在需要连接实体调试器的 Linux x86_64 开发机上：
 

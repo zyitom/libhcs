@@ -65,8 +65,8 @@ public:
 
 private:
     void compute_serial() {
-        // idProduct is the fixed mc02 board-type PID (0x0723), matching the bootloader
-        // and the DFU image suffix. Per-device identity lives in the serial number below.
+        // idProduct 是 mc02 板型的固定 PID(0x0723), 与 bootloader 及 DFU 镜像
+        // 后缀一致。每台设备的区分信息在下方序列号中。
         std::array<uint32_t, 3> uid{HAL_GetUIDw0(), HAL_GetUIDw1(), HAL_GetUIDw2()};
         mix_uid_entropy(uid);
 
@@ -96,7 +96,7 @@ private:
         return buf;
     }
 
-private: // Device Descriptor
+private: // 设备描述符
     tusb_desc_device_t device_descriptor_{
         .bLength = sizeof(tusb_desc_device_t),
         .bDescriptorType = TUSB_DESC_DEVICE,
@@ -118,7 +118,7 @@ private: // Device Descriptor
         .bNumConfigurations = 0x01,
     };
 
-private: // Configuration Descriptor
+private: // 配置描述符
          // NOLINTNEXTLINE(cppcoreguidelines-use-enum-class)
     enum InterfaceNumber : uint8_t {
         kItfNumVendor = 0,
@@ -130,6 +130,9 @@ private: // Configuration Descriptor
                                             + CFG_TUD_VENDOR * TUD_VENDOR_DESC_LEN
                                             + CFG_TUD_DFU_RUNTIME * TUD_DFU_RT_DESC_LEN;
 
+    // vendor 批量端点号。usb/vendor.hpp 的下行流控审计钩子要读 OUT 端点的
+    // 在途状态, 因此公开(与 hpm_board 的 UsbDescriptors 一致)。
+  public:
     static constexpr uint8_t kEpnumVendorDataOut = 0x01;
     static constexpr uint8_t kEpnumVendorDataIn = 0x81;
 
@@ -142,7 +145,7 @@ private: // Configuration Descriptor
     };
     static_assert(sizeof(kConfigurationDescriptor) == kConfigTotalLen);
 
-private: // String Descriptor
+private: // 字符串描述符
     static constexpr std::array<uint8_t, 2> kLanguageId = {0x09, 0x04};
     static constexpr std::string_view kManufacturerString = "Helios";
     static constexpr std::string_view kProductString =

@@ -29,20 +29,14 @@ public:
         downlink_full_reset_counter_.store(5000, std::memory_order::relaxed);
     }
 
-    // Polled from the main loop, but paced off SysTick so the patterns are
-    // independent of the loop cadence. No SPI transmit happens in any ISR
-    // context.
+    // 主循环轮询, 但以 SysTick 节流, 使图案与主循环节奏无关。任何 ISR 上下文中
+    // 都不发生 SPI 发送。
     //
-    // The tick MUST be a millisecond count, not a loop-iteration count: run()
-    // spins at 69-85 kHz depending on build options and load (measured with
-    // libhcs_APP_LOOP_PROFILE; an earlier version of this comment said 380 kHz,
-    // which was never measured and is out by about 4.5x). Counting iterations
-    // therefore ran every pattern tens of times too fast -- the buffer-full blink
-    // and the breathing cycle both landed far above flicker fusion, so each read
-    // as a steady half-brightness colour rather than an animation. Gating here also
-    // makes the 5000-count reset windows below span the 5 seconds their
-    // magnitude implies instead of 13 ms, and stops the WS2812 frame from being
-    // re-sent thousands of times a second.
+    // tick 必须是毫秒计数而非循环迭代计数: run() 视构建选项与负载以 69-85 kHz
+    // 旋转(libhcs_APP_LOOP_PROFILE 实测)。按迭代计数曾让每个图案快几十倍 --
+    // buffer-full 闪烁与呼吸周期都远超闪烁融合频率, 读起来是恒定的半亮颜色而非
+    // 动画。在此节流还使下面 5000 计数的复位窗口名副其实地跨 5 秒而非 13 ms,
+    // 并避免 WS2812 帧每秒被重发数千次。
     void poll() {
         if (user_controlling_.load(std::memory_order::relaxed))
             return;
@@ -84,12 +78,12 @@ public:
             else
                 set_value(0, 255, 255);
         } else if (host_connected_.load(std::memory_order::relaxed)) {
-            // Host session established (nonce handshake done, keepalive lease
-            // live): steady green means data is actually being forwarded.
+            // 主机会话已建立(nonce 握手完成、keepalive 租约有效): 常亮绿色表示
+            // 数据确实在转发。
             set_value(0, 255, 0);
         } else {
-            // Alive but no host session yet: green breathing light. Enumerated
-            // without a live session still shows as "waiting", not "working".
+            // 存活但尚无主机会话: 绿色呼吸灯。已枚举但无会话仍呈等待态而非
+            // 工作态。
             auto brightness = (tick >> 2) & 511;
             if (brightness > 255)
                 brightness = 511 - brightness;
@@ -101,7 +95,7 @@ public:
         host_connected_.store(connected, std::memory_order::relaxed);
     }
 
-    // Non-static to ensure instantiation
+    // 刻意保持非静态以确保实例化
     // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
     void set_value(uint8_t red, uint8_t green, uint8_t blue) {
         static uint32_t last_color = 0;
@@ -110,16 +104,14 @@ public:
         if (color == last_color)
             return;
 
-        // SPI6 is a D3-domain peripheral, so its only DMA path is BDMA, which
-        // reaches D3 SRAM (0x38000000) but never AXI/D2 SRAM -- keep the WS2812
-        // frame buffer in .d3_sram, 32-byte aligned and padded to a cache-line
-        // multiple so it can be cleaned from D-cache before BDMA reads it.
+        // SPI6 属 D3 域外设, 唯一的 DMA 路径是 BDMA, 后者只够到 D3 SRAM
+        // (0x38000000), 永远够不到 AXI/D2 SRAM -- WS2812 帧缓冲因此放 .d3_sram,
+        // 32 字节对齐并补齐到 cache line 整数倍, 便于 BDMA 读取前从 D-cache 清洗。
         alignas(32) [[gnu::section(".d3_sram")]] static uint8_t txbuf[128];
 
-        // Skip if BDMA is still shifting out the previous frame; the next colour
-        // change retries, so last_color is committed only on a successful launch.
-        // Replaces the old ~165 us blocking HAL_SPI_Transmit that stalled the
-        // forwarding loop on every colour step of the breathing animation.
+        // BDMA 仍在移出上一帧时跳过; 下次颜色变化会重试, 故 last_color 只在成功
+        // 启动传输后才提交。阻塞式发送(约 165 us)会在呼吸动画的每次颜色步进上
+        // 卡住转发循环, 不可接受。
         if (HAL_SPI_GetState(&hspi6) != HAL_SPI_STATE_READY)
             return;
 

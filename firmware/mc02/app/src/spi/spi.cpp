@@ -7,7 +7,7 @@
 
 namespace libhcs::firmware::spi {
 
-// Completion callback; fires when HAL_SPI_TransmitReceive_DMA finishes.
+// HAL_SPI_TransmitReceive_DMA 完成时触发的回调。
 extern "C" void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef* hal_spi_handle) {
     if (hal_spi_handle == &hspi2) {
         spi1->it_transfer_complete_callback();

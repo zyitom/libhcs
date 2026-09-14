@@ -10,10 +10,9 @@ namespace libhcs::firmware::usb {
 
 extern "C" {
 
-// USB0 interrupt vector. The HPM SDK leaves the concrete ISR in the example
-// family.c (which this project does not build), so bind it here in app code and
-// keep both third-party submodules pristine. Without it the DFU stack never sees
-// a USB event and the bootloader cannot enumerate.
+// USB0 中断向量。HPM SDK 把具体 ISR 留在示例 family.c 里(本项目不构建它),
+// 因此在应用代码中绑定, 保持两个第三方子模块原封不动。缺少它 DFU 栈收不到
+// 任何 USB 事件, bootloader 无法枚举。
 
 SDK_DECLARE_EXT_ISR_M(IRQn_USB0, hcs_usb0_isr)
 void hcs_usb0_isr(void) { dcd_int_handler(0); }

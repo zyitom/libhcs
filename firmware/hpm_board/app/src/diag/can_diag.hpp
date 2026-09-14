@@ -1,29 +1,22 @@
 #pragma once
 
-// Telemetry for the CAN forwarding stall described in
-// ecat/CORE_SWAP_MIGRATION.md section 6: on the single-core image (USB + CAN on
-// the same PLIC) the host stops receiving forwarded frames at high load, and the
-// condition is permanent until reset. The board has no JTAG or serial console
-// wired here, so the state that would normally be read with a halting debugger
-// is sampled from the main loop and shipped out as a UART0 uplink frame instead.
+// 针对 CAN 转发停滞的遥测(缘起见 ecat/CORE_SWAP_MIGRATION.md 第 6 节): 单核镜像
+// (USB 与 CAN 同挂一个 PLIC)高负载时, 主机停止收到转发帧, 且持续到复位为止。
+// 本板没有接 JTAG 或串口控制台, 正常要用停机调试器读的状态改为在主循环采样, 作为
+// UART0 上行帧发出。
 //
-// The host session provably survives the stall -- protocol::Handler terminates
-// the process if a keepalive ack goes unanswered, and the original runs kept
-// printing for their full 20 s -- so the uplink is still alive while CAN traffic
-// is not. That is what makes main-loop telemetry a usable channel: whatever
-// stops, it is not the path this record travels on.
+// 停滞期间主机会话仍在运行 -- protocol::Handler 在 keepalive ack 无应答时会终止
+// 进程, 而当时的运行全程都在打印 -- 所以数据面停了, 这些记录途经的路径也没停。
+// 这正是主循环遥测可用的前提。
 //
-// The record deliberately mixes three layers so one snapshot can tell them
-// apart:
-//   * ISR entry counts        -- is the CAN interrupt still being delivered?
-//   * MCAN IR/RXF0S/PSR/ECR   -- does the controller still see bus traffic?
-//   * PLIC pending/enable     -- is a source asserting but never delivered?
-// A frozen entry count with a non-empty RXF0S and a set PLIC pending bit means
-// the interrupt was lost between the gateway and the core; a frozen entry count
-// with an idle RXF0S and a bus-off PSR means the controller stopped instead.
+// 一条快照刻意混装三层, 以便区分故障位置:
+//   * ISR 进入计数          -- CAN 中断还在送达吗?
+//   * MCAN IR/RXF0S/PSR/ECR -- 控制器还看得到总线流量吗?
+//   * PLIC pending/enable   -- 是否有源在请求却从未送达?
+// 进入计数冻结 + RXF0S 非空 + PLIC pending 置位 = 中断丢在网关与核之间;
+// 进入计数冻结 + RXF0S 空闲 + PSR bus-off = 停的是控制器本身。
 //
-// Compiled out unless libhcs_APP_CAN_DIAG is set, so the forwarding hot path
-// carries nothing in production builds.
+// 未定义 libhcs_APP_CAN_DIAG 时整体编译消失, 生产构建的转发热路径零开销。
 
 #include <cstddef>
 #include <cstdint>
@@ -34,45 +27,39 @@ namespace libhcs::firmware::diag {
 
 inline constexpr bool kEnabled = true;
 
-// Wire format of the UART0 uplink payload. Little endian, fixed layout so the
-// host decoder needs no length negotiation.
+// UART0 上行负载的线上格式。小端、定长布局, 主机解码器无需长度协商。
 inline constexpr std::uint8_t kRecordMagic = 0xD1U;
 inline constexpr std::uint8_t kRecordVersion = 6U;
 
-// Hot-path notifications. All are a single relaxed atomic add; the CAN ISR calls
-// the first two per interrupt and per forwarded frame respectively.
+// 热路径通知。全部是单次 relaxed 原子加; CAN ISR 分别按每次中断、每个转发帧调用
+// 前两个。
 void note_isr_entry(std::size_t can_index);
 void note_frame(std::size_t can_index);
 void note_tx_fail(std::size_t can_index);
 void note_alloc_fail();
 
-// One increment per main-loop iteration. Reported as iterations since the
-// previous record, which divided by the record period gives the loop period --
-// the latency a downlink byte or an uplink batch pays waiting for its turn.
+// 主循环每迭代自增一次。按相对上一条记录的迭代数上报, 除以记录周期即得循环周期
+// -- 下行字节或上行批在轮到它之前要付的等待延迟。
 void note_main_loop();
 
-// Counted by Can::poll() each time it releases a stuck PLIC claim.
+// 由 Can::poll() 每次释放卡住的 PLIC claim 时计数。
 void note_irq_recovered(std::size_t can_index);
 
-// USB bulk OUT endpoint timing, called from the receive completion callback.
-// Splits the per-packet budget into the only two parts that matter for deciding
-// whether chaining multiple qTDs is worth anything:
+// USB bulk OUT 端点计时, 由接收完成回调调用。把每包开销拆成判断链式 qTD 是否
+// 值得做的仅有的两段:
 //
-//   turnaround = complete -> re-armed. Device-side. This is the part a chained
-//                qTD removes, because the next buffer would already be primed
-//                when the current transfer completes.
-//   starve     = re-armed -> next complete. The endpoint is ready and idle; what
-//                elapses here is bus time plus however long the host controller
-//                takes to issue the next token. Chaining qTDs cannot shorten it.
+//   turnaround = complete -> 重挂。设备侧。链式 qTD 消除的就是它: 当前传输完成时
+//                下一个缓冲已备好。
+//   starve     = 重挂 -> 下一次 complete。端点就绪且空闲, 这里流逝的是总线时间加
+//                主机控制器发出下一个 token 的耗时, 链式 qTD 缩短不了。
 //
-// Both are sampled with CSR_MCYCLE (one instruction, core-clock resolution) so
-// the measurement does not perturb what it measures -- the record's own history
-// has an entry about an observer destroying its subject.
+// 两者都用 CSR_MCYCLE 采样(一条指令, 核时钟分辨率), 测量不扰动被测对象 --
+// 本记录自身的历史里就有一条"观察者摧毁被测对象"的教训。
 void note_usb_out_complete();
 void note_usb_out_armed();
 
-// Main-loop sampler. Emits one record every kEmitPeriodMs of the 1 kHz tick;
-// a no-op when the uplink is not carrying data.
+// 主循环采样器。每 kEmitPeriodMs 个 1 kHz tick 发出一条记录; 上行未在传数据时
+// 为空操作。
 void poll(std::uint32_t tick);
 
 #else

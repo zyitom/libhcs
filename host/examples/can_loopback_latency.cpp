@@ -41,7 +41,7 @@
 
 namespace {
 
-constexpr bool kUseCanFd = false;          // classic CAN 2.0; match your bus
+constexpr bool kUseCanFd = false;          // what YOUR bus runs (no per-frame switch)
 constexpr uint32_t kPingCanId = 0x555;     // unique on the loopback bus
 constexpr uint32_t kPingCount = 2000;      // samples to collect
 // Pause between pings. Tunable because it is the knob that decides whether the
@@ -57,7 +57,7 @@ constexpr auto kEchoTimeout = std::chrono::milliseconds{50};     // give-up per 
 
 // Approximate on-wire time of one frame, subtracted to isolate board+USB.
 // Classic 1 Mbit standard-id 8-byte frame ~= 108-115 bit times. CAN-FD with BRS
-// (1 Mbit arb / 5 Mbit data) is much shorter; adjust if you set kUseCanFd.
+// (1 Mbit arb / 5 Mbit data) is much shorter; adjust if your bus runs FD.
 constexpr double kCanWireTimeUs = kUseCanFd ? 50.0 : 115.0;
 
 std::atomic<bool> g_running{true};
@@ -101,7 +101,7 @@ public:
         ping_seq_.store(seq, std::memory_order_release);  // publishes send_tp_
 
         board_->transmit([&](examples::BoardTransmitter& tx) {
-            tx.can(0, {.can_id = kPingCanId, .can_data = frame, .is_fdcan = kUseCanFd});
+            tx.can(0, {.can_id = kPingCanId, .can_data = frame});
         });
     }
 
@@ -192,7 +192,7 @@ int main() {
     if (rtt_us.empty()) {
         fprintf(stderr,
             "No echoes received. Check the bus0<->bus1 loopback wiring, termination,\n"
-            "and that kUseCanFd matches the bus. (%u lost)\n", lost);
+            "and that kUseCanFd matches the bus's compiled mode. (%u lost)\n", lost);
         return 1;
     }
 

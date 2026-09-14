@@ -74,29 +74,29 @@ public:
 
         core::utility::assert_debug(spi_.try_lock());
 
-        // Reset all registers to reset value.
+        // 复位所有寄存器。
         write_register(RegisterAddress::kGyroSoftReset, 0xB6);
         timer::timer->spin_wait(30ms);
 
-        // "Who am I" check.
+        // "Who am I" 芯片 ID 校验。
         core::utility::assert_always(read_and_confirm(RegisterAddress::kGyroChipId, 0x0F));
 
-        // Enable new data interrupt.
+        // 使能新数据中断。
         core::utility::assert_always(write_and_confirm(RegisterAddress::kGyroIntCtrl, 0x80));
 
-        // Set both INT3 and INT4 as push-pull, active-low.
+        // INT3/INT4 均配为推挽, 低有效。
         core::utility::assert_always(write_and_confirm(RegisterAddress::kInt3Int4IoConf, 0b0000));
-        // Map data ready interrupt to INT3.
+        // 数据就绪中断映射到 INT3。
         core::utility::assert_always(write_and_confirm(RegisterAddress::kInt3Int4IoMap, 0x01));
 
-        // Set ODR and filter bandwidth.
+        // 设置 ODR 与滤波带宽。
         core::utility::assert_always(
             write_and_confirm(RegisterAddress::kGyroBandwidth, 0x80 | static_cast<uint8_t>(rate)));
-        // Set data range.
+        // 设置量程。
         core::utility::assert_always(
             write_and_confirm(RegisterAddress::kGyroRange, static_cast<uint8_t>(range)));
 
-        // Switch to normal mode.
+        // 切到 normal 模式。
         core::utility::assert_always(write_and_confirm(RegisterAddress::kGyroLpm1, 0x00));
 
         spi_.unlock();

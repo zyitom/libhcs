@@ -1,10 +1,9 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <format>
-#include <iostream>
-#include <print>
 #include <string_view>
 #include <utility>
 
@@ -120,41 +119,51 @@ public: // Logging.Raw
 private:
     constexpr Logger() noexcept = default;
 
+    static constexpr std::string_view level_name(Level level) {
+        if (level == Level::kTrace)
+            return "trace";
+        if (level == Level::kDebug)
+            return "debug";
+        if (level == Level::kInfo)
+            return "info";
+        if (level == Level::kWarn)
+            return "warn";
+        if (level == Level::kErr)
+            return "error";
+        if (level == Level::kCritical)
+            return "critical";
+        core::utility::assert_failed_debug();
+    }
+
+    // One line, one write. stderr is unbuffered, so the previous prefix-write
+    // plus println-write pair was two write(2) syscalls per line, and two
+    // threads logging concurrently tore each other's lines apart mid-line.
+    // Formatting into a single stack buffer and emitting it with one fwrite
+    // costs no lock and no allocation on the caller, and the kernel delivers
+    // each write() whole. Longer messages truncate: a log line is not a
+    // storage format.
     template <typename... Args>
     void log_internal(Level level, std::format_string<Args...> fmt, Args&&... args) {
         if (!should_log(level))
             return;
 
-        print_prefix(level);
-        std::println(std::cerr, fmt, std::forward<Args>(args)...);
+        // Uninitialized on purpose: exactly the bytes that were written below
+        // are emitted, so a zero-fill would be a 1 KiB memset per log line
+        // bought for nothing.
+        std::array<char, 1024> line;
+        const auto prefix =
+            std::format_to_n(line.data(), line.size() - 1, "[libhcs] [{}] ", level_name(level));
+        const auto remaining = static_cast<std::size_t>(line.data() + line.size() - 1 - prefix.out);
+        const auto message =
+            std::format_to_n(prefix.out, remaining, fmt, std::forward<Args>(args)...);
+        *message.out = '\n';
+        std::fwrite(
+            line.data(), 1, static_cast<std::size_t>(message.out - line.data()) + 1, stderr);
     }
 
     template <typename T>
     void log_internal(Level level, const T& msg) {
-        if (!should_log(level))
-            return;
-
-        print_prefix(level);
-        std::cerr << msg << '\n';
-    }
-
-    static void print_prefix(Level level) {
-        std::string_view level_text = [level]() constexpr -> std::string_view {
-            if (level == Level::kTrace)
-                return "trace";
-            if (level == Level::kDebug)
-                return "debug";
-            if (level == Level::kInfo)
-                return "info";
-            if (level == Level::kWarn)
-                return "warn";
-            if (level == Level::kErr)
-                return "error";
-            if (level == Level::kCritical)
-                return "critical";
-            core::utility::assert_failed_debug();
-        }();
-        std::print(std::cerr, "[libhcs] [{}] ", level_text);
+        log_internal(level, "{}", msg);
     }
 };
 

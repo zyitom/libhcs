@@ -34,8 +34,7 @@ auto current = Section::kOther;
 
 std::uint32_t last_emit_ms = 0;
 
-// Reused across emissions; the record is built here and handed to the
-// serializer, which copies it into the uplink batch before this returns.
+// 跨多次发送复用; 记录在此组装并交给 serializer, 其会在返回前拷入上行批量池。
 std::array<char, 320> line{};
 
 char* put_decimal(char* cursor, const char* end, std::uint32_t value) {
@@ -91,12 +90,11 @@ void end_pass() {
     if (pass_count == 0U)
         return;
 
-    // "loop n=<passes> khz=<pass rate> avg=<cycles> max=<cycles> | <name>
-    // <permille of total> <avg cycles> <max cycles> | ..."
+    // 输出格式: "loop n=<轮数> khz=<每 ms 轮数> avg=<平均周期> max=<最大周期>
+    // | <段名> <占总量千分比> <平均周期> <最大周期> | ..."
     //
-    // Permille rather than percent because the small sections would otherwise
-    // all read as 0, and integer-only because pulling in soft-float formatting
-    // for a diagnostic would be worse than reading tenths of a percent.
+    // 用千分比而非百分比: 小段按百分比会全部显示为 0; 只用整数: 为一个诊断引入
+    // 软浮点格式化不值得, 读作千分之几即可。
     char* cursor = line.data();
     const char* const end = line.data() + line.size();
 

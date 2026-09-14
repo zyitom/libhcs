@@ -47,9 +47,19 @@ Full-Speed，**转发吞吐的杠杆在 CAN 侧（CAN-FD），不在 USB 侧**�
 
 - **FDCAN 内核时钟 = 80 MHz**，来自 PLL2（`PeriphCommonClock_Config`）。这是唯一能整除
   出精确 5 Mbit/s 数据段的取法（24 MHz 的 HSE 做不到）。
-- **CAN-FD 逐帧切换**：控制器**常驻** FD+BRS 模式（它是经典 CAN 的超集）；每一帧的格式
-  通过发送元素的 FDF/BRS 位、按主机下发的 `is_fdcan` 标志决定——热路径上**不做 INIT
-  模式重配置**。
+- **CAN-FD 帧类型跟随总线，且可由主机切换**：控制器**常驻** FD+BRS 模式（它是经典
+  CAN 的超集，收方向不受影响）；发送帧型默认取 `can.hpp` 的 `kCanPorts` 表（三条总线
+  全部 FD），主机可经 EP0（`usb/vendor_control.cpp`）在构造期或运行时切换——应用就是
+  改 Tx 元素的 FDF/BRS 标志，**不进 INIT 模式、不重新初始化**（EP0 v2 的
+  `kSetCanConfig` + `kCanConfigApply` 位，读回经 `kGetCanConfig`；hpm 板没有这个能力
+  位，对它们该请求退化为断言）。payload 里的仲裁/数据段速率字段永远是核对不是配置：
+  速率由对端电机硬件决定 `[硬件事实，用户确认 2026-09-12]`。
+  每帧 `is_fdcan` 位已废弃 [2026-09-12]，见 `core/src/protocol/protocol.hpp` 的
+  `CanHeaderLayout`；下面的逐帧切换描述仅作历史保留：
+
+  > **历史 [2026-09-12 废弃]**：2026-09-12 之前，每一帧的格式通过发送元素的 FDF/BRS 位、
+  > 按主机下发的 `is_fdcan` 标志逐帧决定。该位在线协议中已删除，主机不能再逐帧选择帧类型
+  > （改为按总线经 EP0 配置）；对端发来的 classic 帧仍照常接收（FD 是超集）。
 - **硬件接收时间戳：已禁用**（代码已注释保留）。FDCAN 内部计数器只有 16 位，1 tick =
   1 个标称位时间 = 1 us @ 1 Mbit/s，约 65.5 ms 就回绕，无法满足 `CanDataView::timestamp_us`
   约定的 32 位微秒语义（主机端按 32 位回绕做差分会周期性算出负值）。上行不再携带该字段，
@@ -116,8 +126,8 @@ Full-Speed，**转发吞吐的杠杆在 CAN 侧（CAN-FD），不在 USB 侧**�
 
 - 时钟树里 **FDCAN = 80 MHz**（来自 PLL2）。
 - FDCAN1/2/3 的 `FrameFormat = FD_BRS`，数据段 5 Mbit/s，标称段 1 Mbit/s。
-- FDCAN **元素数据长度保持 8 字节**——`MessageRAMOffset` 那两个值（`0x406` / `0x812`）
-  是按 8 字节元素算的；改成 64 字节元素会导致区域重叠。
+- FDCAN **元素数据长度保持 8 字节**——`MessageRAMOffset` 那两个值（`0x200` / `0x400`）
+  是按 8 字节元素（16 B，即 4 词）算的；改成 64 字节元素会导致区域重叠。
 - SPI2 波特率 <= 10 MHz（BMI088 的上限）；当前分频系数 32（约 5.7 MHz）。
 
 > 相关约束见[仓库根 AGENTS.md 的 CubeMX BSP 修改纪律](../../AGENTS.md#cubemx-bsp-修改纪律)：

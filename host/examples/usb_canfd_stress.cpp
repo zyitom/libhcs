@@ -93,7 +93,6 @@ struct CorruptionEvidence {
     CorruptionKind kind = CorruptionKind::kLength;
     size_t length = 0;
     uint32_t can_id = 0;
-    bool is_fdcan = false;
     bool is_extended_can_id = false;
     bool is_remote_transmission = false;
     std::array<std::byte, kPayloadBytes> payload{};
@@ -127,7 +126,6 @@ struct Stream {
         item.kind = kind;
         item.length = data.can_data.size();
         item.can_id = data.can_id;
-        item.is_fdcan = data.is_fdcan;
         item.is_extended_can_id = data.is_extended_can_id;
         item.is_remote_transmission = data.is_remote_transmission;
         const size_t copied = std::min(item.payload.size(), data.can_data.size());
@@ -142,7 +140,7 @@ struct Stream {
             rx.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        if (!data.is_fdcan || data.is_extended_can_id || data.is_remote_transmission
+        if (data.is_extended_can_id || data.is_remote_transmission
             || data.can_id != expected_can_id) {
             bad_header.fetch_add(1, std::memory_order_relaxed);
             record_corruption(CorruptionKind::kHeader, data);
@@ -244,9 +242,8 @@ void print_corruption_evidence(const char* tag, const Stream& stream) {
             continue;
 
         printf(
-            "    bad[%zu] kind=%s len=%zu id=0x%08x fd=%u ext=%u rtr=%u payload=", index,
+            "    bad[%zu] kind=%s len=%zu id=0x%08x ext=%u rtr=%u payload=", index,
             corruption_kind_name(item.kind), item.length, item.can_id,
-            static_cast<unsigned>(item.is_fdcan),
             static_cast<unsigned>(item.is_extended_can_id),
             static_cast<unsigned>(item.is_remote_transmission));
         const size_t payload_size = std::min(item.length, item.payload.size());
@@ -313,9 +310,9 @@ int main(int argc, char** argv) {
                 // equality check catches a command lost at any layer.
                 board.start_transmit()
                     .can_transmit(CanPort::kCan0,
-                        {.can_id = kCanId0, .can_data = a, .is_fdcan = true})
+                        {.can_id = kCanId0, .can_data = a})
                     .can_transmit(CanPort::kCan2,
-                        {.can_id = kCanId2, .can_data = b, .is_fdcan = true});
+                        {.can_id = kCanId2, .can_data = b});
 
                 rx.pair01.tx.fetch_add(1, std::memory_order_relaxed);
                 rx.pair23.tx.fetch_add(1, std::memory_order_relaxed);

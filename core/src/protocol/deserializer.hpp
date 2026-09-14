@@ -62,8 +62,6 @@ public:
 
     virtual void time_status_deserialized_callback(const data::TimeStatusView& data) { (void)data; }
 
-    virtual void sync_sample_deserialized_callback(const data::SyncSampleView& data) { (void)data; }
-
     virtual void pulse_schedule_deserialized_callback(const data::PulseScheduleView& data) {
         (void)data;
     }

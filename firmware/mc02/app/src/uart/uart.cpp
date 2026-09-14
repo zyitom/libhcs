@@ -8,9 +8,8 @@ namespace libhcs::firmware::uart {
 
 namespace {
 
-// USART2 / USART3 are UartRs485, a different type, and are reached through
-// get_rs485_instance_from_dma() below for the same reason UART5 is reached
-// through get_dbus_instance_from_dma().
+// USART2 / USART3 是不同类型 UartRs485, 经下方 get_rs485_instance_from_dma()
+// 访问, 理由与 UART5 经 get_dbus_instance_from_dma() 访问相同。
 Uart& get_uart_instance(UART_HandleTypeDef* hal_uart_handle) {
     if (hal_uart_handle == &huart1)
         return *uart1;
@@ -102,9 +101,8 @@ extern "C" void HAL_UART_ErrorCallback(UART_HandleTypeDef* hal_uart_handle) {
 extern "C" void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef* hal_uart_handle, uint16_t size) {
     (void)size;
 
-    // The HAL raises this for both IDLE and DMA transfer-complete events. The
-    // stream is circular over the whole ring and wraps on its own, so a transfer
-    // completion carries no information; only the IDLE event does.
+    // HAL 对 IDLE 与 DMA 传输完成两种事件都会调用本回调。流是覆盖整个 ring 的
+    // 循环传输并自行回绕, 传输完成不携带信息, 只有 IDLE 事件有意义。
     if (HAL_UARTEx_GetRxEventType(hal_uart_handle) != HAL_UART_RXEVENT_IDLE)
         return;
 

@@ -15,9 +15,9 @@ inline void jump_to_app(uint32_t app_address) {
 
     __disable_irq();
 
-    // Bootloader runs cache-less and with the MPU off (see main.cpp), so there is
-    // nothing to tear down here. Cache-maintenance ops with the cache disabled
-    // fault on Cortex-M7. The app re-enables caches/MPU in its own startup.
+    // bootloader 无缓存且 MPU 关闭运行(见 main.cpp), 此处无需额外清理; 缓存关闭
+    // 时执行缓存维护指令会在 Cortex-M7 上 fault。缓存与 MPU 由应用自身的启动
+    // 代码重新开启。
     HAL_MPU_Disable();
 
     HAL_RCC_DeInit();

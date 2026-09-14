@@ -18,10 +18,8 @@ struct BootMailbox {
         request = 0;
     }
 
-    // Written by the DFU download path once a candidate image has passed
-    // validation, so the reset that follows manifestation boots the new
-    // application instead of re-entering DFU. The magic is stored last as a
-    // commit barrier (see the app-side mailbox).
+    // 由 DFU 下载路径在候选镜像通过校验后写入, 使 manifest 后的复位启动新应用
+    // 而不是重回 DFU。magic 最后写入, 作为提交屏障(见应用侧 mailbox)。
     void request_boot_app_once() {
         request = kMailboxRequestBootAppOnce;
         magic = kMailboxMagic;

@@ -67,12 +67,12 @@ void note_uplink_drop(std::size_t can_index) {
         counters[can_index].uplink_drop.fetch_add(1, std::memory_order::relaxed);
 }
 
-// Main loop only, so a plain increment is enough.
+// 仅主循环调用, 普通自增即可。
 void note_main_loop() { main_loop_count++; }
 
 void poll() {
-    // timepoint() counts quarter-microseconds (1 MHz timer, CNT << 2), so 4000
-    // ticks is one millisecond. Wraps every ~18 min; only deltas are used.
+    // timepoint() 以 1/4 微秒为单位计数(1 MHz 定时器, CNT << 2), 4000 tick 为 1 ms。
+    // 约 18 min 回绕; 只使用差值。
     const auto now_ms = static_cast<std::uint32_t>(
         timer::timer->timepoint().time_since_epoch().count() / 4000U);
     if (now_ms - last_emit_ms < kEmitPeriodMs)
@@ -81,7 +81,7 @@ void poll() {
 
     auto& serializer = usb::get_serializer();
 
-    // 8-byte header + tick + main-loop delta, then 7 words per controller.
+    // 8 字节头部 + tick + 主循环增量, 之后每个控制器 7 个字。
     constexpr std::size_t kFixedSize = 8 + 4 + 4;
     constexpr std::size_t kPerCanSize = 7 * 4;
     constexpr std::size_t kRecordSize = kFixedSize + kCanCount * kPerCanSize;
@@ -104,17 +104,15 @@ void poll() {
         cursor = put_u32(cursor, counters[index].frames.load(std::memory_order::relaxed));
         cursor = put_u32(cursor, counters[index].tx_fail.load(std::memory_order::relaxed));
         cursor = put_u32(cursor, counters[index].uplink_drop.load(std::memory_order::relaxed));
-        // PSR is partly clear-on-read for LEC/DLEC: reading it here consumes the
-        // code, which is acceptable because nothing else in this firmware reads
-        // it -- but it does mean two consumers would race, so keep it that way.
+        // PSR 的 LEC/DLEC 为读后自清: 在此读取会消费掉错误码。本固件没有其他
+        // 读取者, 尚可接受; 再加一个消费者就会互相竞争, 务必保持单读者。
         cursor = put_u32(cursor, can->PSR);
         cursor = put_u32(cursor, can->ECR);
         cursor = put_u32(cursor, can->TXFQS);
     }
 
-    // Best effort by design: if the batch pool is full the record is dropped
-    // rather than retried, exactly like a forwarded CAN frame. A gap in the
-    // sequence numbers is itself a symptom worth seeing on the host.
+    // 刻意的尽力而为: 批量池满时丢弃记录而不重试, 与被转发的 CAN 帧同等待遇。
+    // 序号出现空洞本身就是值得上位机看到的症状。
     (void)serializer.write_uart(
         static_cast<core::protocol::FieldId>(data::DataId::kUart0),
         {.uart_data = {record, kRecordSize}, .idle_delimited = true}, {});

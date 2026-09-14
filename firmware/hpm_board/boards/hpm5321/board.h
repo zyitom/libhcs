@@ -23,7 +23,7 @@ extern "C" {
 void board_init(void);
 void board_init_usb(void);
 
-/* Bootloader-specific helper for force-stay button handling. */
+/* bootloader 专用的强驻留按钮处理辅助函数。 */
 bool board_check_bootloader_force_stay_requested(void);
 
 void board_delay_us(uint32_t us);

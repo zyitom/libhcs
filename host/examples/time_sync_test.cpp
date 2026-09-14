@@ -208,62 +208,6 @@ int main(int argc, char** argv) {
             "  anomalies during the run %u (since boot %u)   state transitions %zu\n",
             anomalies_during_run, last.status.anomaly_count, transitions);
         printf(
-            "  fitted PTPC units per microframe %u (nominal 120000)\n",
-            last.status.ptpc_units_per_microframe);
-
-        // 1 PTPC unit is 1/960 of a microsecond on this board.
-        printf(
-            "  PTPC fit prediction error: mean %+.3f us   worst %.3f us\n",
-            last.status.ptpc_residual_mean / 960.0, last.status.ptpc_residual_abs_max / 960.0);
-        printf(
-            "  capture age: %.3f .. %.3f us   ownership glitches: %u"
-            "   [0.000..0.000 would mean the capture never fired]\n",
-            last.status.ptpc_step_min / 960.0, last.status.ptpc_step_max / 960.0,
-            last.status.ptpc_raw_ns);
-
-        // Self-consistency of the fit, checkable on ONE board: between two
-        // reports the anchor point must move along the line the same fit
-        // publishes. If the implied slope disagrees with the published one, the
-        // reference pair is stored inconsistently -- and that error is
-        // indistinguishable from real skew in any cross-board comparison.
-        {
-            double implied_min = 0.0;
-            double implied_max = 0.0;
-            size_t implied_count = 0;
-            for (size_t report = 1; report < reports[index].size(); report++) {
-                const auto& previous = reports[index][report - 1].status;
-                const auto& current = reports[index][report].status;
-                if (current.ptpc_reference_microframe <= previous.ptpc_reference_microframe)
-                    continue;
-                // The reference is a modular nanosecond reading, not an
-                // absolute one: the board never reads PTPC's seconds register
-                // because it is not latched with the nanoseconds. So the
-                // difference has to be taken modulo the rollover.
-                constexpr int64_t kModulus = 1'000'000'000;
-                int64_t unit_delta = static_cast<int64_t>(current.ptpc_reference_units)
-                                   - static_cast<int64_t>(previous.ptpc_reference_units);
-                if (unit_delta < 0)
-                    unit_delta += kModulus;
-                const double implied =
-                    static_cast<double>(unit_delta)
-                    / static_cast<double>(
-                        current.ptpc_reference_microframe - previous.ptpc_reference_microframe);
-                if (implied_count == 0 || implied < implied_min)
-                    implied_min = implied;
-                if (implied_count == 0 || implied > implied_max)
-                    implied_max = implied;
-                implied_count++;
-            }
-            if (implied_count != 0) {
-                printf(
-                    "  reference pair implies %.3f..%.3f units/microframe over %zu steps"
-                    "  -> %s\n",
-                    implied_min, implied_max, implied_count,
-                    (implied_max - implied_min) < 1.0 ? "self-consistent"
-                                                      : "INCONSISTENT with the published slope");
-            }
-        }
-        printf(
             "  fitted local ticks per microframe %.4f (nominal 500) -> board crystal %+.1f ppm\n",
             ticks_per_microframe, (ticks_per_microframe / 500.0 - 1.0) * 1e6);
 

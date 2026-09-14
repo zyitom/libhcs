@@ -48,7 +48,6 @@ public:
      * must return a span pointing to the same underlying memory.
      */
     virtual BufferSpanType data() const noexcept = 0;
-
 };
 
 /**
@@ -141,9 +140,14 @@ public:
      */
     virtual void receive(std::function<void(std::span<const std::byte>)> callback) = 0;
 
-    // Optional transport-link restart notification. The callback runs on the
-    // same receive thread and must not block it; Handler uses it to invalidate
-    // the protocol session and lets its keepalive thread establish a new one.
+    // Optional transport-link restart notification. The callback runs on
+    // whichever thread performed the restart -- generally NOT the receive
+    // thread -- and must neither block nor touch receive-path state directly;
+    // a transport that can restart underneath live traffic delivers the
+    // notification before re-arming its receive path, so the first receive
+    // callback after the restart can consume it. Handler marks the restart
+    // here and performs the actual protocol reset on the receive thread, the
+    // one thread its deserializer may be touched from.
     virtual void on_link_restart(std::function<void()> callback) { (void)callback; }
     // NOLINTEND(performance-unnecessary-value-param)
 
@@ -230,7 +234,8 @@ std::unique_ptr<Transport> create_transport(
 inline std::unique_ptr<Transport> create_transport(
     uint16_t usb_vid, uint16_t usb_pid, std::string_view serial_filter,
     const ConnectionOptions& options) {
-    return create_transport(usb_vid, std::span<const uint16_t>{&usb_pid, 1}, serial_filter, options);
+    return create_transport(
+        usb_vid, std::span<const uint16_t>{&usb_pid, 1}, serial_filter, options);
 }
 
 } // namespace usb

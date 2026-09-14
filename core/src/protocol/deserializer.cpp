@@ -77,7 +77,6 @@ coroutine::LifoTask<bool> Deserializer::process_can_field(FieldId field_id) {
             co_return false;
         auto header = CanHeader::CRef{header_bytes};
 
-        data_view.is_fdcan = header.get<CanHeader::IsFdCan>();
         data_view.is_extended_can_id = header.get<CanHeader::IsExtendedCanId>();
         data_view.is_remote_transmission = header.get<CanHeader::IsRemoteTransmission>();
         can_data_length = static_cast<uint8_t>(header.get<CanHeader::HasCanData>());
@@ -115,9 +114,11 @@ coroutine::LifoTask<bool> Deserializer::process_can_field(FieldId field_id) {
         data_view.can_data = std::span<const std::byte>{tail_bytes, can_data_length};
         if (has_timestamp) {
             const auto* ts_bytes = tail_bytes + can_data_length;
-            uint32_t ts;
-            std::memcpy(&ts, ts_bytes, sizeof(ts));
-            data_view.timestamp_us = ts;
+            // Explicit little-endian to match the serializer; on a
+            // little-endian host this compiles to the same plain load the
+            // native memcpy produced.
+            data_view.timestamp_us = utility::Bitfield<4>::CRef{ts_bytes}
+                                         .get<layouts::CanTimestampLayout::TimestampUs>();
         }
         consume_peeked();
     } else {
@@ -367,36 +368,9 @@ coroutine::LifoTask<bool> Deserializer::process_session_field(FieldId) {
             .residual_mean_q16 = payload.get<TimeStatusPayload::ResidualMeanQ16>(),
             .residual_abs_max_q16 = payload.get<TimeStatusPayload::ResidualAbsMaxQ16>(),
             .residual_count = payload.get<TimeStatusPayload::ResidualCount>(),
-            .ptpc_units_per_microframe =
-                payload.get<TimeStatusPayload::PtpcUnitsPerMicroframe>(),
-            .ptpc_reference_units = payload.get<TimeStatusPayload::PtpcReferenceUnits>(),
-            .ptpc_reference_microframe =
-                payload.get<TimeStatusPayload::PtpcReferenceMicroframe>(),
-            .ptpc_residual_mean = payload.get<TimeStatusPayload::PtpcResidualMean>(),
-            .ptpc_residual_abs_max = payload.get<TimeStatusPayload::PtpcResidualAbsMax>(),
-            .ptpc_step_min = payload.get<TimeStatusPayload::PtpcStepMin>(),
-            .ptpc_step_max = payload.get<TimeStatusPayload::PtpcStepMax>(),
-            .ptpc_raw_ns = payload.get<TimeStatusPayload::PtpcRawNs>(),
-            .ptpc_raw_microframe = payload.get<TimeStatusPayload::PtpcRawMicroframe>(),
         };
         consume_peeked();
         callback_.time_status_deserialized_callback(status);
-        co_return true;
-    }
-    case data::SessionType::kSyncSample: {
-        const auto* payload_bytes = co_await peek_bytes(sizeof(SyncSamplePayload));
-        if (!payload_bytes) [[unlikely]]
-            co_return false;
-        auto payload = SyncSamplePayload::CRef{payload_bytes};
-        const data::SyncSampleView sample{
-            .nonce = data_view.nonce,
-            .tag = payload.get<SyncSamplePayload::Tag>(),
-            .microframe_q16 = payload.get<SyncSamplePayload::MicroframeQ16>(),
-            .bus = payload.get<SyncSamplePayload::Bus>(),
-            .ptpc_ns = payload.get<SyncSamplePayload::PtpcNs>(),
-        };
-        consume_peeked();
-        callback_.sync_sample_deserialized_callback(sample);
         co_return true;
     }
     case data::SessionType::kPulseSchedule: {
@@ -420,10 +394,8 @@ coroutine::LifoTask<bool> Deserializer::process_session_field(FieldId) {
         const data::PulseReportView report{
             .nonce = data_view.nonce,
             .scheduled_microframe = payload.get<PulseReportPayload::ScheduledMicroframe>(),
-            .captured_microframe_q16 =
-                payload.get<PulseReportPayload::CapturedMicroframeQ16>(),
-            .ticks_per_microframe_q16 =
-                payload.get<PulseReportPayload::TicksPerMicroframeQ16>(),
+            .captured_microframe_q16 = payload.get<PulseReportPayload::CapturedMicroframeQ16>(),
+            .ticks_per_microframe_q16 = payload.get<PulseReportPayload::TicksPerMicroframeQ16>(),
             .flags = payload.get<PulseReportPayload::Flags>(),
         };
         consume_peeked();

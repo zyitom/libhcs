@@ -75,32 +75,32 @@ public:
 
         core::utility::assert_debug(spi_.try_lock());
 
-        // Dummy read to switch accelerometer to SPI mode.
+        // 哑读一次, 让加速度计进入 SPI 模式。
         read_register(RegisterAddress::kAccChipId);
         timer::timer->spin_wait(1ms);
 
-        // Reset all registers to reset value.
+        // 复位所有寄存器。
         write_register(RegisterAddress::kAccSoftReset, 0xB6);
         timer::timer->spin_wait(1ms);
 
-        // "Who am I" check.
+        // "Who am I" 芯片 ID 校验。
         core::utility::assert_always(read_and_confirm(RegisterAddress::kAccChipId, 0x1E));
 
-        // Enable INT1 as output pin, push-pull, active-low.
+        // INT1 配为输出, 推挽, 低有效。
         core::utility::assert_always(write_and_confirm(RegisterAddress::kInt1IoCtrl, 0b00001000));
-        // Map data ready interrupt to pin INT1.
+        // 数据就绪中断映射到 INT1。
         core::utility::assert_always(write_and_confirm(RegisterAddress::kIntMapData, 0b00000100));
 
-        // Set ODR and OSR.
+        // 设置 ODR 与 OSR。
         core::utility::assert_always(write_and_confirm(
             RegisterAddress::kAccConf, 0x80 | (0x02 << 4) | static_cast<uint8_t>(data_rate)));
-        // Set accelerometer range.
+        // 设置量程。
         core::utility::assert_always(
             write_and_confirm(RegisterAddress::kAccRange, static_cast<uint8_t>(range)));
 
-        // Switch to active mode.
+        // 切到 active 模式。
         core::utility::assert_always(write_and_confirm(RegisterAddress::kAccPwrConf, 0x00));
-        // Turn on accelerometer.
+        // 使能加速度计。
         core::utility::assert_always(write_and_confirm(RegisterAddress::kAccPwrCtrl, 0x04));
         timer::timer->spin_wait(1ms);
 

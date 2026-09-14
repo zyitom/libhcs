@@ -44,12 +44,10 @@ public:
 
             auto writeable = kBatchCount - readable - 1;
             if (!writeable) {
-                // Only a fault while a host is draining. With no session
-                // try_transmit() never pops a batch, so the ring fills once and
-                // stays full until activate_session() clears it -- reporting
-                // that would leave an idle, healthy board blinking the
-                // buffer-full pattern indefinitely, since every later allocate()
-                // lands here and re-arms the 5 s window.
+                // 只有主机正在排空时才可能是故障。无会话时 try_transmit() 从不弹出
+                // batch, 环形队列填满一次后就一直保持满, 直到 activate_session()
+                // 清空 -- 若此时上报, 空闲的健康板会无限闪烁缓冲满灯型, 因为此后
+                // 每次 allocate() 都落到这里并重新触发 5 s 窗口。
                 if (uplink_session_active())
                     led::led->uplink_buffer_full();
                 return {};
@@ -84,9 +82,8 @@ public:
 
     private:
         std::atomic<size_t> written_size_ = 0;
-        // Align to the Cortex-M7 D-cache line (32 B) so a batch never shares a cache
-        // line with adjacent state -- keeps cache clean/invalidate on the USB path
-        // free of false sharing.
+        // 对齐到 Cortex-M7 D-cache 行(32 B), batch 不与相邻状态共享缓存行
+        // -- USB 路径上的 cache clean/invalidate 因此没有伪共享。
         alignas(32) std::byte data_[core::protocol::kProtocolBufferSize]{};
     };
 
@@ -109,7 +106,7 @@ public:
 
     static void release_batch(const Batch* batch) {
         const_cast<Batch*>(batch)->reset(); // NOLINT(cppcoreguidelines-pro-type-const-cast):
-                                            // Compromises made to maintain encapsulation.
+                                            // 为维持封装所做的妥协。
     }
 
     void clear() {

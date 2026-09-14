@@ -1,41 +1,31 @@
 #pragma once
 
-// Step 1 of the USB-SOF cross-board time base: prove that FRINDEX really does
-// advance by exactly one per SOF interrupt, before any of the timeline algorithm
-// is written.
+// USB-SOF 跨板时间基准的第一步: 在任何时间线算法写就之前, 先证明 FRINDEX
+// 确实随每个 SOF 中断精确加一。
 //
-// WHY THIS EXISTS AS ITS OWN FIRMWARE STEP. The whole scheme rests on the device
-// controller's frame index being a passive, hardware-updated copy of the host's
-// microframe counter -- identical on every board hanging off the same host
-// controller, because every board is clocked by the same SOF edges. If the
-// controller instead sets the SOF-received status flag slightly BEFORE it
-// increments FRINDEX, an interrupt handler that reads the register at entry sees
-// the previous value, and the observed delta sequence degenerates into an
-// alternating 0, 2, 0, 2 pattern. Both cases produce a working-looking counter,
-// and they differ by exactly one microframe of systematic offset -- which is 125
-// us, two orders of magnitude past the ~1 us the design targets. Debugging that
-// after the wrap-count state machine and the host protocol exist would mean
-// separating an algorithm bug from a silicon race with both in flight, so it is
-// answered here with nothing else running.
+// 为何单列一个固件步骤: 整套方案依赖设备控制器的帧索引是主机 microframe
+// 计数器的被动硬件副本 -- 挂在同一主机控制器下的每块板都由相同 SOF 边沿
+// 驱动, 读数必然一致。若控制器在递增 FRINDEX 之前先置 SOF-received 标志,
+// 中断入口处读到的就是旧值, 观测到的 delta 序列退化为 0, 2, 0, 2 交替。
+// 两种情形都给出看似正常的计数器, 却恰差一个 microframe 的系统性偏移 --
+// 125 us, 比设计目标 ~1 us 高两个数量级。等回绕计数状态机和主机协议都
+// 上线之后再排查, 就得同时分辨算法缺陷与硅片竞态; 故在此单独回答, 板上
+// 无其他干扰。
 //
-// The record therefore carries three independent discriminators:
-//   * a full histogram of consecutive FRINDEX deltas (the primary evidence);
-//   * for every anomalous delta, the USBSTS the interrupt was taken on, PORTSC1
-//     (port speed, suspend, PHY low-power), and the millisecond tick -- enough
-//     to tell an enumeration artifact from something happening in steady state;
-//   * a second FRINDEX read taken immediately after the first, inside the same
-//     interrupt -- a nonzero "advanced within ISR" count is the direct signature
-//     of sampling right on the increment edge;
-//   * ISR-to-ISR local timer intervals, which must center on 125 us. A delta of
-//     1 paired with a 250 us interval means interrupts are being missed and the
-//     counter is silently wrong, which the delta histogram alone cannot see.
+// 记录因此携带如下独立判据:
+//   * 相邻 FRINDEX delta 的完整直方图(主要证据);
+//   * 每个异常 delta 对应的 USBSTS、PORTSC1(端口速率、挂起、PHY 低功耗)
+//     与毫秒 tick -- 足以区分枚举期伪象与稳态现象;
+//   * 同一中断内紧跟首读之后的第二次 FRINDEX 读 -- "advanced within ISR"
+//     计数非零, 即恰好采在递增边沿上的直接特征;
+//   * ISR 到 ISR 的本地定时器间隔, 应以 125 us 为中心。delta 为 1 而间隔
+//     250 us 意味着中断丢失、计数器静默出错, delta 直方图自身看不出这一点。
 //
-// The register reads and the SRI acknowledge live in sync/sof.cpp, which is the
-// single SOF hook this and sync::timebase share; the probe only receives the
-// values.
+// 寄存器读取与 SRI 应答都在 sync/sof.cpp -- 它与本模块及 sync::timebase
+// 共享唯一的 SOF 钩子; 探针只接收读数。
 //
-// Compiled out entirely unless libhcs_APP_SOF_DIAG, so a production image
-// carries neither the counters nor the 8 kHz interrupt.
+// 未定义 libhcs_APP_SOF_DIAG 时整体编译剔除, 量产镜像既不含计数器, 也不含
+// 8 kHz 中断。
 
 #include <cstdint>
 
@@ -45,36 +35,33 @@ namespace libhcs::firmware::sync::sof_probe {
 
 inline constexpr bool kEnabled = true;
 
-// Wire format of the UART0 uplink payload. Little endian, fixed layout except
-// for the anomaly tail, whose entry count is carried in the record.
+// UART0 上行载荷的线上格式。小端; 除尾部异常条目(条目数随记录携带)外
+// 布局固定。
 inline constexpr std::uint8_t kRecordMagic = 0xD2U;
 inline constexpr std::uint8_t kRecordVersion = 2U;
 
-// Delta buckets 0..8 plus one catch-all for 9 and above.
+// delta 桶 0..8, 另有一桶兜住 9 及以上。
 inline constexpr std::uint32_t kDeltaBuckets = 10U;
 
-// Anomalies kept per record. Drained on every emit, so a run shows anomalies as
-// they happen instead of only the first few after boot -- which is what version
-// 1 of this record effectively did, because 8 slots per 100 ms filled up during
-// enumeration and everything after went unseen. Sized well above the ~3 per
-// record actually observed; the host cross-checks the stored count against the
-// free-running total, so an overflow cannot pass silently.
+// 每条记录保留的异常数。每次上报即清空, 运行中随时可见, 而非只看到开机后
+// 最初几条 -- 初版记录(每 100 ms 仅 8 槽)在枚举期即被填满, 此后的异常全部
+// 无人看见。容量远高于实测每条约 3 条; 主机将存量计数与自增总数交叉核对,
+// 溢出不可能静默通过。
 inline constexpr std::uint32_t kAnomalyCapacity = 12U;
 
-// ISR path, called from sync::sof_isr_entry() with the values it read.
+// ISR 路径, 由 sync::sof_isr_entry() 携其读得的值调用。
 void note_sof(
     std::uint32_t frindex, std::uint32_t frindex_again, std::uint32_t now_quarter_us,
     std::uint32_t usbsts, std::uint32_t portsc1);
 
-// Main-loop sampler; emits one record every kEmitPeriodMs of the 1 kHz tick.
+// 主循环采样器; 1 kHz tick 下每 kEmitPeriodMs 上报一条记录。
 void poll(std::uint32_t tick);
 
 #else
 
 inline constexpr bool kEnabled = false;
 
-inline void note_sof(
-    std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) {}
+inline void note_sof(std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) {}
 inline void poll(std::uint32_t) {}
 
 #endif

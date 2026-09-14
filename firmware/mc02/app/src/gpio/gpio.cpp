@@ -14,8 +14,7 @@ namespace libhcs::firmware::gpio {
 extern "C" void HAL_GPIO_EXTI_Callback(uint16_t gpio_pin) {
     if (gpio_pin == INT1_ACC_Pin) {
 #ifdef libhcs_APP_IMU_ENABLE
-        // Capture the data-ready edge time as close to the interrupt as possible;
-        // the SPI read that fetches the sample happens later in the main loop.
+        // 尽量贴近中断捕获数据就绪边沿的时刻; 取样的 SPI 读在之后的主循环进行。
         const uint32_t capture_timestamp_quarter_us =
             timer::timer->timepoint().time_since_epoch().count();
         if (spi::bmi088::accelerometer)
@@ -33,23 +32,19 @@ extern "C" void HAL_GPIO_EXTI_Callback(uint16_t gpio_pin) {
     }
 }
 
-// Channel edge interrupts. All four EXTI lines are owned app-side, so no edge
-// interrupt depends on a USER CODE section that a CubeMX regeneration can drop.
+// 通道边沿中断。四条 EXTI 线全部由 app 侧持有, 任何边沿中断都不依赖可能被
+// CubeMX 重新生成删掉的 USER CODE 段。
 //
-// EXTI0/2/9_5 need nothing from CubeMX: PA0/PA2/PE9 are S_TIM*_CH* pins in the
-// .ioc, so it never learns they are also inputs and generates no handler for
-// those lines. EXTI15_10 used to be different -- CubeMX owned that handler
-// because PE10/PE12 are GPXTI pins, and PE13 could only ride along through a
-// USER CODE section, which is exactly what commit b972290 silently deleted.
-// "Generate IRQ handler" is now off for EXTI15_10 in the .ioc (NVIC > Code
-// generation), which removes only the handler; MX_GPIO_Init still enables the
-// line and sets its priority.
+// EXTI0/2/9_5 无需 CubeMX 参与: PA0/PA2/PE9 在 .ioc 里是 S_TIM*_CH* 引脚,
+// CubeMX 不知道它们兼作输入, 也就不为这些线生成 handler。EXTI15_10 在 .ioc 中
+// 已关闭 Generate IRQ handler(NVIC > Code generation), 只去掉生成 handler 一项;
+// MX_GPIO_Init 仍会使能该线并设置优先级。
 extern "C" void EXTI0_IRQHandler(void) { HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_0); }
 extern "C" void EXTI2_IRQHandler(void) { HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_2); }
 extern "C" void EXTI9_5_IRQHandler(void) { HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_9); }
 
-// PE10 (INT1_ACC), PE12 (INT1_GYRO) and PE13 (PWM channel 4) all sit on this
-// line, so it must serve both the IMU and the GPIO driver.
+// PE10(INT1_ACC)、PE12(INT1_GYRO)与 PE13(PWM 通道 4)都在这条线上, 故它须
+// 同时服务 IMU 与 GPIO 驱动。
 extern "C" void EXTI15_10_IRQHandler(void) {
     HAL_GPIO_EXTI_IRQHandler(INT1_ACC_Pin);
     HAL_GPIO_EXTI_IRQHandler(INT1_GYRO_Pin);

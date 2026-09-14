@@ -30,9 +30,9 @@ public:
         core::utility::assert_always(HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) == HAL_OK);
         core::utility::assert_always(HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3) == HAL_OK);
 
-        // Channel EXTI lines: PA0->EXTI0, PA2->EXTI2, PE9->EXTI9_5. EXTI15_10
-        // (PE13) is already enabled by MX_GPIO_Init -- it is shared with the
-        // BMI088 data-ready pins, so only its handler lives in gpio.cpp.
+        // 通道 EXTI 线: PA0->EXTI0、PA2->EXTI2、PE9->EXTI9_5。EXTI15_10(PE13)
+        // 已由 MX_GPIO_Init 使能 -- 与 BMI088 数据就绪引脚共用, 故仅其 handler
+        // 放在 gpio.cpp。
         HAL_NVIC_SetPriority(EXTI0_IRQn, 4, 0);
         HAL_NVIC_EnableIRQ(EXTI0_IRQn);
         HAL_NVIC_SetPriority(EXTI2_IRQn, 4, 0);
@@ -123,12 +123,10 @@ private:
         uint16_t gpio_pin;
         uint8_t alternate_function;
         volatile uint32_t* compare_register;
-        // The owning timer's ARR. Read at runtime rather than baked into a
-        // constant because the two timers behind these four channels no longer
-        // have to share a period: TIM2 is also the USB-SOF capture timer
-        // (sync/sof.cpp), and making that capture fine enough to be worth using
-        // means running TIM2 at 275 MHz with ARR 5499999, while TIM1 stays at
-        // 1 MHz with ARR 19999. Both still produce 50 Hz.
+        // 所属定时器的 ARR。运行时读取而非编译期常量: 这四个通道背后的两个定时器
+        // 不必再共用周期。TIM2 同时是 USB-SOF 捕获定时器(sync/sof.cpp), 要让
+        // 捕获精细到值得使用须跑 275 MHz、ARR 5499999; TIM1 保持 1 MHz、
+        // ARR 19999。两者仍都产生 50 Hz。
         volatile uint32_t* autoreload_register;
     };
     static constexpr auto kNoPeriod = timer::Timer::Duration::zero();
@@ -263,8 +261,8 @@ private:
         return *channel_hardware(channel_index).autoreload_register + 1U;
     }
 
-    // 64-bit intermediate: at TIM2's 5500000-count period the product overflows
-    // 32 bits at a duty of about 780, which would have silently wrapped.
+    // 64 位中间量: TIM2 周期为 5500000 计数时, 乘积在 duty 约 780 处溢出 32 位,
+    // 会静默回绕。
     uint32_t duty16_to_pwm_compare(uint8_t channel_index, uint16_t duty) const {
         const uint64_t period = pwm_counter_period(channel_index);
         return static_cast<uint32_t>(((static_cast<uint64_t>(duty) * period) + 32767U) / 65535U);

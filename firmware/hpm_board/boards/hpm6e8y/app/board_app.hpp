@@ -19,25 +19,23 @@
 
 namespace libhcs::firmware::board {
 
-// Fieldbus (core1) application layer of the EtherCAT bridge. This board
-// exposes all four physical CAN ports (CAN0..CAN3 = MCAN0..MCAN3; see kCanPorts
-// for pin routing) and one test UART (UART1 on PY06/PY07), plus a plain GPIO RGB
-// LED. The EtherCAT side (ESC, core0) is configured in ../board.c and does not
-// appear here.
+// EtherCAT 桥的现场总线(core1)应用层。本板引出全部四个物理 CAN 口
+// (CAN0..CAN3 = MCAN0..MCAN3, 引脚走线见 kCanPorts)和一个测试 UART(UART1 于
+// PY06/PY07), 另有一盏纯 GPIO RGB LED。EtherCAT 侧(ESC, core0)在 ../board.c
+// 配置, 不出现在这里。
 
-// USB0 uses the HPM6E80 high-speed device controller and PHY.
+// USB0 使用 HPM6E80 的高速设备控制器与 PHY。
 bool usb_use_high_speed();
 
-// CAN ports in logical order, mapped to the four physical silk ports CAN0..CAN3
-// (= MCAN0..MCAN3). Pin routing recovered by the CAN pin scanner and recorded in
-// CAN_PIN_REVERSE_ENGINEERING.md:
+// CAN 口按逻辑序排列, 映射到四个物理丝印口 CAN0..CAN3(= MCAN0..MCAN3)。
+// 引脚走线由 CAN 引脚扫描恢复, 记录于 CAN_PIN_REVERSE_ENGINEERING.md:
 //   CAN0 = MCAN0  TX PC00 / RX PC01
 //   CAN1 = MCAN1  TX PB05 / RX PB04
 //   CAN2 = MCAN2  TX PD08 / RX PD09
 //   CAN3 = MCAN3  TX PD15 / RX PD14
-// All four run CAN-FD (1 Mbps arbitration / 5 Mbps data, BRS on). FD mode is a
-// strict superset -- classic frames still work -- and is required by the CANFD
-// loopback stress test that jumpers CAN0<->CAN1 and CAN2<->CAN3.
+// 四路都跑 CAN-FD(仲裁 1 Mbps / 数据 5 Mbps, BRS 开)。接收是严格超集 -- 对端
+// 的经典帧照常解码; 而本板发送的每帧都是 FD: 帧类型跟随总线, 且是 CANFD 回环
+// 压力测试(跳线 CAN0<->CAN1、CAN2<->CAN3)所要求的。
 constexpr CanPort kCanPorts[] = {
     {.base = HPM_MCAN0_BASE,
      .irq_num = IRQn_MCAN0,
@@ -57,10 +55,9 @@ constexpr CanPort kCanPorts[] = {
      .data_id = data::DataId::kCan3},
 };
 
-// Table capacity and the number of controllers actually populated on this board.
-// They differ only on boards whose directory serves more than one PCB
-// (boards/hpm5321), where the table is sized for the larger variant and this
-// count comes from the runtime identity. Here they are the same.
+// 表容量与本板实际存在的控制器数。两者只在服务多块 PCB 的板目录
+// (boards/hpm5321)上不同: 表按更大的变体分配尺寸, 数量则来自运行时身份。
+// 本板两者相同。
 constexpr size_t kCanPortCapacity = std::size(kCanPorts);
 constexpr size_t can_port_count() { return kCanPortCapacity; }
 constexpr CanPort can_port(size_t index) { return kCanPorts[index]; }
@@ -68,19 +65,17 @@ constexpr CanPort can_port(size_t index) { return kCanPorts[index]; }
 uint32_t init_can(MCAN_Type* ptr);
 void can_irq_handler(size_t board_can_index);
 
-// MCAN message RAM on HPM6E80 must live in the 32 KiB AHB RAM at 0xF0200000.
-// The core1 linker script exposes no .ahb_sram output section, so the board
-// hands out fixed slices of that (otherwise unused) region instead of a
-// section-placed array.
+// HPM6E80 的 MCAN message RAM 必须位于 0xF0200000 处的 32 KiB AHB RAM。
+// core1 链接脚本没有暴露 .ahb_sram 输出段, 板级改为发放该区域(本固件中无其他
+// 用途)的固定切片, 而不是用 section 放置的数组。
 mcan_msg_buf_attr_t can_message_ram(size_t can_index);
 
-// PTPC (the shared CAN timestamp timebase) runs on AHB0, pinned to 200 MHz in
-// board.c: reported-nanosecond step is 5 ns, so true microseconds = reported
-// nanoseconds / (200 * 5). The CAN driver asserts this against the clock tree
-// at init -- if board.c changes the AHB0 divider, update this constant.
+// PTPC(共享的 CAN 时间戳时基)挂在 AHB0 上, 在 board.c 中钉为 200 MHz: 上报的
+// 纳秒步进是 5 ns, 故真实微秒 = 上报纳秒 / (200 * 5)。CAN 驱动在 init 时对照
+// 时钟树断言该值 -- board.c 若改 AHB0 分频, 这里同步更新。
 constexpr uint32_t kCanTimestampNsPerUs = 1000;
 
-// UART ports in logical order: one test data UART (UART1, PY06/PY07 header).
+// UART 口按逻辑序: 一个测试数据 UART(UART1, PY06/PY07 排针)。
 constexpr UartPort kUartPorts[] = {
     {.base = HPM_UART1_BASE,
      .irq_num = IRQn_UART1,
@@ -95,52 +90,43 @@ constexpr UartPort kUartPorts[] = {
 uint32_t init_uart(UART_Type* ptr);
 void uart_irq_handler(size_t board_uart_index);
 
-// Machine timer of whichever core runs this application layer. Each core sees
-// only its own MCHTMR through the same HPM_MCHTMR_BASE window, so the clock name
-// must follow the running core: MCHTMR1 for the current EtherCAT bridge (the
-// app layer lives on core1), MCHTMR0 for the single-core USB image and for the
-// core-swap layout that moves the protocol stack back onto core0. board.c
-// clocks BOTH dividers at the 4 MHz the shared Timer driver asserts, so no
-// clock-tree change is needed when this flips.
+// 运行本应用层的那个核的机器定时器。每个核经同一 HPM_MCHTMR_BASE 窗口只能
+// 看到自己的 MCHTMR, 时钟名必须跟随运行中的核: 当前 EtherCAT 桥(应用层在
+// core1)用 MCHTMR1; 单核 USB 镜像与把协议栈挪回 core0 的核交换布局用
+// MCHTMR0。board.c 把两个分频都配成共享 Timer 驱动所断言的 4 MHz, 此开关翻转
+// 时无需改时钟树。
 #if defined(BOARD_RUNNING_CORE) && BOARD_RUNNING_CORE == HPM_CORE1
 constexpr clock_name_t kMchtmrClockName = clock_mchtmr1;
 #else
 constexpr clock_name_t kMchtmrClockName = clock_mchtmr0;
 #endif
 
-// DMA ring storage section for the shared UART driver. Core1 has no AHB SRAM
-// section; the AXI SRAM non-cacheable region serves the same purpose (DMA
-// coherent without manual cache maintenance).
+// 共享 UART 驱动的 DMA 环形存储段。core1 没有 AHB SRAM 段, 用 AXI SRAM 的
+// 非 cache 区达到同样目的(DMA 一致, 无需手动 cache 维护)。
 #define libhcs_DMA_BUFFER_SECTION ".noncacheable.non_init"
 
-// Main RGB LED, active-LOW (common-anode: drive the pad low to light it). Pads
-// verified by the GPIO LED scan (see GPIO_LED_REVERSE_ENGINEERING.md): red=PE05,
-// green=PE04, blue=PE03.
+// 主 RGB LED, 低有效(共阳: 拉低焊盘点亮)。焊盘经 GPIO LED 扫描核实
+// (见 GPIO_LED_REVERSE_ENGINEERING.md): 红=PE05, 绿=PE04, 蓝=PE03。
 //
-// These three pads DO carry an ESC0_CTR alt function (PE03=CTR_1, PE04=CTR_2,
-// PE05=CTR_3), which the old EVK-derived pinmux used to select. That is no
-// longer the case: board.c init_esc_pins() now uses the HPM6E*Y* on-die PHY
-// mapping and routes the four CTR signals to PA25 (CTR_0), PA28 (CTR_1),
-// PC20 (CTR_2) and PC21 (CTR_3) -- it never writes PE03/PE04/PE05. So the RGB
-// LED is exclusively owned by this app layer, independent of which core runs
-// init_esc_pins() first. Do not re-add ESC0_CTR on these pads.
+// 这三个焊盘确实带 ESC0_CTR 复用功能(PE03=CTR_1, PE04=CTR_2, PE05=CTR_3),
+// 旧 EVK 派生的 pinmux 选的正是它。现在不再如此: board.c 的 init_esc_pins()
+// 已改用 HPM6E*Y* 片内 PHY 映射, 把四个 CTR 信号引到 PA25(CTR_0)、PA28(CTR_1)、
+// PC20(CTR_2)、PC21(CTR_3), 从不写 PE03/PE04/PE05。因此 RGB LED 由本应用层
+// 独占, 与哪个核先跑 init_esc_pins() 无关。不要在这三个焊盘上重新加 ESC0_CTR。
 constexpr GpioPin kLedRedPin = make_gpio_pin<gpiom_soc_gpio0, 'E', 5, false>();
 constexpr GpioPin kLedGreenPin = make_gpio_pin<gpiom_soc_gpio0, 'E', 4, false>();
 constexpr GpioPin kLedBluePin = make_gpio_pin<gpiom_soc_gpio0, 'E', 3, false>();
 
-// Accessor form of the three constants above. The shared LED driver calls these
-// rather than reading the constants, because a board directory that serves more
-// than one PCB has to pick its pads from the runtime identity
-// (boards/hpm5321/app/board_app.hpp does). This board has one pinout, so these
-// are constant folds.
+// 上面三个常量的访问器形式。共享 LED 驱动调用它们而非直接读常量, 因为服务
+// 多块 PCB 的板目录必须按运行时身份选焊盘(boards/hpm5321/app/board_app.hpp
+// 就是如此)。本板只有一种引脚布局, 这里会被常量折叠。
 constexpr GpioPin led_red_pin() { return kLedRedPin; }
 constexpr GpioPin led_green_pin() { return kLedGreenPin; }
 constexpr GpioPin led_blue_pin() { return kLedBluePin; }
 
-// This board DOES have per-CAN indicator LEDs (green+blue per port); the GPIO LED
-// scan confirmed CAN0 green=PC26, CAN1 blue=PE02, CAN2 green=PA09/blue=PB00,
-// CAN3 green=PB02/blue=PB03. The full green+blue-per-port mapping is still being
-// scanned, so they are not wired up as indicators yet.
+// 本板确有每路 CAN 的指示灯(每口绿+蓝); GPIO LED 扫描已确认 CAN0 绿=PC26、
+// CAN1 蓝=PE02、CAN2 绿=PA09/蓝=PB00、CAN3 绿=PB02/蓝=PB03。每口绿+蓝的完整
+// 映射仍在扫描, 故尚未接成指示灯。
 constexpr std::array<GpioPin, 0> kCanIndicatorPins{};
 constexpr size_t can_indicator_count() { return kCanIndicatorPins.size(); }
 

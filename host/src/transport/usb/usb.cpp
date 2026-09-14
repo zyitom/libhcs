@@ -69,9 +69,17 @@ public:
         utility::FinalAction rollback_on_failure{[this]() noexcept {
             destroy_free_transmit_transfers();
             free_dev_mem_slabs();
+            if (control_device_handle_ != nullptr) {
+                libusb_close(control_device_handle_);
+                control_device_handle_ = nullptr;
+            }
             libusb_release_interface(libusb_device_handle_, kTargetInterface);
             libusb_close(libusb_device_handle_);
             libusb_exit(libusb_context_);
+            if (control_context_ != nullptr) {
+                libusb_exit(control_context_);
+                control_context_ = nullptr;
+            }
         }};
 
         // Opt-in uplink size instrumentation. How full each bulk transfer runs is
@@ -129,6 +137,10 @@ public:
     Usb& operator=(Usb&&) = delete;
 
     ~Usb() override {
+        // Deregister first: after this, no hotplug callbacks can arrive on the
+        // event thread while it is being wound down.
+        if (hotplug_registered_)
+            libusb_hotplug_deregister_callback(libusb_context_, hotplug_callback_handle_);
         dump_rx_length_histogram();
         dump_callback_timing();
         {
@@ -172,11 +184,20 @@ public:
         // for every buffer.
         free_dev_mem_slabs();
 
-        libusb_release_interface(libusb_device_handle_, kTargetInterface);
+        // The handle is null when the link faulted and a reconnect attempt
+        // already quiesced the device but never got it back: measured
+        // 2026-09-12, this libusb dereferences a null handle inside
+        // release_interface (pthread_mutex_lock(NULL)), and the histogram dump
+        // above guards the same way -- a teardown after a failed re-open is
+        // exactly when both run. Every call in the guard is a no-op without a
+        // handle, and libusb_exit() below needs only the context.
+        if (libusb_device_handle_ != nullptr) {
+            libusb_release_interface(libusb_device_handle_, kTargetInterface);
 
-        // libusb_close() reliably cancels all pending transfers and invokes their callbacks,
-        // avoiding race conditions present in other cancellation methods
-        libusb_close(libusb_device_handle_);
+            // libusb_close() reliably cancels all pending transfers and invokes their callbacks,
+            // avoiding race conditions present in other cancellation methods
+            libusb_close(libusb_device_handle_);
+        }
 
         // Guarantees join() returns even if some transfer never reports back:
         // whatever is still counted at this point can no longer be delivered,
@@ -187,6 +208,14 @@ public:
             event_thread_.join();
 
         libusb_exit(libusb_context_);
+
+        // The control plane is closed last: its handle lives on its own
+        // context, its completions are reaped on the calling threads, and by
+        // this point the keepalive is joined, so nothing can be in flight.
+        if (control_device_handle_ != nullptr)
+            libusb_close(control_device_handle_);
+        if (control_context_ != nullptr)
+            libusb_exit(control_context_);
     }
 
     std::unique_ptr<TransportBuffer> acquire_transmit_buffer() noexcept override {
@@ -240,8 +269,14 @@ public:
         auto& transfer = static_cast<TransferWrapper*>(buffer.get())->transfer_;
         transfer->length = static_cast<int>(size);
 
+        // Counted before the submit, so a completion that races it can never
+        // observe a count lower than what libusb still owns; the reconnect
+        // drain waits on this reaching zero.
+        transmit_transfers_in_flight_.fetch_add(1, std::memory_order::relaxed);
+
         const int ret = libusb_submit_transfer(transfer);
         if (ret != 0) [[unlikely]] {
+            transmit_transfers_in_flight_.fetch_sub(1, std::memory_order::relaxed);
             const uint64_t count =
                 transfer_errors_.transmit_error.fetch_add(1, std::memory_order::relaxed) + 1;
             if (logging::should_log_occurrence(count))
@@ -278,6 +313,10 @@ public:
     // carries that state across transfers, so without this the first bytes of
     // the new connection get appended to the truncated old field and the
     // SESSION_ACK that follows is mis-parsed.
+    //
+    // Runs on the thread that performed the re-open (the keepalive), NOT on
+    // the receive thread. It must not block and must not touch receive-path
+    // state directly: mark the restart here, consume it on the receive thread.
     // NOLINTNEXTLINE(performance-unnecessary-value-param)
     void on_link_restart(std::function<void()> callback) override {
         link_restart_callback_ = std::move(callback);
@@ -310,6 +349,24 @@ public:
     ControlResult vendor_control(
         uint8_t request_type, uint8_t request, uint16_t index,
         std::span<std::byte> payload) override {
+        // One EP0 exchange at a time. Application threads and the keepalive's
+        // before-session hook both land here, and a reconnect closes and
+        // re-opens the control handle underneath them; EP0 transfers are rare
+        // and bounded by kControlTimeoutMs, so a plain mutex is the whole
+        // story -- without it, a close racing an in-flight transfer would be
+        // libusb-undefined.
+        const std::scoped_lock guard{control_mutex_};
+
+        // The control handle lives on its own context: its completion is
+        // reaped by libusb_control_transfer's event handling on THIS thread,
+        // which never takes the bulk event thread's lock -- a bulk decode
+        // callback stuck for seconds delays EP0 by nothing at all, and a
+        // stalled EP0 exchange delays bulk completions by nothing at all.
+        // Without a control handle (the second context failed to come up at
+        // open) fall back to the shared handle: the pre-separation behaviour.
+        libusb_device_handle* const handle =
+            control_device_handle_ != nullptr ? control_device_handle_ : libusb_device_handle_;
+
         // There is no handle between a fault and a successful re-open, and the
         // keepalive walks straight into this: its next pass re-runs the board's
         // before-session hook, whose first act is an EP0 read of the interface
@@ -317,15 +374,27 @@ public:
         // library -- measured 2026-09-06 by deauthorizing the port, which keeps
         // the board away long enough for a re-open to fail. A device reset never
         // showed it: the board was always back before the first retry.
-        if (libusb_device_handle_ == nullptr) [[unlikely]]
+        // Every non-OK outcome logs here, once, with the request code and index:
+        // handler.cpp's thrown messages say "see the transport log", so the log
+        // must actually carry an entry for each of the paths that get there.
+        if (handle == nullptr) [[unlikely]] {
+            logger_.warn(
+                "EP0 vendor request 0x{:02x} (index {}) skipped: device handle is down between "
+                "a fault and a re-open", request, index);
             return ControlResult::kFailed;
+        }
 
         const int ret = libusb_control_transfer(
-            libusb_device_handle_, request_type, request, 0, index,
+            handle, request_type, request, 0, index,
             reinterpret_cast<unsigned char*>(payload.data()), static_cast<uint16_t>(payload.size()),
             kControlTimeoutMs);
-        if (ret == LIBUSB_ERROR_PIPE)
+        if (ret == LIBUSB_ERROR_PIPE) {
+            // A STALL is the board's deliberate "rejected" -- a normal answer of
+            // this channel, but still worth a line: it is the only trace an
+            // operator gets at the transport layer of WHICH request was refused.
+            logger_.warn("EP0 vendor request 0x{:02x} (index {}) stalled by board", request, index);
             return ControlResult::kStalled;
+        }
         if (ret < 0) {
             logger_.warn(
                 "EP0 vendor request 0x{:02x} (index {}) failed: {} ({})", request, index, ret,
@@ -335,8 +404,13 @@ public:
         // A short transfer means the two sides disagree about the payload, which
         // is the one outcome that must not be read as success: the caller would
         // decode uninitialized bytes as the board's answer.
-        if (std::cmp_not_equal(ret, payload.size()))
+        if (std::cmp_not_equal(ret, payload.size())) {
+            logger_.error(
+                "EP0 vendor request 0x{:02x} (index {}) short transfer: {} of {} bytes -- the "
+                "two sides disagree about the payload layout", request, index, ret,
+                payload.size());
             return ControlResult::kFailed;
+        }
         return ControlResult::kOk;
     }
 
@@ -419,8 +493,7 @@ public:
         if (pthread_getschedparam(io_thread, &policy, &param) != 0
             || (policy != SCHED_FIFO && policy != SCHED_RR))
             return;
-        param.sched_priority =
-            std::max(param.sched_priority - 1, sched_get_priority_min(policy));
+        param.sched_priority = std::max(param.sched_priority - 1, sched_get_priority_min(policy));
         if (const int ret = pthread_setschedparam(keepalive, policy, &param); ret != 0) {
             logger_.warn(
                 "could not give the session keepalive thread RT priority {}: {}",
@@ -436,9 +509,13 @@ private:
     // Bring every outstanding transfer home and let the device go, WITHOUT
     // touching the libusb context or the event thread polling it. That is the
     // difference from the destructor's teardown: this one is survivable.
-    void quiesce_device() noexcept {
+    //
+    // Returns false when a receive callback was still running when the bound
+    // drain expired: the handle must not be closed out from under it, and the
+    // caller should retry the whole recovery once the callback has returned.
+    [[nodiscard]] bool quiesce_device() noexcept {
         if (libusb_device_handle_ == nullptr)
-            return;
+            return true;
 
         {
             const std::scoped_lock guard{rx_transfer_mutex_};
@@ -448,16 +525,37 @@ private:
         for (int i = 0; i < kTeardownDrainRounds && receive_transfer_count() != 0; i++)
             std::this_thread::sleep_for(std::chrono::milliseconds{2});
 
-        // Every transmit wrapper must be back from libusb before the pool is
-        // destroyed -- freeing one the controller still owns is a use-after-free
-        // that only shows up under load. A dead device completes them promptly
-        // with NO_DEVICE, which is what puts them back.
+        // A receive transfer still counted means application code is running
+        // inside invoke_receive_callback() on the event thread. Closing the
+        // handle now would leave that callback to re-submit a transfer bound
+        // to a closed handle. Retrying later is the honest outcome -- the link
+        // is already down, so nothing is lost by waiting.
+        if (receive_transfer_count() != 0) [[unlikely]] {
+            static std::atomic<uint64_t> occurrences{0};
+            if (logging::should_log_occurrence(
+                    occurrences.fetch_add(1, std::memory_order::relaxed) + 1))
+                logger_.warn(
+                    "Link teardown: a receive callback is still running past the drain bound; "
+                    "deferring the re-open");
+            return false;
+        }
+
+        // From here, every transmit completion that has not landed yet belongs
+        // to a dead connection: bumping the generation makes its callback
+        // destroy the wrapper instead of returning it to the pool, so nothing
+        // bound to the handle closed below can ever be handed out again.
+        {
+            const std::scoped_lock guard{transmit_transfer_mutex_};
+            link_generation_.fetch_add(1, std::memory_order::relaxed);
+        }
+
+        // Bounded and best effort: this decides only whether the dev_mem
+        // mappings below are reclaimed now or deliberately leaked together
+        // with their still-outstanding buffers. A straggler past the bound is
+        // destroyed by its own completion callback, never returned to a pool.
         for (int i = 0; i < kTeardownDrainRounds; i++) {
-            {
-                const std::scoped_lock guard{transmit_transfer_mutex_};
-                if (free_transmit_transfers_.readable() == kTransmitTransferCount)
-                    break;
-            }
+            if (transmit_transfers_in_flight_.load(std::memory_order::relaxed) == 0)
+                break;
             std::this_thread::sleep_for(std::chrono::milliseconds{2});
         }
 
@@ -466,6 +564,18 @@ private:
         libusb_release_interface(libusb_device_handle_, kTargetInterface);
         libusb_close(libusb_device_handle_);
         libusb_device_handle_ = nullptr;
+        {
+            // The control-plane handle belongs to the same physical session:
+            // past this point its fd points at a device that is gone or about
+            // to be re-opened. reopen_device() builds a fresh one before the
+            // before-session hook runs its EP0 exchange.
+            const std::scoped_lock guard{control_mutex_};
+            if (control_device_handle_ != nullptr) {
+                libusb_close(control_device_handle_);
+                control_device_handle_ = nullptr;
+            }
+        }
+        return true;
     }
 
     // Re-select the SAME board (by the serial recorded at construction), claim
@@ -473,18 +583,9 @@ private:
     // notification: its keepalive already re-runs the EP0 handshake and opens a
     // fresh session whenever the session is down.
     bool reopen_device() noexcept {
-        try {
-            const std::string_view filter = serial_.empty() ? std::string_view{} : serial_;
-            libusb_device_handle_ = DeviceScanner::select_device(
-                libusb_context_, vendor_id_, product_ids_, filter, reconnect_options_);
-        } catch (const std::exception& exception) {
-            const uint64_t count = reconnect_failures_.fetch_add(1, std::memory_order::relaxed) + 1;
-            if (logging::should_log_occurrence(count))
-                logger_.warn(
-                    "Reconnect: the board is not back yet (x{}): {}", count, exception.what());
-            libusb_device_handle_ = nullptr;
+        const std::string_view filter = serial_.empty() ? std::string_view{} : serial_;
+        if (!select_main_handle(filter))
             return false;
-        }
 
         if (const int ret = libusb_claim_interface(libusb_device_handle_, kTargetInterface);
             ret != 0) [[unlikely]] {
@@ -494,10 +595,17 @@ private:
             // succeed and the claim fail -- the device is listed but has no
             // usable interfaces.)
             const uint64_t count = reconnect_failures_.fetch_add(1, std::memory_order::relaxed) + 1;
-            if (logging::should_log_occurrence(count))
-                logger_.warn(
-                    "Reconnect: failed to claim interface {}: {} ({}) (x{})", kTargetInterface, ret,
-                    helper::libusb_errname(ret), count);
+            if (logging::should_log_occurrence(count)) {
+                if (ret == LIBUSB_ERROR_BUSY)
+                    logger_.warn(
+                        "Reconnect: interface {} is claimed by someone else (BUSY, x{}); only one "
+                        "session per board is possible",
+                        kTargetInterface, count);
+                else
+                    logger_.warn(
+                        "Reconnect: failed to claim interface {}: {} ({}) (x{})", kTargetInterface,
+                        ret, helper::libusb_errname(ret), count);
+            }
             libusb_close(libusb_device_handle_);
             libusb_device_handle_ = nullptr;
             return false;
@@ -511,10 +619,20 @@ private:
             dev_mem_available_ = true;
         }
 
-        // Before the receive pool is armed, which is the only window where this
-        // is serialized against deserializer_.feed() the way the interface
-        // requires: quiesce_device() left no receive transfer outstanding, so no
-        // callback can be running, and none can start until the loop below.
+        // Fresh control-plane handle before the before-session hook runs: the
+        // hook's EP0 exchange is the very next thing to touch the device, and
+        // it must land on a handle to THIS session, not on the dead one
+        // quiesce_device() closed.
+        if (control_context_ != nullptr && !reopen_control_handle()) {
+            (void)quiesce_device();
+            return false;
+        }
+
+        // Signalled before the receive pool is armed: quiesce_device() left no
+        // receive transfer outstanding, so no callback can be running, and
+        // none can start until the loop below. The callback itself only marks
+        // the restart; the protocol layer performs the actual reset on the
+        // receive thread, the one thread the deserializer may be touched from.
         if (link_restart_callback_)
             link_restart_callback_();
 
@@ -524,7 +642,7 @@ private:
                 init_receive_transfers(receive_endpoint_);
         } catch (const std::exception& exception) {
             logger_.error("Reconnect: failed to rebuild the transfer pools: {}", exception.what());
-            quiesce_device();
+            (void)quiesce_device();
             return false;
         }
 
@@ -532,6 +650,79 @@ private:
         // was empty a moment ago.
         transmit_transfer_cv_.notify_all();
         return true;
+    }
+
+    // The hotplug ARRIVED callback is the producer; the reconnect path waits
+    // here instead of re-scanning on a timer.
+    void note_board_hotplug(libusb_hotplug_event event) noexcept {
+        if (event == LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED) {
+            board_arrivals_.fetch_add(1, std::memory_order::relaxed);
+            board_arrived_cv_.notify_all();
+        }
+        // LEFT needs no action: a vanished device announces itself through
+        // failed completions, which is what drives fault() today.
+    }
+
+    // Parks up to `bound` waiting for any a511 board to enumerate again. A
+    // wait woken by the OTHER board's arrival simply falls through to a
+    // failing select and the caller's next attempt.
+    bool wait_for_board_arrival(std::chrono::milliseconds bound) {
+        const uint64_t seen = board_arrivals_.load(std::memory_order::relaxed);
+        std::unique_lock guard{board_arrived_mutex_};
+        return board_arrived_cv_.wait_for(guard, bound, [&] {
+            return board_arrivals_.load(std::memory_order::relaxed) != seen;
+        });
+    }
+
+    // select_device with an arrival-aware second chance: the first scan fails
+    // while the board is away, so instead of handing the failure straight back
+    // (and burning a 250 ms retry interval), park on the hotplug signal and
+    // scan again the moment any board of ours enumerates. Long outages produce
+    // one parked wait instead of a retry storm.
+    [[nodiscard]] bool select_main_handle(std::string_view filter) {
+        try {
+            libusb_device_handle_ = DeviceScanner::select_device(
+                libusb_context_, vendor_id_, product_ids_, filter, reconnect_options_);
+            return true;
+        } catch (const std::exception&) {
+            wait_for_board_arrival(kReconnectArrivalWait);
+        }
+        try {
+            libusb_device_handle_ = DeviceScanner::select_device(
+                libusb_context_, vendor_id_, product_ids_, filter, reconnect_options_);
+            return true;
+        } catch (const std::exception& exception) {
+            const uint64_t count = reconnect_failures_.fetch_add(1, std::memory_order::relaxed) + 1;
+            if (logging::should_log_occurrence(count))
+                logger_.warn(
+                    "Reconnect: the board is not back yet (x{}): {}", count, exception.what());
+            libusb_device_handle_ = nullptr;
+            return false;
+        }
+    }
+
+    // (Re-)open the control-plane handle on its own context. The kernel allows
+    // several usbfs fds per device, and endpoint 0 needs no interface claim --
+    // the control handle coexists with the bulk handle without touching its
+    // claim. The exact serial pins the second open to the same physical board.
+    [[nodiscard]] bool reopen_control_handle() {
+        try {
+            libusb_device_handle* const control_handle = DeviceScanner::select_device(
+                control_context_, vendor_id_, product_ids_, serial_, reconnect_options_);
+            {
+                const std::scoped_lock guard{control_mutex_};
+                if (control_device_handle_ != nullptr)
+                    libusb_close(control_device_handle_);
+                control_device_handle_ = control_handle;
+            }
+            return true;
+        } catch (const std::exception& exception) {
+            const uint64_t count = reconnect_failures_.fetch_add(1, std::memory_order::relaxed) + 1;
+            if (logging::should_log_occurrence(count))
+                logger_.warn(
+                    "Reconnect: control-plane open failed (x{}): {}", count, exception.what());
+            return false;
+        }
     }
 
     // Escalation from try_recover_link() once the link is faulted: clearing a
@@ -543,7 +734,10 @@ private:
         if (!link_faulted_.load(std::memory_order::relaxed))
             return true; // another attempt already succeeded
 
-        quiesce_device();
+        // A false return means a receive callback was still running; retrying
+        // from the keepalive loop is the honest outcome.
+        if (!quiesce_device())
+            return false;
         if (!reopen_device())
             return false;
 
@@ -567,7 +761,8 @@ private:
             : self_(self)
             , transfer_(self_.create_libusb_transfer())
             , buffer_(self_.alloc_transfer_buffer())
-            , buffer_is_dev_mem_(self_.dev_mem_available_) {}
+            , buffer_is_dev_mem_(self_.dev_mem_available_)
+            , generation_(self_.link_generation_.load(std::memory_order::relaxed)) {}
 
         TransferWrapper(const TransferWrapper&) = delete;
         TransferWrapper& operator=(const TransferWrapper&) = delete;
@@ -603,8 +798,12 @@ private:
         libusb_transfer* transfer_;
         unsigned char* buffer_;
         bool buffer_is_dev_mem_;
-        // Which pool this wrapper goes back to on completion. Set once at
-        // construction; a buffer never migrates between channels.
+        // The connection this wrapper was created for. Set once at
+        // construction; a buffer never migrates between channels, and a
+        // completion from an older connection must never re-enter the pool of
+        // the current one -- its transfer is bound to a handle that has since
+        // been closed.
+        std::uint64_t generation_;
     };
 
     void usb_init(
@@ -634,6 +833,26 @@ private:
 
         if (const int ret = libusb_claim_interface(libusb_device_handle_, kTargetInterface);
             ret != 0) [[unlikely]] {
+            // BUSY is the kernel's own exclusivity guard: one interface, one
+            // claim, so a second Handler instance or process racing for the
+            // same board lands here. Translated into words because "-4 (BUSY)"
+            // reads like a driver bug when it is really the singleton rule
+            // doing its job. ACCESS is its permissions sibling.
+            if (ret == LIBUSB_ERROR_BUSY)
+                throw std::runtime_error(
+                    std::format(
+                        "This board is already opened (interface {} is claimed by another "
+                        "Handler instance or another process). Only one session per board is "
+                        "possible; close the other user of the board matching filter '{}' and "
+                        "retry.",
+                        kTargetInterface,
+                        serial_filter.empty() ? std::string_view{"any serial"} : serial_filter));
+            if (ret == LIBUSB_ERROR_ACCESS)
+                throw std::runtime_error(
+                    std::format(
+                        "Permission denied on interface {} ({}): this user cannot claim the "
+                        "board. Check the udev rules for the device node.",
+                        kTargetInterface, helper::libusb_errname(ret)));
             throw std::runtime_error(
                 std::format(
                     "Failed to claim interface {}: {} ({})", kTargetInterface, ret,
@@ -641,6 +860,73 @@ private:
         }
 
         serial_ = read_serial(libusb_device_handle_);
+
+        // Control plane on its own libusb context. EP0 exchanges (the
+        // construction-time channel configuration, the before-session hook on
+        // every reconnect, application vendor_control calls) then run through
+        // libusb_control_transfer's own event handling on the CALLING thread,
+        // against a context whose event lock the bulk event thread never
+        // touches: a bulk decode callback stuck for seconds delays EP0 by
+        // nothing at all, and a stalled EP0 exchange delays bulk completions
+        // by nothing at all. On the shared context both directions used to
+        // queue behind each other, because a sync transfer reaps its
+        // completion under the very event lock the dedicated thread holds
+        // while running callbacks.
+        //
+        // A second open of the same physical device is safe: the kernel allows
+        // several usbfs fds per device, endpoint 0 needs no interface claim,
+        // and the two contexts keep their event machinery fully separate. If
+        // the second context cannot be created, vendor_control() falls back to
+        // the shared-context behaviour -- degraded, not broken.
+        if (const int ret = libusb_init(&control_context_); ret != 0) [[unlikely]] {
+            control_context_ = nullptr;
+            logger_.warn(
+                "Failed to create the control-plane libusb context: {} ({}); EP0 stays on the "
+                "bulk context",
+                ret, helper::libusb_errname(ret));
+        } else {
+            utility::FinalAction close_control{[this]() noexcept {
+                if (control_device_handle_ != nullptr) {
+                    libusb_close(control_device_handle_);
+                    control_device_handle_ = nullptr;
+                }
+                libusb_exit(control_context_);
+                control_context_ = nullptr;
+            }};
+            // Pin the second open to the exact serial: with two identical
+            // boards on one bus, the control plane must not land on the other
+            // one. An empty serial (unmatchable at open) keeps the caller's
+            // original filter.
+            control_device_handle_ = DeviceScanner::select_device(
+                control_context_, vendor_id, product_ids,
+                serial_.empty() ? serial_filter : std::string_view{serial_}, reconnect_options_);
+            close_control.disable();
+        }
+
+        // Hotplug-accelerated reconnect: the event thread already reaps this
+        // context's events, so ARRIVED notifications are free -- they turn the
+        // reconnect path from "poll for the board every 250 ms" into "re-open
+        // the moment it enumerates again" (verified 2026-09-12: LEFT/ARRIVED
+        // deliver within milliseconds of a real removal and re-enumeration,
+        // and the same-context device list refreshes with them).
+        if (libusb_has_capability(LIBUSB_CAP_HAS_HOTPLUG)) {
+            const int rc = libusb_hotplug_register_callback(
+                libusb_context_,
+                LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED | LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT, 0,
+                vendor_id, LIBUSB_HOTPLUG_MATCH_ANY, LIBUSB_HOTPLUG_MATCH_ANY,
+                [](libusb_context*, libusb_device*, libusb_hotplug_event event,
+                   void* user_data) -> int {
+                    static_cast<Usb*>(user_data)->note_board_hotplug(event);
+                    return 0;
+                },
+                this, &hotplug_callback_handle_);
+            if (rc != 0) [[unlikely]]
+                logger_.warn(
+                    "hotplug registration failed ({} ({})); reconnect keeps polling", rc,
+                    helper::libusb_errname(rc));
+            else
+                hotplug_registered_ = true;
+        }
 
         // Libusb successfully initialized
         close_device_handle.disable();
@@ -691,8 +977,14 @@ private:
         }
 
         auto* iter = transmit_transfers;
-        free_transmit_transfers_.push_back_n(
-            [&iter]() noexcept { return *iter++; }, kTransmitTransferCount);
+        {
+            // Every other access to the pool takes this mutex; the arming path
+            // is the one producer that did not, and it is exactly the window a
+            // straggling completion from the previous connection can land in.
+            const std::scoped_lock guard{transmit_transfer_mutex_};
+            free_transmit_transfers_.push_back_n(
+                [&iter]() noexcept { return *iter++; }, kTransmitTransferCount);
+        }
     }
 
     // Pins this thread and optionally raises it to SCHED_FIFO. Failures are
@@ -857,6 +1149,10 @@ private:
     }
 
     void usb_transmit_complete_callback(TransferWrapper* wrapper) {
+        // The completion of exactly one submit. Decrement before any early
+        // return: the reconnect drain waits for this to reach zero.
+        transmit_transfers_in_flight_.fetch_sub(1, std::memory_order::relaxed);
+
         // Checked before the wrapper goes back to the pool, and never allowed to
         // stop it going back: a leaked wrapper would block every later sender in
         // acquire_transmit_buffer(). Reporting is all this can do -- but before
@@ -874,6 +1170,21 @@ private:
             const std::scoped_lock guard{mutex};
 
             if (stop_handling_events_.load(std::memory_order::relaxed)) [[unlikely]] {
+                wrapper->destroy();
+                delete wrapper;
+                return;
+            }
+
+            // A completion belonging to a connection that was already torn
+            // down: its transfer is bound to a closed handle, so destroying it
+            // here is the only safe outcome. This is what makes the bounded
+            // drain in quiesce_device() purely a reclamation optimization --
+            // a straggler can shrink the pool, never poison it. Checked under
+            // the same mutex as the bump, so a completion that loaded the
+            // generation before the bump cannot slip a stale wrapper in after
+            // the old pool has been destroyed.
+            if (wrapper->generation_ != link_generation_.load(std::memory_order::relaxed))
+                [[unlikely]] {
                 wrapper->destroy();
                 delete wrapper;
                 return;
@@ -1092,6 +1403,9 @@ private:
     }
 
     void destroy_free_transmit_transfers() noexcept {
+        // Same mutex discipline as every other access to the pool, so the
+        // completion callback can never push a wrapper while this drains it.
+        const std::scoped_lock guard{transmit_transfer_mutex_};
         free_transmit_transfers_.pop_front_n([](TransferWrapper* wrapper) noexcept {
             wrapper->destroy();
             delete wrapper;
@@ -1112,8 +1426,16 @@ private:
         }
         if (total == 0)
             return;
+        // Between a fault and a successful re-open the handle is null --
+        // measured 2026-09-06 on the vendor_control path -- and
+        // libusb_get_device() dereferences it without a check. A teardown
+        // right after a failed reconnect is exactly when this histogram is
+        // worth printing, so skip the annotation instead of crashing the
+        // teardown.
         const int mps =
-            libusb_get_max_packet_size(libusb_get_device(libusb_device_handle_), kInEndpoint);
+            libusb_device_handle_ == nullptr
+                ? LIBUSB_ERROR_OTHER
+                : libusb_get_max_packet_size(libusb_get_device(libusb_device_handle_), kInEndpoint);
         fprintf(
             stderr, "[rx-histogram] %llu transfers, %llu bytes, mean %.1f B/transfer\n",
             static_cast<unsigned long long>(total), static_cast<unsigned long long>(bytes),
@@ -1284,6 +1606,25 @@ private:
     libusb_context* libusb_context_ = nullptr;
     libusb_device_handle* libusb_device_handle_ = nullptr;
 
+    // Control plane: a second libusb context and a second open of the same
+    // physical device, so EP0 exchanges never share the bulk event thread's
+    // event lock. Null when the second context could not be created -- EP0
+    // then falls back to the bulk handle, the pre-separation behaviour.
+    libusb_context* control_context_ = nullptr;
+    libusb_device_handle* control_device_handle_ = nullptr;
+    // Serializes EP0 between application threads and the reconnect path,
+    // which closes and re-opens the control handle underneath them.
+    std::mutex control_mutex_;
+
+    // Hotplug watch: ARRIVED notifications (one per a511 enumeration, vendor
+    // filtered) are what the reconnect path parks on instead of polling;
+    // LEFT is counted by the same callback and deliberately ignored.
+    libusb_hotplug_callback_handle hotplug_callback_handle_{};
+    bool hotplug_registered_ = false;
+    std::atomic<uint64_t> board_arrivals_{0};
+    std::mutex board_arrived_mutex_;
+    std::condition_variable board_arrived_cv_;
+
     std::thread event_thread_;
 
     std::atomic<int> active_transfers_ = 0;
@@ -1292,7 +1633,8 @@ private:
     // Set once when the link is beyond local repair (the device is gone, or the
     // receive pool could not be kept alive). Everything after that point refuses
     // work instead of pretending to do it: acquire_transmit_buffer() hands back
-    // nullptr, transmit() throws, and try_recover_link() stops trying. Replaces
+    // nullptr, transmit() recycles the buffer, and try_recover_link() stops
+    // trying. Replaces
     // an unconditional std::terminate() -- a bridge losing its board is the
     // application's decision to make, not the transport's.
     std::atomic<bool> link_faulted_ = false;
@@ -1332,6 +1674,12 @@ private:
     std::atomic<bool> abandon_remaining_transfers_ = false;
     static constexpr int kTeardownDrainRounds = 100; // 2 ms each
 
+    // How long the reconnect path parks on the hotplug arrival signal when
+    // the board is away. Bounded, because the destructor joins this path's
+    // owner (the keepalive thread) and must not wait on a board that may
+    // never return.
+    static constexpr std::chrono::milliseconds kReconnectArrivalWait{2000};
+
     // One mapping per this many bytes of buffer, rather than one per buffer.
     // Sized to hold a whole number of buffers so a slab wastes nothing: at the
     // 1024-byte stride below that is 16 per slab, and the pools ask for 80
@@ -1351,6 +1699,14 @@ private:
     };
 
     utility::RingBuffer<TransferWrapper*> free_transmit_transfers_;
+    // Connections are numbered; a transmit completion that belongs to an older
+    // one must never re-enter the pool of the current one, because its
+    // transfer is bound to a handle that has since been closed. Bumped in
+    // quiesce_device() before the old pool is destroyed and the new one armed.
+    std::atomic<std::uint64_t> link_generation_{1};
+    // Transmit transfers submitted and not yet completed. What the reconnect
+    // drain waits on; the completion callback owns the only decrement.
+    std::atomic<int> transmit_transfers_in_flight_{0};
     bool dev_mem_available_ = false;
     // Only ever touched from the thread that builds and tears down the pools;
     // the completion callbacks reach the counter below, not this vector.

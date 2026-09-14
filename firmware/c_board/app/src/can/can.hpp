@@ -31,10 +31,11 @@ public:
         config_can(hal_filter_bank, hal_slave_start_filter_bank);
     }
 
+    // This controller (STM32F407 bxCAN) has no CAN-FD. The protocol no longer
+    // carries a per-frame type flag for the driver to guard against: the frame
+    // type is a property of the bus, and this board's buses are classic by
+    // construction -- the CBoard host class offers no way to ask for FD.
     void handle_downlink(const data::CanDataView& data) {
-        if (data.is_fdcan) [[unlikely]]
-            return; // TODO: Support FDCAN when protocol ready
-
         auto construct = [&data](std::byte* storage) noexcept {
             auto& mailbox = *new (storage) TransmitMailboxData{};
 
@@ -68,7 +69,6 @@ public:
             const auto rdtr = hal_can_instance->sFIFOMailBox[CAN_RX_FIFO0].RDTR;
 
             data::CanDataView data{};
-            data.is_fdcan = false;
             data.is_extended_can_id = static_cast<bool>(CAN_RI0R_IDE & rir);
             data.is_remote_transmission = static_cast<bool>(CAN_RI0R_RTR & rir);
 

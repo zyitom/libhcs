@@ -20,23 +20,20 @@ void sof_isr_entry() {
     if ((status & USB_USBSTS_SRI_MASK) == 0U)
         return;
 
-    // Earliest possible read, before the acknowledge and before any
-    // bookkeeping. Reading late would let the controller finish an increment
-    // that began after the status bit was set -- which is exactly the race the
-    // probe exists to detect, and a late read hides it. The second read is the
-    // probe's discriminator for that race; the compiler drops it when the probe
-    // is compiled out.
+    // 尽可能早地读, 先于应答、先于任何杂务。读晚了会让控制器完成状态位
+    // 置起之后才开始的递增 -- 这恰是探针要检测的竞态, 而晚读会把它掩盖。
+    // 第二次读是探针对该竞态的判据; 探针被编译剔除时, 编译器也会一并去掉
+    // 它。
     const std::uint32_t frame = usb->FRINDEX & USB_FRINDEX_FRINDEX_MASK;
     const std::uint32_t now = timer::Timer::timestamp_quarter_us();
 
-    // Guarded by if constexpr rather than left to the optimizer: these are
-    // volatile reads of a peripheral, so the compiler must emit them even when
-    // the consumer is an empty inline function.
+    // 用 if constexpr 把关而非交给优化器: 这些是对外设的 volatile 读,
+    // 即使消费者是空的 inline 函数, 编译器也必须发射它们。
     std::uint32_t frame_again = frame;
     if constexpr (sof_probe::kEnabled)
         frame_again = usb->FRINDEX & USB_FRINDEX_FRINDEX_MASK;
 
-    // Write-one-to-clear, and only this bit.
+    // 写一清零, 且只动这一位。
     usb->USBSTS = USB_USBSTS_SRI_MASK;
 
     timebase::note_sof(frame, now);

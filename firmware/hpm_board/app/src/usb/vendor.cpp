@@ -22,20 +22,15 @@ namespace {
 
 constexpr uint32_t kDfuRuntimeResetDelayMs = 50U;
 
-// Bulk endpoint size, refreshed at mount. tud_vendor_rx_cb() below needs it to
-// decide whether a packet is short (and therefore ends the transfer), and that
-// callback runs once per downlink packet, which made tud_speed_get() a jal/ret
-// around one byte load on the hottest path there is. It lives in usbd.c, so the
-// call could not be inlined away. The callback runs from tud_task() on the main
-// loop, not in the USB interrupt: the vendor class driver registers no xfer_isr
-// in usbd.c, so its xfer_cb is always deferred. can.hpp relies on that.
+// bulk 端点尺寸, 挂载时刷新。下面的 tud_vendor_rx_cb() 需要它判断包是否为短包
+// (短包即结束传输); 该回调每个下行包跑一次, 逐次调 tud_speed_get() 就是在最热的
+// 路径上给单字节加载外包一圈 jal/ret。它在 usbd.c 里, 调用无法被内联掉。回调从
+// tud_task() 在主循环运行, 不在 USB 中断里: vendor 类驱动没有注册 xfer_isr,
+// xfer_cb 总是被推迟 -- can.hpp 依赖这一点。
 //
-// Mount is the right place and session activation is NOT: the session-open
-// packet arrives through tud_vendor_rx_cb itself, so a value refreshed on
-// activation would still be the default while that packet was being classified.
-// tud_mount_cb runs on SET_CONFIGURATION, before the endpoint exists and
-// therefore before any packet can arrive on it, and the speed is fixed by the
-// enumeration that just finished.
+// 刷新点必须是 mount 而非会话激活: 会话打开包本身就是经 tud_vendor_rx_cb 到达的,
+// 若在激活时刷新, 分类那个包时读到的仍是默认值。tud_mount_cb 在 SET_CONFIGURATION
+// 时运行, 早于端点存在、也就早于任何包能到达它, 且速率已被刚完成的枚举固定。
 std::size_t g_packet_size = 64;
 
 volatile bool g_dfu_runtime_reboot_requested = false;
@@ -48,9 +43,8 @@ uint32_t runtime_ms() {
 
 } // namespace
 
-// The three link:: uplink hooks are NOT defined here: they live in
-// link/uplink_usb.cpp, because "which transport owns the data plane" is an
-// application choice, not a property of this driver. See that file.
+// 三个 link:: 上行钩子不在此定义: 它们位于 link/uplink_usb.cpp -- "哪个传输拥有
+// 数据面"是应用的选择, 不是本驱动的属性。见该文件。
 
 namespace libhcs::firmware::usb {
 
@@ -64,19 +58,17 @@ void poll_dfu_runtime_reboot() {
     boot::BootMailbox::reboot_to_bootloader();
 }
 
-// TinyUSB device callbacks
+// TinyUSB 设备回调
 extern "C" {
 
-// USB0 interrupt vector. The HPM SDK leaves the concrete ISR in the example
-// family.c (which this project does not build), so bind it here in app code and
-// keep both third-party submodules pristine. dcd_int_handler is TinyUSB's device
-// ISR entry.
+// USB0 中断向量。HPM SDK 把具体 ISR 留在示例 family.c 里(本项目不编译它), 因此
+// 在应用代码这里绑定, 两个第三方子模块保持原封不动。dcd_int_handler 是 TinyUSB
+// 的设备 ISR 入口。
 SDK_DECLARE_EXT_ISR_M(IRQn_USB0, hcs_usb0_isr)
 void hcs_usb0_isr(void) {
-    // Ahead of the device stack, because the whole point of the SOF probe is to
-    // read FRINDEX at the earliest instant software can. Its body is empty
-    // unless libhcs_APP_SOF_DIAG is set, but it is defined out of line in
-    // sof.cpp, so without LTO the call itself remains -- a jal to a bare ret.
+    // 先于设备协议栈执行: SOF 探测的全部意义就在于在软件能及的最早瞬间读
+    // FRINDEX。未定义 libhcs_APP_SOF_DIAG 时函数体为空, 但它 out-of-line 定义在
+    // sof.cpp, 无 LTO 时调用本身仍在 -- 对着一个空 ret 的 jal。
     sync::sof_isr_entry();
     dcd_int_handler(0);
 }
@@ -88,24 +80,20 @@ void tud_vendor_rx_cb(uint8_t itf, const uint8_t* buffer, uint16_t size) {
     if (itf != 0) [[unlikely]]
         return;
 
-    // Timestamp before any work, so the turnaround this opens covers the whole
-    // device-side path. Compiled out unless libhcs_APP_CAN_DIAG.
+    // 在任何处理之前打时间戳, 这里打开的 turnaround 才能覆盖整个设备侧路径。
+    // 未定义 libhcs_APP_CAN_DIAG 时编译消失。
     diag::note_usb_out_complete();
     diag::latency::open_downlink();
 
-    // Process first, arm after: the class driver hands this callback a pointer
-    // into the endpoint's own DMA buffer, and arming the endpoint again lets the
-    // controller start writing that same buffer. So the endpoint stays un-armed
-    // -- and the device NAKs the host -- for the whole of the processing below.
+    // 先处理, 后挂端点: 类驱动交给本回调的指针指向端点自己的 DMA 缓冲, 此刻重新
+    // 挂端点会让控制器开始覆写同一块缓冲。因此端点保持未挂载 -- 设备对主机 NAK --
+    // 贯穿下面的全部处理。
     //
-    // Copying the packet out first would lift that constraint (turnaround
-    // 2.22 -> 1.27 us, measured) and was tried through 2026-09-05. It buys
-    // nothing here: this host schedules exactly 8 bulk transactions per 125 us
-    // microframe per device, and the device is already idle waiting when the next
-    // one arrives, so the saved turnaround just moves into that idle wait --
-    // packet rate 63999/63996/64002 with the copy against 63988/63988/63991
-    // without. Revisit only on a host that schedules more than 8 per microframe,
-    // where the device would become the constraint.
+    // 先把包拷出去可以解除该约束(turnaround 实测 2.22 -> 1.27 us), 2026-09-05 前
+    // 试过。在这里没有收益: 本主机对每个设备每 125 us 微帧恰好调度 8 个 bulk
+    // 事务, 下一个到来时设备早已空闲等待, 省下的 turnaround 只是挪进那段空闲 --
+    // 包率有拷贝时 63999/63996/64002, 无拷贝时 63988/63988/63991。仅当主机每微帧
+    // 调度超过 8 个、设备成为瓶颈时再重估。
     usb::vendor->handle_downlink(
         {reinterpret_cast<const std::byte*>(buffer), payload_size}, finished);
 
@@ -123,9 +111,9 @@ void tud_suspend_cb(bool remote_wakeup_en) {
     (void)remote_wakeup_en;
     usb::vendor->deactivate_session();
     usb::vendor->finish_downlink_transfer();
-    // Resume does not re-enumerate, so tud_mount_cb below never runs for it.
+    // 恢复不会重新枚举, 下面的 tud_mount_cb 不会因此运行。
     usb::vendor->reset_downlink_arm();
-    // A new host must perform the EP0 handshake for itself.
+    // 新主机必须自己完成 EP0 握手。
     usb::vendor->set_ep0_handshake_done(false);
 }
 
@@ -133,12 +121,10 @@ void tud_resume_cb() {}
 
 void tud_mount_cb() {
     g_packet_size = (tud_speed_get() == TUSB_SPEED_HIGH) ? 512U : 64U;
-    // SET_CONFIGURATION (re)creates the endpoints, so whatever arm the hardware
-    // was holding is gone. The endpoint does not exist yet at this point -- that
-    // is fine, this only records the debt and the main loop retries until the
-    // transfer is accepted.
+    // SET_CONFIGURATION 会(重)建端点, 硬件原来持有的挂载随之消失。此刻端点尚不
+    // 存在 -- 无妨, 这里只是记下欠账, 主循环会重试到 transfer 被接受为止。
     usb::vendor->reset_downlink_arm();
-    // A new host must perform the EP0 handshake for itself.
+    // 新主机必须自己完成 EP0 握手。
     usb::vendor->set_ep0_handshake_done(false);
 }
 
@@ -146,7 +132,7 @@ void tud_umount_cb() {
     usb::vendor->deactivate_session();
     usb::vendor->finish_downlink_transfer();
     usb::vendor->reset_downlink_arm();
-    // A new host must perform the EP0 handshake for itself.
+    // 新主机必须自己完成 EP0 握手。
     usb::vendor->set_ep0_handshake_done(false);
 }
 

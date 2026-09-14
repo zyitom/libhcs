@@ -33,8 +33,8 @@ App::App() {
         board_init_usb();
         dma_mgr_init();
 
-        // Enable D-cache write-around: streaming writes bypass cache allocation,
-        // keeping the 16 KiB D-cache available for hot control structures.
+        // 使能 D-cache write-around: 流式写入不占 cache 行, 把 16 KiB
+        // D-cache 留给热点控制结构。
         l1c_dc_enable_writearound();
 
         boot::BootMailbox::clear();
@@ -46,51 +46,43 @@ App::App() {
     {
         const utility::InterruptLockGuard guard;
 
-        // Before the CAN and UART init() calls below: those arm driver ISRs that
-        // serialize straight into the protocol stack, so the stack instance has
-        // to exist first.
+        // 必须在下方 CAN/UART 的 init() 之前: 那些 init 挂接的驱动 ISR 直接
+        // 串行进入协议栈, 协议栈实例得先存在。
         //
         usb::vendor.init();
 
-        // After usb::vendor.init(), never before: tud_init() -> dcd_init()
-        // assigns USBINTR wholesale, so an earlier arm of the SOF enable would
-        // be overwritten. A no-op unless the time base or the SOF probe is
-        // compiled in.
+        // 必须在 usb::vendor.init() 之后, 不能更早: tud_init() -> dcd_init()
+        // 会整体重赋 USBINTR, 更早挂上的 SOF 使能会被覆盖。未编译时间基或
+        // SOF 探针时为 no-op。
         sync::sof_init();
 
-        // Bounded by can_count(), not by the array size: on the hpm5321 image the
-        // table is sized for the dual-CAN PCB and the single-CAN one leaves the
-        // last slot unconstructed. Initializing it there would clock MCAN3 and
-        // steal PA30/PA31 from the LED. The uninitialized Lazy stays inert.
+        // 上界是 can_count() 而非数组容量: hpm5321 镜像的表按双 CAN PCB 分配
+        // 尺寸, 单 CAN PCB 则留下末位槽不构造。在那里 init 会给 MCAN3 上时钟,
+        // 并把 PA30/PA31 从 LED 手里抢走。未初始化的 Lazy 保持惰性。
         for (size_t i = 0; i < can::can_count(); ++i)
             can::can_array[i].init();
 
         for (auto& board_uart : uart::uart_array)
             board_uart.init();
 
-        // After the CAN drivers, which are what bring PTPC0 up: this routes USB
-        // Start-of-Frame into PTPC's hardware capture. A no-op unless the time
-        // base is compiled in.
-        sync::timebase::init_capture();
+        // 必须在 CAN 驱动之后(正是它们把 PTPC0 打开): 这里把 USB
+        // Start-of-Frame 接入 PTPC 的硬件捕获。未编译时间基时为 no-op。
 
-        // After the UART driver on purpose: this overrides UART0's pin mux to
-        // put GPTMR0's compare output and capture input on those pads. UART0 is
-        // unavailable in a build with the pulse test enabled.
+        // 刻意放在 UART 驱动之后: 这里会改写 UART0 的引脚复用, 把 GPTMR0 的
+        // 比较输出与捕获输入放上那些焊盘。启用 pulse 测试的构建里 UART0 不可用。
         sync::pulse::init();
     }
 }
 
 namespace {
 
-// LED source: steady green must mean "frames are being forwarded", so it
-// follows the session that the CAN/UART drivers serialize into.
-bool host_session_established() {
-    return usb::vendor->session_established();
-}
+// LED 依据: 常绿必须意味着"帧正在被转发", 故跟随 CAN/UART 驱动串行接入的
+// 那个会话。
+bool host_session_established() { return usb::vendor->session_established(); }
 
 } // namespace
 
-// Non-static to ensure instantiation
+// 刻意保持非静态以确保实例化
 // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
 [[noreturn]] void App::run() {
     uint32_t last_tick = 0;
@@ -98,66 +90,54 @@ bool host_session_established() {
         diag::note_main_loop();
         tud_task();
 
-        // Drain the CAN software transmit queues immediately after tud_task(),
-        // which is where TinyUSB delivers this pass's downlink frames. Placing
-        // it later -- after the 1 kHz LED/telemetry block -- would put that
-        // block's work between a frame arriving and reaching the wire.
+        // 紧随 tud_task() 排空 CAN 软件发送队列: 本轮的下行帧正是在这里由
+        // TinyUSB 交付。若推迟到 1 kHz LED/遥测块之后, 那块的工作会插在帧
+        // 到达与帧上线之间。
         for (size_t i = 0; i < can::can_count(); ++i)
             can::can_array[i]->try_transmit();
 
-        // Settle any USB bulk OUT arm still owed. The steady-state re-arm rides
-        // on the receive completion callback instead; this only covers the first
-        // arm and the release of a throttled endpoint, so it has to come after
-        // the drain above -- that is what makes the queue look drained to the
-        // throttle policy. See usb/vendor.hpp for the watermarks and the
-        // bounded-stall escape.
+        // 结清仍欠着的 USB bulk OUT 挂载。稳态的重新挂载走接收完成回调, 这里
+        // 只覆盖首次挂载与被限流端点的解除, 因此必须放在上面的排空之后 --
+        // 这样节流策略看到的队列才是已排空的。水位与有界停顿出口见
+        // usb/vendor.hpp 的说明。
         usb::vendor->poll_downlink_arm_if_pending();
 
         usb::poll_dfu_runtime_reboot();
 
-        // LED bookkeeping runs here at the 1 kHz tick pace instead of inside the
-        // mchtmr ISR: MTIP bypasses the PLIC priority threshold, so ISR-side work
-        // would preempt even the priority-3 CAN ISR and tax the forwarding hot
-        // path. The LED state reflects the session handshake (nonce + keepalive
-        // lease), not mere USB enumeration: steady green means data is actually
-        // being forwarded; an enumerated host without a live session stays on
-        // the "waiting" blink.
+        // LED 记账放在这里按 1 kHz tick 节奏跑, 而不在 mchtmr ISR 里: MTIP
+        // 绕过 PLIC 优先级阈值, ISR 侧做这件事会连优先级 3 的 CAN ISR 都抢先,
+        // 加重转发热路径。LED 状态反映会话握手(nonce + keepalive 租约)而非
+        // 单纯的 USB 枚举: 常绿表示数据确实在转发; 已枚举但无活跃会话的主机
+        // 停留在"等待"闪烁。
         const uint32_t tick = timer::timer->tick_count();
         if (tick != last_tick) {
             last_tick = tick;
             led::led->set_host_connected(host_session_established());
             led::led->update(tick);
 
-            // Shared time base: refit the microframe-to-local-timer line, and
-            // re-arm the SOF enable so the hook survives a controller that was
-            // reinitialized behind us. Both no-ops unless compiled in.
+            // 共享时基: 重拟合微帧到本地定时器的直线, 并重新挂上 SOF 使能,
+            // 使钩子在控制器于背后被重建后仍存活。未编译时均为 no-op。
             sync::timebase::poll(tick);
             sync::pulse::poll(tick);
             sync::sof_rearm();
 
-            // Ship any hardware Start-of-Frame captures the CAN receive path
-            // queued. Paced off the 1 kHz tick because the probe runs at a few
-            // hundred frames per second at most and the ring holds 16.
-            usb::vendor->poll_sync_samples();
             usb::vendor->poll_pulse_captures();
 
-            // USB SOF / FRINDEX validation telemetry (libhcs_APP_SOF_DIAG
-            // builds only), on the same 1 kHz tick as the CAN telemetry below.
+            // USB SOF / FRINDEX 校验遥测(仅 libhcs_APP_SOF_DIAG 构建), 与下方
+            // CAN 遥测同用 1 kHz tick。
             sync::sof_probe::poll(tick);
 
-            // CAN forwarding telemetry (libhcs_APP_CAN_DIAG builds only).
-            // Paced off the same 1 kHz tick and emitted before the transport
-            // pump below, so a record produced this tick leaves on this pass.
+            // CAN 转发遥测(仅 libhcs_APP_CAN_DIAG 构建)。同一 1 kHz tick 节奏,
+            // 且在下方传输泵之前发出, 使本 tick 产生的记录当轮就离开。
             diag::poll(tick);
         }
 
-        // CAN interrupt-delivery watchdog. Must run every pass, not off the
-        // 1 kHz tick: RX FIFO0 holds 32 elements, which at the rates this board
-        // forwards is under two milliseconds of slack before frames are lost.
+        // CAN 中断送达看门狗。必须每轮都跑, 不能挂在 1 kHz tick 上: RX FIFO0
+        // 装得下 32 个元素, 按本板的转发速率算, 距帧丢失的余量不足两毫秒。
         for (size_t i = 0; i < can::can_count(); ++i)
             can::can_array[i]->poll();
 
-        // Host transport pump.
+        // 主机传输泵。
         usb::vendor->try_transmit();
 
         for (auto& board_uart : uart::uart_array)

@@ -18,9 +18,8 @@ namespace libhcs::firmware::board {
 namespace {
 
 uint32_t init_can_clock(MCAN_Type* ptr) {
-    // Group membership (group1, the core1 domain) is set centrally in board.c
-    // before core1 is released; only the divider is chosen here. 80 MHz from
-    // PLL1CLK0 (800 MHz / 10), same as the EVK reference, for every controller.
+    // 组归属(group1, core1 域)由 board.c 在释放 core1 前统一设置, 这里只选
+    // 分频。每个控制器都是 PLL1CLK0(800 MHz / 10)的 80 MHz, 与 EVK 参考一致。
     if (ptr == HPM_MCAN0) {
         clock_set_source_divider(clock_can0, clk_src_pll1_clk0, 10);
         return clock_get_frequency(clock_can0);
@@ -42,7 +41,7 @@ uint32_t init_can_clock(MCAN_Type* ptr) {
 
 uint32_t init_uart_clock(UART_Type* ptr) {
     if (ptr == HPM_UART1) {
-        // Clocked from group1 (see board.c); default 24 MHz OSC source.
+        // 时钟来自 group1(见 board.c); 默认 24 MHz OSC 源。
         return clock_get_frequency(clock_uart1);
     }
     return 0;
@@ -53,8 +52,8 @@ uint32_t init_uart_clock(UART_Type* ptr) {
 bool usb_use_high_speed() { return true; }
 
 uint32_t init_can(MCAN_Type* ptr) {
-    // RX pads: pull-up enabled + Schmitt trigger, so an idle/unconnected bus
-    // reads recessive cleanly. TX pads take the IOC default drive.
+    // RX 焊盘: 上拉使能 + 施密特触发, 空闲/未接的总线才能被干净地读成隐性态。
+    // TX 焊盘用 IOC 默认驱动。
     constexpr uint32_t rx_pad =
         IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(1) | IOC_PAD_PAD_CTL_HYS_SET(1);
     if (ptr == HPM_MCAN0) {
@@ -78,9 +77,8 @@ uint32_t init_can(MCAN_Type* ptr) {
 }
 
 mcan_msg_buf_attr_t can_message_ram(size_t can_index) {
-    // Fixed slices of the 32 KiB AHB RAM (0xF0200000), which nothing else in
-    // this firmware uses; see the declaration for why this is not a
-    // section-placed array. One default-sized message buffer per controller.
+    // 32 KiB AHB RAM(0xF0200000)的固定切片, 本固件没有其他使用者; 为何不用
+    // section 放置的数组见声明处。每个控制器一个默认大小的 message buffer。
     constexpr uint32_t slice_size = MCAN_MSG_BUF_SIZE_IN_WORDS * sizeof(uint32_t);
     static_assert(
         std::size(kCanPorts) * slice_size
@@ -92,13 +90,13 @@ mcan_msg_buf_attr_t can_message_ram(size_t can_index) {
 }
 
 uint32_t init_uart(UART_Type* ptr) {
-    constexpr uint32_t tx_pad = IOC_PAD_PAD_CTL_PE_SET(1) | // Pull enable
-                                IOC_PAD_PAD_CTL_PS_SET(1);  // Pull select - Pull up
-    constexpr uint32_t rx_pad = IOC_PAD_PAD_CTL_PE_SET(1) | // Pull enable
-                                IOC_PAD_PAD_CTL_PS_SET(1) | // Pull select - Pull up
-                                IOC_PAD_PAD_CTL_HYS_SET(1); // Enable Schmitt trigger
+    constexpr uint32_t tx_pad = IOC_PAD_PAD_CTL_PE_SET(1) | // 上拉使能
+                                IOC_PAD_PAD_CTL_PS_SET(1);  // 上拉选择: 上拉
+    constexpr uint32_t rx_pad = IOC_PAD_PAD_CTL_PE_SET(1) | // 上拉使能
+                                IOC_PAD_PAD_CTL_PS_SET(1) | // 上拉选择: 上拉
+                                IOC_PAD_PAD_CTL_HYS_SET(1); // 施密特触发使能
     if (ptr == HPM_UART1) {
-        // PY pads: route through PIOC to the SoC domain in addition to IOC.
+        // PY 焊盘: 除 IOC 外还要经 PIOC 路由到 SoC 域。
         HPM_IOC->PAD[IOC_PAD_PY07].FUNC_CTL = IOC_PY07_FUNC_CTL_UART1_TXD;
         HPM_PIOC->PAD[IOC_PAD_PY07].FUNC_CTL = PIOC_PY07_FUNC_CTL_SOC_PY_07;
         HPM_IOC->PAD[IOC_PAD_PY07].PAD_CTL = tx_pad;
@@ -121,7 +119,7 @@ void init_led_pins() {
 }
 
 void init_can_indicator_pins() {
-    // No per-CAN indicator LEDs on this board.
+    // 本板没有每路 CAN 的指示灯。
 }
 
 SDK_DECLARE_EXT_ISR_M(IRQn_MCAN0, can0_isr)

@@ -4,12 +4,11 @@
 
 namespace libhcs::firmware::flash {
 
-// RAII around the flash control-register lock.
+// flash 控制寄存器锁的 RAII 封装。
 //
-// An unlock failure is reported through ok() rather than trapping: the
-// bootloader is the last line of recovery, so a flash controller that refuses
-// to unlock has to surface as a DFU error status the host can act on, not as a
-// HardFault that silently takes the device off the bus.
+// 解锁失败通过 ok() 上报而不 trap: bootloader 是恢复的最后防线, 拒绝解锁的
+// flash 控制器必须以主机可处理的 DFU 错误状态呈现, 而不是 HardFault 后悄悄
+// 掉线。
 class UnlockGuard {
 public:
     UnlockGuard()
@@ -20,9 +19,8 @@ public:
     UnlockGuard(UnlockGuard&&) = delete;
     UnlockGuard& operator=(UnlockGuard&&) = delete;
 
-    // Re-locking cannot be recovered from and cannot fail in a way that
-    // invalidates work already committed, so its status is intentionally
-    // dropped; the next unlock would report the controller as unusable.
+    // 重新上锁不可恢复, 也不会使已提交的写入失效, 因此有意丢弃其返回值;
+    // 若控制器真已不可用, 下一次解锁自会报告。
     ~UnlockGuard() { (void)HAL_FLASH_Lock(); }
 
     bool ok() const { return unlocked_; }

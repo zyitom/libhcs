@@ -4,26 +4,23 @@
 
 namespace libhcs::firmware::usb {
 
-// TinyUSB descriptor callbacks
+// TinyUSB 描述符回调
 extern "C" {
 
-// Device Descriptors
-// Invoked when received GET DEVICE DESCRIPTOR
-// Application return pointer to descriptor
+// 设备描述符
+// 收到 GET DEVICE DESCRIPTOR 时调用, 应用返回指向描述符的指针
 uint8_t const* tud_descriptor_device_cb(void) { return usb_descriptors->get_device_descriptor(); }
 
-// Configuration Descriptors
-// Invoked when received GET CONFIGURATION DESCRIPTOR
-// Application return pointer to descriptor
-// Descriptor contents must exist long enough for transfer to complete
+// 配置描述符
+// 收到 GET CONFIGURATION DESCRIPTOR 时调用, 应用返回指向描述符的指针;
+// 描述符内容必须存活到传输完成
 uint8_t const* tud_descriptor_configuration_cb(uint8_t index) {
     return usb_descriptors->get_configuration_descriptor(index);
 }
 
-// String Descriptors
-// Invoked when received GET STRING DESCRIPTOR request
-// Application return pointer to descriptor
-// Descriptor contents must exist long enough for transfer to complete
+// 字符串描述符
+// 收到 GET STRING DESCRIPTOR 请求时调用, 应用返回指向描述符的指针;
+// 描述符内容必须存活到传输完成
 uint16_t const* tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
     return usb_descriptors->get_string_descriptor(index, langid);
 }

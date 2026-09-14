@@ -25,12 +25,10 @@ namespace libhcs::firmware::usb {
 
 class UsbDescriptors {
 public:
-    // Align endpoint numbering to STM32 HAL style:
-    // EP1 OUT: data OUT, EP1 IN: data IN.
+    // 端点编号对齐 STM32 HAL 风格: EP1 OUT 为数据 OUT, EP1 IN 为数据 IN。
     //
-    // Public because the endpoint address is not only descriptor content: the
-    // vendor transport audits the OUT endpoint's armed state against it, and a
-    // second copy of the number is exactly the kind of thing that drifts.
+    // 公开的原因: 端点地址不只是描述符内容, vendor 传输要拿它审计 OUT 端点的挂载
+    // 状态; 第二份编号正是会漂移的那种东西。
     static constexpr uint8_t kEpnumCdc0DataOut = 0x01;
     static constexpr uint8_t kEpnumCdc0DataIn = 0x81;
 
@@ -39,17 +37,16 @@ public:
         update_product_id();
     }
 
-    // Non-static because idProduct is decided at run time on boards whose image
-    // serves two PCBs: the hpm5321 app reports 0x5321 or 0x5322 from the OTP
-    // identity, so one binary keeps both boards' existing USB identity and the
-    // host needs no change (host/src/transport/usb/device_scanner.hpp matches the
-    // PID exactly). Single-variant boards report their compile-time PID.
+    // 非 static: 镜像服务两块 PCB 的板子上 idProduct 由运行时决定 -- hpm5321 应用
+    // 按 OTP 标识上报 0x5321 或 0x5322, 一个二进制保住两块板既有的 USB 身份, 主机
+    // 无需改动(host/src/transport/usb/device_scanner.hpp 精确匹配 PID)。单形态
+    // 板子上报编译期 PID。
     uint8_t const* get_device_descriptor() const {
         return reinterpret_cast<uint8_t const*>(&device_descriptor_);
     }
 
     static uint8_t const* get_configuration_descriptor(uint8_t index) {
-        (void)index; // For multiple configurations
+        (void)index; // 多配置预留
 
         if constexpr (TUD_OPT_HIGH_SPEED)
             return (tud_speed_get() == TUSB_SPEED_HIGH) ? kConfigurationDescriptorHs
@@ -80,12 +77,12 @@ public:
 
             str_size = static_cast<uint8_t>(std::min<size_t>(str.size(), max_size));
 
-            // Convert ASCII string into UTF-16
+            // ASCII 字符串转 UTF-16
             for (uint8_t i = 0; i < str_size; i++)
                 descriptor_string_buffer_[i + 1] = static_cast<uint16_t>(str[i]);
         }
 
-        // first byte is length (including header), second byte is string type
+        // 首字节为长度(含头部), 次字节为描述符类型
         descriptor_string_buffer_[0] =
             (TUSB_DESC_STRING << 8) | static_cast<uint16_t>((2 * str_size) + 2);
 
@@ -112,24 +109,21 @@ private:
         core::utility::assert_debug(cursor == serial_string_.data() + serial_string_.size());
     }
 
-    // Report the PID matching the PCB this chip is on. A no-op on single-variant
-    // boards, where board::kOtpIdentityEnabled is false and the compile-time PID
-    // already in kDeviceDescriptor is correct.
+    // 上报与芯片所在 PCB 匹配的 PID。单形态板子上是空操作: board::kOtpIdentityEnabled
+    // 为 false, kDeviceDescriptor 里的编译期 PID 本就正确。
     //
-    // The product string is deliberately NOT varied: the host matches it exactly
-    // against "HCS Agent v<version>", and the PID is what distinguishes the two
-    // boards there. Nothing else in the descriptor set changes, so a board sees
-    // byte-identical descriptors to the ones its own build used to emit.
+    // 产品字符串刻意不随板变化: 主机对 "HCS Agent v<version>" 精确匹配, 区分两块
+    // 板靠的是 PID。描述符集其余部分不变, 板子看到的字节与原独立构建的产出完全
+    // 一致。
     void update_product_id() {
         if constexpr (!board::kOtpIdentityEnabled)
             return;
 
         const auto& identity = board::board_identity();
 
-        // The bootloader refuses to jump here unless the identity resolved, so
-        // reaching this with kUnknown means the app was started some other way
-        // (a debugger, or a bootloader predating the check). Trap in debug; in
-        // release keep the compile-time PID rather than inventing one.
+        // bootloader 在标识未解析时拒绝跳转到这里, 以 kUnknown 走到这里说明应用
+        // 是别的途径启动的(调试器, 或早于该检查的 bootloader)。debug 下断言;
+        // release 保留编译期 PID 而不是编造一个。
         core::utility::assert_debug(identity.recognized());
 
         if (identity.variant == board::BoardVariant::kSingleCan)
@@ -180,16 +174,13 @@ private:
         return buffer;
     }
 
-private: // Device Descriptor
-    // The two hpm5321 PCBs' allocated PIDs. Same values the separate builds used,
-    // so hosts, udev rules and dfu-util command lines are unaffected by the
-    // merge; only which one a given binary reports is now decided at run time.
+private: // 设备描述符
+    // 两块 hpm5321 PCB 分到的 PID, 与原独立构建所用相同: 主机、udev 规则与
+    // dfu-util 命令行不受合并影响; 变的只是某个二进制上报哪一个, 现由运行时决定。
     static constexpr uint16_t kSingleCanProductId = 0x5321;
-    // Bus-powered, and NO remote wakeup. The bit used to be set here while the
-    // firmware never called tud_remote_wakeup() even once -- a descriptor that
-    // claimed a capability the device does not have. A host may legitimately
-    // suspend a bus and wait to be woken; advertising wakeup without
-    // implementing it is the one way to make that wait never end.
+    // 总线供电, 且不支持远程唤醒。该位曾置 1 而固件从未调用过 tud_remote_wakeup()
+    // -- 描述符声明了设备不具备的能力。主机挂起总线后等待唤醒是合法行为, 宣告
+    // 唤醒却不实现正是让这个等待永不结束的方式。
     static constexpr uint8_t kConfigAttributes = 0;
 
     static constexpr uint16_t kDualCanFdProductId = 0x5322;
@@ -215,11 +206,11 @@ private: // Device Descriptor
         .bNumConfigurations = 0x01,
     };
 
-    // Mutable copy: the constructor patches idProduct from the board identity.
-    // Everything else stays exactly as the constant above declares it.
+    // 可变副本: 构造函数按板标识修补 idProduct, 其余字段与上面的常量声明完全
+    // 一致。
     tusb_desc_device_t device_descriptor_ = kDeviceDescriptor;
 
-private: // Configuration Descriptor
+private: // 配置描述符
          // NOLINTNEXTLINE(cppcoreguidelines-use-enum-class)
     enum InterfaceNumber : uint8_t {
         kItfNumVendor = 0,
@@ -231,19 +222,16 @@ private: // Configuration Descriptor
                                             + CFG_TUD_VENDOR * TUD_VENDOR_DESC_LEN
                                             + CFG_TUD_DFU_RUNTIME * TUD_DFU_RT_DESC_LEN;
 
-    // There is deliberately no second bulk pair. One was added 2026-08-07 to
-    // give CAN a pipe of its own and removed 2026-09-05: an idle IN endpoint is
-    // polled continuously by the host controller whether or not it carries
-    // data, which cost a quarter of the packet rate and one host service
-    // interval on the median of every CAN frame -- more than the head-of-line
-    // blocking it removed. See firmware/hpm_board/AGENTS.md.
+    // 刻意不加第二对 bulk 端点(2026-08-07 曾为 CAN 单开一对, 2026-09-05 移除):
+    // 空闲 IN 端点无论有无数据都会被主机控制器持续轮询, 代价是四分之一的包率、
+    // 每帧中位数多等一个主机服务间隔 -- 超过它消除的队头阻塞。见
+    // firmware/hpm_board/AGENTS.md。
 
     static constexpr uint8_t const kConfigurationDescriptorFs[] = {
-        // Config number, interface count, string index, total length, attribute, power in mA
-        TUD_CONFIG_DESCRIPTOR(
-            1, kItfNumTotal, 0, kConfigTotalLen, kConfigAttributes, 100),
+        // 配置序号, 接口数, 字符串索引, 总长度, 属性, 电流(mA)
+        TUD_CONFIG_DESCRIPTOR(1, kItfNumTotal, 0, kConfigTotalLen, kConfigAttributes, 100),
 
-        // Interface number, string index, EP data address (out, in) and size.
+        // 接口号, 字符串索引, EP 数据地址(out, in)与尺寸。
         TUD_VENDOR_DESCRIPTOR(kItfNumVendor, 0, kEpnumCdc0DataOut, kEpnumCdc0DataIn, 64),
         TUD_DFU_RT_DESCRIPTOR(
             kItfNumDfuRuntime, 4, DFU_ATTR_CAN_DOWNLOAD | DFU_ATTR_WILL_DETACH, 1000, 1024),
@@ -251,22 +239,20 @@ private: // Configuration Descriptor
     static_assert(sizeof(kConfigurationDescriptorFs) == kConfigTotalLen);
 
     static constexpr uint8_t const kConfigurationDescriptorHs[] = {
-        // Config number, interface count, string index, total length, attribute, power in mA
-        TUD_CONFIG_DESCRIPTOR(
-            1, kItfNumTotal, 0, kConfigTotalLen, kConfigAttributes, 100),
+        // 配置序号, 接口数, 字符串索引, 总长度, 属性, 电流(mA)
+        TUD_CONFIG_DESCRIPTOR(1, kItfNumTotal, 0, kConfigTotalLen, kConfigAttributes, 100),
 
-        // Interface number, string index, EP data address (out, in) and size.
+        // 接口号, 字符串索引, EP 数据地址(out, in)与尺寸。
         TUD_VENDOR_DESCRIPTOR(kItfNumVendor, 0, kEpnumCdc0DataOut, kEpnumCdc0DataIn, 512),
         TUD_DFU_RT_DESCRIPTOR(
             kItfNumDfuRuntime, 4, DFU_ATTR_CAN_DOWNLOAD | DFU_ATTR_WILL_DETACH, 1000, 1024),
     };
     static_assert(sizeof(kConfigurationDescriptorHs) == kConfigTotalLen);
 
-private: // String Descriptor
+private: // 字符串描述符
     static constexpr std::array<uint8_t, 2> kLanguageId = {0x09, 0x04};
     static constexpr std::string_view kManufacturerString = "Helios";
-    static constexpr std::string_view kProductString =
-        "HCS Agent v" libhcs_PROJECT_VERSION_STRING;
+    static constexpr std::string_view kProductString = "HCS Agent v" libhcs_PROJECT_VERSION_STRING;
     static constexpr std::string_view kDfuRuntimeString = "DFU Runtime";
     std::array<char, 43> serial_string_{"AF-0000-0000-0000-0000-0000-0000-0000-0000"};
 

@@ -46,7 +46,7 @@ public:
 
     [[noreturn]] static void reboot() {
         ppor_reset_mask_set_source_enable(HPM_PPOR, ppor_reset_software);
-        // HPM6E dual-core DFU must reset CPU1; a hot reset only restarts CPU0.
+        // HPM6E 双核 DFU 必须复位 CPU1; 热复位只重启 CPU0。
         ppor_reset_set_cold_reset_enable(HPM_PPOR, ppor_reset_software);
         ppor_sw_reset(HPM_PPOR, 10U);
         while (true) {}

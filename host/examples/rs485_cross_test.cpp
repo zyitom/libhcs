@@ -234,11 +234,13 @@ public:
     }
 
     void set_baudrate(uint32_t baudrate) {
+        // EP0 reconfiguration: synchronous and read-back-verified; throws if the
+        // board's divisor solver refuses the rate, leaving the port untouched.
         const std::lock_guard guard{transmit_mutex_};
         if (port_ == 1)
-            host_->board().start_transmit().uart2_config({.baudrate = baudrate});
+            host_->board().configure_uart2(baudrate);
         else
-            host_->board().start_transmit().uart3_config({.baudrate = baudrate});
+            host_->board().configure_uart3(baudrate);
     }
 
     std::size_t message_count() {

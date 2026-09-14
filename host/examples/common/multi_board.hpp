@@ -291,14 +291,22 @@ public:
 
     void transmit(FunctionRef<void(BoardTransmitter&)> build) override {
         auto builder = board_.start_transmit();
-        Transmitter transmitter{builder};
+        Transmitter transmitter{builder, board_};
         build(transmitter);
     }
 
 private:
+    // UART configuration no longer rides the transmit stream for this board: it
+    // moved to the EP0 control channel, where the board's answer (verified with
+    // a read-back) is the acknowledgement the bulk stream cannot carry. The
+    // transmitter's uart_config therefore reconfigures synchronously and throws
+    // when the board refuses, instead of queueing an in-band field.
     struct Transmitter final : BoardTransmitter {
         libhcs::board::Mc02::PacketBuilder& builder;
-        explicit Transmitter(libhcs::board::Mc02::PacketBuilder& b) : builder(b) {}
+        libhcs::board::Mc02& board;
+        Transmitter(libhcs::board::Mc02::PacketBuilder& b, libhcs::board::Mc02& board_ref)
+            : builder(b)
+            , board(board_ref) {}
         BoardTransmitter& can(int bus, const libhcs::data::CanDataView& data) override {
             switch (bus) {
             case 0: builder.can1_transmit(data); break;
@@ -310,12 +318,14 @@ private:
         }
         BoardTransmitter& uart_config(
             int port, const libhcs::data::UartConfigView& config) override {
+            if (!config.baudrate.has_value())
+                return *this; // sparse patch semantics: nothing asked, nothing done
             switch (port) {
-            case 0: builder.uart1_config(config); break;
-            case 1: builder.uart2_config(config); break;
-            case 2: builder.uart3_config(config); break;
-            case 3: builder.uart7_config(config); break;
-            case 4: builder.uart10_config(config); break;
+            case 0: board.configure_uart1(*config.baudrate); break;
+            case 1: board.configure_uart2(*config.baudrate); break;
+            case 2: board.configure_uart3(*config.baudrate); break;
+            case 3: board.configure_uart7(*config.baudrate); break;
+            case 4: board.configure_uart10(*config.baudrate); break;
             default: throw std::out_of_range{"Mc02: UART port out of range (0-4)"};
             }
             return *this;

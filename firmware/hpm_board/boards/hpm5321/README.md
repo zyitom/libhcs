@@ -98,19 +98,26 @@ vendor 类设备，会话握手（kStart nonce + keepalive 租约）由共享的
 版上只有第 0 路被构造和启用。主机若给单 CAN 版发 `kCan2` 的帧，会被当作"本板不认识这个
 field"拒掉，不会打到未初始化的对象上。
 
-### 两个变体都跑 CAN-FD：帧格式是逐帧的，控制器模式不切换
+### 两个变体都跑 CAN-FD：帧类型跟随总线，控制器模式不切换
 
 **控制器在 init 时被配置成 CAN-FD 一次，之后永不重配。** 每一帧是 classic 还是 FD，
-由那一帧帧头里的 FDF/BRS 位决定，两个方向都逐帧携带 `is_fdcan`：
-
-| 方向 | 代码 | 含义 |
-|---|---|---|
-| 下行（主机 → 板） | `can.cpp:39-41`，`send_fd = canfd_ && data.is_fdcan` | 主机**请求**这帧用 FD 发 |
-| 上行（板 → 主机） | `can.cpp:125`，`data.is_fdcan = rx.canfd_frame` | 硬件**报告**收到的是什么格式 |
+由总线的编译期模式（`board_app.hpp` 的 `kCanPorts` 表 `.mode`）一次性决定：本板发出的
+所有帧都是 FD（FDF/BRS 置位）；收方向仍是超集——FD-enabled 的 M_CAN 照常接收 classic
+帧。总线的模式经 EP0（`kGetInterface` / `kGetCanConfig`，见
+[core vendor_control.hpp](../../../../core/include/libhcs/protocol/vendor_control.hpp)）
+上报主机并在其构造时断言；线协议里每帧的 `IsFdCan` 位已于 2026-09-12 废弃
+（`core/src/protocol/protocol.hpp` 的 `CanHeaderLayout`），两个方向都不再写、不再读。
 
 FD 是经典 CAN 2.0 的**严格超集**：FD-enabled 的 M_CAN 同样收发 classic 帧。所以
 "开 FD"不会让这块板收不到普通 CAN 帧——**没有"发来经典帧就切回经典模式"这个动作**，
 INIT 模式重配、总线中断统统不存在。
+
+#### 历史：帧格式曾是逐帧的 [2026-09-12 废弃]
+
+2026-09-04 起 hpm 固件率先把帧格式改为跟随总线（每帧头部位只读忽略）；2026-09-12
+协议彻底废弃该位、mc02 同步迁到 EP0 后，逐帧指定在全部板卡上终结。更早之前的行为：
+下行 `send_fd = canfd_ && data.is_fdcan`（主机**请求**这帧用 FD 发），上行
+`data.is_fdcan = rx.canfd_frame`（硬件**报告**收到的是什么格式）。
 
 #### 历史：单 CAN 版曾被配成仅经典模式 [2026-08-19 移除]
 

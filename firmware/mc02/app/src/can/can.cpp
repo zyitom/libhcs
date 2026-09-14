@@ -65,11 +65,12 @@ void Can::handle_downlink(const data::CanDataView& data) {
     core::utility::assert_debug(data.can_data.size() <= 8);
     const auto dlc = static_cast<uint32_t>(data.can_data.size());
 
-    // 控制器常驻 FD+BRS 模式, 这是经典 CAN 的严格超集: 帧格式由 Tx 元素(T1)里的
-    // FDF/BRS 位逐帧决定 -- 经典帧(is_fdcan == false)两位清零发出, FD 帧切到
-    // 5 Mbit/s 数据段; 不需要进 INIT 模式重配, 热路径上只多两个位。
+    // 帧类型属于总线而非单帧。曾按主机头部位逐帧选择, 该位已废弃, 模式现由
+    // kCanPorts 表按总线固定(见 can.hpp), 主机在构造握手时经 EP0 读回。若仍读
+    // 头部位, 主机与板子可能对线上已定死的帧类型各执一词。控制器保持 FD 能力
+    // (CubeMX 配置 FDCAN_FRAME_FD_BRS), 对端发来的经典帧仍能接收。
     mailbox.control = dlc << 16;
-    if (data.is_fdcan)
+    if (canfd_)
         mailbox.control |= FDCAN_FD_CAN | FDCAN_BRS_ON;
 
     if (!data.can_data.empty())
@@ -100,8 +101,8 @@ void Can::handle_downlink(const data::CanDataView& data) {
         led::led->downlink_buffer_full();
         diag::note_tx_fail(diag_index());
     }
-    // Whether or not the push succeeded: a refused push means the queue is full,
-    // so it is non-empty either way. See Can::drain_pending_transmits() in can.hpp.
+    // 无论入队成败都置位: 入队被拒说明队列已满, 两种情况下队列都非空。
+    // 见 can.hpp 的 Can::drain_pending_transmits()。
     transmit_pending_mask_ |= 1U << diag_index();
 }
 
@@ -130,9 +131,10 @@ void Can::handle_uplink(data::DataId field_id, core::protocol::Serializer& seria
 
         const uint32_t rdtr = rx_mailbox->RDTR;
         data::CanDataView can_data{};
-        // Rx 元素 R1 的 bit 21 (FDF) 标记 FD 帧; 转发时原样带上,
-        // 让上位机知道每帧的真实格式。
-        can_data.is_fdcan = static_cast<bool>(rdtr & FDCAN_FD_CAN);
+        // Rx 元素 R1 的 FDF 位表示本帧以 FD 格式到达。线上协议已无逐帧类型标志
+        // (类型属于总线, 见 can.hpp), 读它只为区分 DLC 9..15 的两种含义,
+        // 见下方的丢弃与钳位处理。
+        const bool rx_fd = (rdtr & FDCAN_FD_CAN) != 0U;
         can_data.is_extended_can_id = static_cast<bool>(rx_mailbox->RIR & 0x40000000U);
         can_data.is_remote_transmission = static_cast<bool>(rx_mailbox->RIR & 0x20000000U);
 
@@ -160,7 +162,7 @@ void Can::handle_uplink(data::DataId field_id, core::protocol::Serializer& seria
         // 8 字节(FDCAN_DATA_BYTES_8), 且线协议上限也是 8, 转发出去就是静默截断 --
         // 直接丢弃该帧, 但继续排空 FIFO。经典帧 DLC 9..15 是合法的,
         // 按 CAN 规范表示 8 字节数据。
-        if (can_data.is_fdcan && can_data_length > 8) [[unlikely]] {
+        if (rx_fd && can_data_length > 8) [[unlikely]] {
             hal_can_instance->RXF0A = get_index;
             continue;
         }
@@ -183,6 +185,10 @@ void Can::handle_uplink(data::DataId field_id, core::protocol::Serializer& seria
         // 与 hpm_board 的 Can::serialize_uplink 一致, 那边一直有这个标记。无论如何
         // 下面都会确认报文: 从 RX FIFO 重试会卡住排空循环、连累更新的帧, 所以池满时
         // 仍然丢帧 -- 这里的意义只是让它不再静默。
+        // 在结果判断之前计数: 因上行批量池满而被丢的帧, 也要在 EP0 状态查询里
+        // 显示为"已接收" -- "总线有帧但我们丢了"不能看起来像"总线什么都没来",
+        // 这是每次排查死总线的第一个分叉。
+        ++forwarded_frames_;
         const auto uplink_result = serializer.write_can(field_id, can_data);
         if (uplink_result == core::protocol::Serializer::SerializeResult::kBadAlloc) [[unlikely]] {
             led::led->uplink_buffer_full();
@@ -195,6 +201,38 @@ void Can::handle_uplink(data::DataId field_id, core::protocol::Serializer& seria
 
         hal_can_instance->RXF0A = get_index;
     }
+}
+
+// 仅 EP0 使用的冷路径, 刻意不放进 ITCM 热路径段。HAL 读到的就是 M_CAN 寄存器的
+// 原始编码 -- FDCAN_PROTOCOL_ERROR_* 的 0..7 与 EP0 LastErrorCode 枚举同序 --
+// 无需任何转换即可进负载。tx_occurred/tx_cancelled 读 TXBTO/TXBCF: 由于
+// AutoRetransmission 已被 .ioc 关闭, 二者分别明确表示"已上总线"与"已放弃"。
+Can::Status Can::status() const {
+    FDCAN_ProtocolStatusTypeDef protocol_status {};
+    core::utility::assert_always(
+        HAL_FDCAN_GetProtocolStatus(hal_can_handle_, &protocol_status) == HAL_OK);
+    FDCAN_ErrorCountersTypeDef error_counters {};
+    core::utility::assert_always(
+        HAL_FDCAN_GetErrorCounters(hal_can_handle_, &error_counters) == HAL_OK);
+
+    uint8_t flags = 0;
+    if (protocol_status.ErrorPassive != 0U)
+        flags |= 1U << 0; // 被动错误
+    if (protocol_status.Warning != 0U)
+        flags |= 1U << 1; // 警告
+    if (protocol_status.BusOff != 0U)
+        flags |= 1U << 2; // 总线关闭
+    return {
+        .tec = static_cast<uint8_t>(error_counters.TxErrorCnt),
+        .rec = static_cast<uint8_t>(error_counters.RxErrorCnt),
+        .last_error = static_cast<uint8_t>(protocol_status.LastErrorCode),
+        .data_last_error = static_cast<uint8_t>(protocol_status.DataLastErrorCode),
+        .flags = flags,
+        .tx_occurred = hal_can_handle_->Instance->TXBTO,
+        .tx_cancelled = hal_can_handle_->Instance->TXBCF,
+        .rx_frames = forwarded_frames_,
+        .rx_fifo_level = hal_can_handle_->Instance->RXF0S & FDCAN_RXF0S_F0FL,
+    };
 }
 
 libhcs_ITCM
@@ -215,17 +253,16 @@ bool Can::drain_transmit_queue() {
             hardware_free_slots());
     }
 
-    // Clear this controller's pending bit only once its queue is really empty. A
-    // FIFO that filled first leaves both the frames and the bit for the next
-    // pass. See Can::drain_pending_transmits() in can.hpp.
+    // 只有队列确认已空才清本控制器的 pending 位。若期间硬件 FIFO 又被填满,
+    // 帧和位都留给下一轮。见 can.hpp 的 Can::drain_pending_transmits()。
     if (transmit_buffer_.readable() == 0)
         transmit_pending_mask_ &= ~(1U << diag_index());
 
     return sent != 0;
 }
 
-// Out-of-line half of Can::drain_pending_transmits(): only reached when some
-// controller's hardware FIFO overflowed into its software queue.
+// Can::drain_pending_transmits() 的 out-of-line 一半: 仅当某个控制器的硬件 FIFO
+// 溢出进软件队列时才会到达。
 libhcs_ITCM
 void Can::drain_pending_transmits_slow() {
     const uint32_t pending = transmit_pending_mask_;
@@ -237,10 +274,52 @@ void Can::drain_pending_transmits_slow() {
         can3->drain_transmit_queue();
 }
 
-// Debug-build invariant check behind Can::drain_pending_transmits().
+// Can::drain_pending_transmits() 背后的 debug 构建不变量检查。
 bool Can::transmit_queues_empty() {
     return can1->transmit_buffer_.readable() == 0 && can2->transmit_buffer_.readable() == 0
         && can3->transmit_buffer_.readable() == 0;
+}
+
+void Can::recover_all_stuck_transmits() {
+    can1->recover_stuck_transmits();
+    can2->recover_stuck_transmits();
+    can3->recover_stuck_transmits();
+}
+
+// ES0491 (STM32H72x/73x) 2.22.3 的软件守护。本控制器以 DAR 模式运行
+// (AutoRetransmission = DISABLE, .ioc 固定): 勘误指出, 仲裁在前两个标识符位上失败时
+// 一次发送可能既不上总线也不被取消 -- TXBRP 的请求位永久挂起, 该槽位从此不参与
+// 发送, 反复命中后 32 槽硬件 FIFO 逐次耗尽, 端口静默瘫痪。正常 DAR 语义下请求至多
+// 一个帧时间(~150 us)内终结, 仲裁丢失立即取消; 挂起超过 kStuckRequestThresholdMs
+// 且不在 bus-off(恢复期间请求位合法地长期非零, 见 bus_off_)只剩这一种硬件状态。
+//
+// 处置按勘误 workaround 取消请求(TXBCR), 释放槽位; 帧与正常 DAR 仲裁失败同语义地
+// 丢弃, EP0 状态查询的 tx_cancelled(TXBCF)可见。刻意不执行 workaround 的"重发"半步:
+// 取消一完成槽位就回到 TFQPI 分配, 同线程的下一次 handle_downlink 可能已把新帧写进
+// 同一槽位, 此时对旧请求位再置 TXBAR 会把新帧发两遍。丢弃一个已停滞 20 ms 的帧,
+// 好过让一个槽位永久蒸发。
+constexpr uint32_t kStuckRequestThresholdMs = 20;
+
+void Can::recover_stuck_transmits() {
+    const uint32_t pending = hal_can_handle_->Instance->TXBRP;
+    if (pending == 0U || bus_off_) {
+        stuck_request_since_ms_ = 0;
+        return;
+    }
+
+    const uint32_t now_ms = HAL_GetTick();
+    if (stuck_request_since_ms_ == 0U) {
+        // 0 保留为"无计时"哨兵; HAL_GetTick 开机后从 0 走起。
+        stuck_request_since_ms_ = now_ms != 0U ? now_ms : 1U;
+        return;
+    }
+    if (now_ms - stuck_request_since_ms_ < kStuckRequestThresholdMs)
+        return;
+
+    hal_can_handle_->Instance->TXBCR = pending;
+    stuck_request_since_ms_ = 0;
+    led::led->downlink_buffer_full();
+    diag::note_tx_fail(diag_index());
 }
 
 extern "C" libhcs_ITCM void HAL_FDCAN_RxFifo0Callback(
@@ -279,8 +358,21 @@ extern "C" void HAL_FDCAN_ErrorStatusCallback(
     if (!(error_status_its & FDCAN_IT_BUS_OFF))
         return;
 
+    Can* can;
+    if (hfdcan == &hfdcan1)
+        can = can1.get();
+    else if (hfdcan == &hfdcan2)
+        can = can2.get();
+    else if (hfdcan == &hfdcan3)
+        can = can3.get();
+    else
+        return;
+
     FDCAN_ProtocolStatusTypeDef status;
     HAL_FDCAN_GetProtocolStatus(hfdcan, &status);
+    // IR.BO 在 Bus_Off 置位与清零两个沿都会触发: 置位沿启动恢复流程, 清零沿只解除
+    // recover_stuck_transmits() 的屏蔽。
+    can->note_bus_off(status.BusOff != 0U);
     if (status.BusOff == 0U)
         return;
 

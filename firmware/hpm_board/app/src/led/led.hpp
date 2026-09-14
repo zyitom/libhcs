@@ -12,23 +12,20 @@ namespace libhcs::firmware::led {
 
 inline auto& led_backend = gpio_led;
 
-// CAN bus fault categories.  Deliberately coarse: a CAN controller can only
-// reliably tell "nobody acknowledged my frame" apart from "the bits on the wire
-// are corrupted".  The specific protocol error (stuff/form/bit/CRC) fluctuates
-// frame to frame and does NOT map back to a single physical cause -- reversed
-// wiring, a missing 120R termination, a short, a baudrate mismatch and plain
-// noise all produce the same mix -- so they are merged into one BUS-ERROR state
-// instead of pretending to distinguish them.  Each state renders as a distinct,
-// easy-to-read indicator-LED pattern (see the table in Led::update()).
+// CAN 总线故障分类。刻意粗化: 控制器只能可靠区分"无人应答我的帧"与"线上位
+// 出错"。具体协议错误(stuff/form/bit/CRC)逐帧波动, 并不对应单一物理原因 --
+// 反接、缺 120R 终端电阻、短路、波特率不匹配、普通噪声都产生同样的混合 -- 故
+// 合并为一个 BUS-ERROR 态, 而不是假装可以区分。每个状态渲染成一种明显不同、
+// 易读的指示灯图案(见 Led::update() 的表)。
 enum class CanFault : uint8_t {
-    kNone = 0,    // healthy / no error
-    kNoAck,       // ACK error -- alone on the bus / partner unpowered / TX wire cut
-    kWiringFault, // Bit0 error: cannot drive the bus dominant -- CAN_H/L shorted
-                  // together, reversed, or open (the common physical wiring mistakes)
-    kSignalError, // stuff/form/CRC (and the rare Bit1 "stuck dominant"): corrupted
-                  // bits whose causes -- missing 120R termination, baudrate mismatch,
-                  // noise -- fluctuate frame to frame and cannot be told apart
-    kBusOff,      // controller bus-off -- too many errors, recovering/offline
+    kNone = 0,    // 健康/无错误
+    kNoAck,       // ACK 错误 -- 总线上只有自己/对端未上电/TX 线断
+    kWiringFault, // Bit0 错误: 无法把总线驱动为显性 -- CAN_H/L 短接、反接或
+                  // 断开(最常见的物理接线错误)
+    kSignalError, // stuff/form/CRC(以及罕见的 Bit1 "显性卡死"): 出错的位, 其
+                  // 原因 -- 缺 120R 终端电阻、波特率不匹配、噪声 -- 逐帧波动,
+                  // 无法区分
+    kBusOff,      // 控制器 bus-off -- 错误过多, 恢复中/离线
 };
 
 class Led {
@@ -70,15 +67,14 @@ public:
         } while (!downlink_full_reset_counter_.compare_exchange_weak(
             downlink_full, downlink_full - 1, std::memory_order::relaxed));
 
-        // Simple 3-channel GPIO RGB LED (each color is only on/off, no PWM
-        // brightness). Color language mirrors the c_board indicator so both
-        // boards read the same; yellow is red+green and cyan is green+blue, and
-        // all three channels are never lit at once so the status stays readable:
-        //   steady green     = host session established (data forwarding)
-        //   slow green blink  = alive, waiting for host session
-        //   yellow blink      = uplink (board -> host) buffer full
-        //   cyan blink        = downlink (host -> board) buffer full
-        //   yellow/cyan alt   = both directions congested
+        // 三通道 GPIO RGB LED(每色只有开/关, 无 PWM 调光)。颜色语言与 c_board
+        // 指示灯一致, 两种板读法相同; 黄=红+绿、青=绿+蓝, 三个通道从不同时
+        // 全亮以保证状态可读:
+        //   常绿        = 主机会话已建立(数据转发中)
+        //   绿色慢闪    = 存活, 等待主机会话
+        //   黄色闪烁    = 上行(板 -> 主机)缓冲满
+        //   青色闪烁    = 下行(主机 -> 板)缓冲满
+        //   黄/青交替   = 双向拥塞
         const bool on = (tick & 128U) != 0;
         if (uplink_full && downlink_full) {
             led_backend->set_value(on ? 255 : 0, 255, on ? 0 : 255);
@@ -87,31 +83,25 @@ public:
         } else if (downlink_full) {
             led_backend->set_value(0, on ? 255 : 0, on ? 255 : 0);
         } else if (host_connected_.load(std::memory_order::relaxed)) {
-            // Host session established and healthy: steady green.
             led_backend->set_value(0, 255, 0);
         } else {
-            // No host session yet: slow green blink (~1Hz) = alive, waiting for host.
             led_backend->set_value(0, (tick & 512U) ? 255 : 0, 0);
         }
 
-        // CAN bus indicator light language — one independent LED per CAN
-        // controller, taken from the board's kCanIndicatorPins table (empty on
-        // boards without indicator LEDs).  Four states the controller can
-        // actually distinguish, each a clearly different, easy-to-read pattern:
-        //   off          = healthy / no errors
-        //   slow blink   = NO-ACK: nobody acknowledged -- alone on the bus, the
-        //                  partner is unpowered, or the TX wire is cut
-        //   fast blink   = WIRING FAULT (Bit0): the bus cannot be driven dominant
-        //                  -- CAN_H/L shorted together, reversed, or open
-        //   double blink = SIGNAL ERROR: corrupted bits -- missing 120R termination,
-        //                  baudrate mismatch or noise (cannot be told apart)
-        //   solid on     = BUS-OFF: too many errors; controller recovering/offline
-        // The CAN ISR refreshes the per-controller fault on every error
-        // interrupt; it decays here ~5 s after the last error, returning to off.
-        // Bounded by the runtime count, not the table capacity: the hpm5321 image
-        // carries two indicator entries for the dual-CAN PCB, and the single-CAN
-        // one has no indicator LEDs at all -- its PB14/PB15 are unpopulated, so
-        // driving them would be writing to pads this board does not use.
+        // CAN 总线指示灯语言: 每个 CAN 控制器一颗独立 LED, 取自板级
+        // kCanIndicatorPins 表(没有指示灯的板为空)。四种控制器真正能区分的
+        // 状态, 每种都是明显不同、易读的图案:
+        //   熄灭      = 健康/无错误
+        //   慢闪      = NO-ACK: 无人应答 -- 总线上只有自己、对端未上电或 TX 线断
+        //   快闪      = 接线故障(Bit0): 总线驱动不成显性 -- CAN_H/L 短接、反接
+        //              或断开
+        //   双闪      = 信号错误: 出错的位 -- 缺 120R 终端电阻、波特率不匹配或
+        //              噪声(无法区分)
+        //   常亮      = BUS-OFF: 错误过多, 控制器恢复中/离线
+        // CAN ISR 在每次错误中断时刷新对应控制器的故障, 此处自最后一次错误起
+        // 约 5 s 后衰减回熄灭。循环上界取运行时数量而非表容量: hpm5321 镜像的
+        // 表按双 CAN PCB 尺寸分配, 单 CAN PCB 则一个指示灯都没有 -- 它的
+        // PB14/PB15 未焊, 驱动它们等于写本板不使用的焊盘。
         for (size_t i = 0; i < board::can_indicator_count(); ++i) {
             uint16_t timeout = can_fault_timeout_[i].load(std::memory_order::relaxed);
             if (timeout) {
@@ -122,14 +112,14 @@ public:
                 timeout ? can_fault_[i].load(std::memory_order::relaxed) : CanFault::kNone;
             bool led_on = false;
             switch (fault) {
-            case CanFault::kNoAck: led_on = (tick % 1000U) < 500U; break;      // ~1 Hz
-            case CanFault::kWiringFault: led_on = (tick % 200U) < 100U; break; // ~5 Hz
-            case CanFault::kSignalError: { // two quick flashes, then a pause
+            case CanFault::kNoAck: led_on = (tick % 1000U) < 500U; break;      // 约 1 Hz
+            case CanFault::kWiringFault: led_on = (tick % 200U) < 100U; break; // 约 5 Hz
+            case CanFault::kSignalError: {                                     // 两次快闪, 然后停顿
                 const uint32_t phase = tick % 1200U;
                 led_on = phase < 120U || (phase >= 240U && phase < 360U);
                 break;
             }
-            case CanFault::kBusOff: led_on = true; break; // solid
+            case CanFault::kBusOff: led_on = true; break; // 常亮
             case CanFault::kNone: led_on = false; break;
             }
             board::kCanIndicatorPins[i].set_active(led_on);
@@ -140,17 +130,13 @@ public:
         host_connected_.store(connected, std::memory_order::relaxed);
     }
 
-    // CAN bus fault light-code tracking.  Called from the CAN ISR with the
-    // controller index (0-based) and the current fault.  The timeout keeps the
-    // indicator LED visible for ~5 s after the last error interrupt.  A kNone
-    // report only refreshes the timeout and keeps the last concrete fault, so a
-    // bus state change (warning/passive) carrying no fresh LEC does not blank a
-    // fault that was reported moments earlier.
+    // CAN 总线故障灯码记录: 由 CAN ISR 以控制器下标(0 起)和当前故障调用。
+    // 超时让指示灯在最后一次错误中断后仍可见约 5 s。kNone 只刷新超时并保留
+    // 最近的具体故障, 使不带新 LEC 的总线状态变化(warning/passive)不会抹掉
+    // 刚刚报告过的故障。
     void report_can_fault(uint8_t can_index, CanFault fault) {
-        // Guards the array bound (capacity). Whether an indicator LED physically
-        // exists is update()'s business: recording a fault for a slot that has no
-        // LED is harmless, and the check that matters for memory safety is this
-        // one.
+        // 这里守的是数组容量上界; 槽位是否真有 LED 由 update() 管: 给没有
+        // LED 的槽位记录故障无害, 内存安全真正依赖的是这个检查。
         if (can_index >= kCanIndicatorCount)
             return;
         can_fault_timeout_[can_index].store(kCanFaultTimeoutTicks, std::memory_order::relaxed);
@@ -159,16 +145,14 @@ public:
     }
 
 private:
-    // Capacity of the board's indicator table, which sizes the state arrays
-    // below. board::can_indicator_count() is how many LEDs are actually
-    // populated; the two differ only on the hpm5321 image, whose table is sized
-    // for the dual-CAN PCB while the single-CAN one has none.
+    // 板级指示灯表的容量, 决定下方状态数组的大小。board::can_indicator_count()
+    // 是实际存在的 LED 数; 两者只在 hpm5321 镜像上不同 -- 表按双 CAN PCB 尺寸
+    // 分配, 而单 CAN PCB 一个指示灯都没有。
     static constexpr size_t kCanIndicatorCount = board::kCanIndicatorPins.size();
 
-    // CAN fault indicator state — ISR-safe via atomic stores.  Each CAN
-    // controller gets its own fault/timeout pair, refreshed by the CAN ISR on
-    // every error interrupt.
-    static constexpr uint16_t kCanFaultTimeoutTicks = 5000; // 5 s at 1 kHz
+    // CAN 故障指示状态 -- 经原子存储保证 ISR 安全。每个 CAN 控制器一组
+    // fault/timeout, 由 CAN ISR 在每次错误中断时刷新。
+    static constexpr uint16_t kCanFaultTimeoutTicks = 5000; // 1 kHz tick 下的 5 s
     std::array<std::atomic<uint16_t>, kCanIndicatorCount> can_fault_timeout_{};
     std::array<std::atomic<CanFault>, kCanIndicatorCount> can_fault_{};
 

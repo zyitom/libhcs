@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
                     b->transmit([&](examples::BoardTransmitter& tx) {
                         for (int m = 0; m < motors; ++m)
                             tx.can(rx_bus, {.can_id = kFbIdBase + (uint32_t)m,
-                                            .can_data = fb, .is_fdcan = false});
+                                            .can_data = fb});
                     });
                     fb_sent.fetch_add(motors, std::memory_order_relaxed);
                 } catch (const std::exception&) {}
@@ -106,7 +106,7 @@ int main(int argc, char** argv) {
                 a->transmit([&](examples::BoardTransmitter& tx) {
                     for (int f = 0; f < cmd_frames; ++f)
                         tx.can(tx_bus, {.can_id = kCmdIdBase + (uint32_t)f,
-                                        .can_data = pay, .is_fdcan = false});
+                                        .can_data = pay});
                 });
                 sent += cmd_frames;
             } catch (const std::exception&) {}

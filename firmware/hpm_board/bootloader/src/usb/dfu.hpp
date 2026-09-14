@@ -30,11 +30,9 @@ public:
             return 0U;
 
         if (state == DFU_DNBUSY) {
-            // TinyUSB invokes download() after acknowledging GETSTATUS. Most
-            // blocks only fill the RAM sector buffer, but every fourth block
-            // synchronously erases and programs a 4 KiB flash sector. Give the
-            // host an honest poll interval for those operations so it does not
-            // start another control transfer while the ROM flash call is busy.
+            // TinyUSB 在应答 GETSTATUS 后调 download()。多数块只填 RAM 扇区缓冲,
+            // 每第四块则同步擦除并编程一个 4 KiB flash 扇区。对这些操作上报真实的
+            // 轮询间隔, 使主机不会在 ROM flash 调用忙碌期间发起下一次控制传输。
             if (!session_started_)
                 return kSectorCommitTimeoutMs;
 
@@ -55,14 +53,11 @@ public:
         if (alt != kDfuAltFlash)
             return DFU_STATUS_ERR_TARGET;
 
-        // Refuse every write on a board whose OTP identity is not one of the two
-        // known values. Writing an app that then configures PA30/PA31 for the
-        // wrong variant is the failure this exists to prevent, and there is no
-        // way to pick a safe default from here -- so nothing gets flashed until
-        // someone reads the reported word 25 and decides what the board is.
-        // ERR_TARGET is the honest status: the device cannot accept an image for
-        // this target. dfu-util surfaces it as a failed download rather than a
-        // silent success.
+        // OTP 身份非两个已知值之一的板拒绝一切写入。刷进一个会按错误板型配置
+        // PA30/PA31 的 app 正是本检查要防的失败, 而这里无从选择安全默认 --
+        // 在有人读出上报的 word 25 并判定板型之前, 什么都不刷。ERR_TARGET 是
+        // 诚实的状态码: 设备无法接受发给该目标的镜像, dfu-util 会显示下载失败
+        // 而非静默成功。
         if (!board::board_identity().recognized())
             return DFU_STATUS_ERR_TARGET;
 
@@ -78,9 +73,7 @@ public:
 
             flash_writer_.begin_session();
 
-            // Reported rather than fatal: a metadata sector that will not erase
-            // used to trap here, which took the device off the bus with no way
-            // for the host to tell what happened.
+            // 上报而非致命: 在这里 trap 会把设备拽下总线, 主机无从得知发生了什么。
             if (!flash::Metadata::get_instance().begin_flashing())
                 return fail(DFU_STATUS_ERR_ERASE);
 

@@ -51,9 +51,8 @@ public:
 
             flash_writer_.begin_session();
 
-            // Reported rather than fatal: a metadata sector that will not erase
-            // used to trap here, which took the device off the bus with no way
-            // for the host to tell what happened.
+            // 以上报代替 trap: metadata 扇区无法擦除时, 设备必须保持在线、可被
+            // 主机诊断, 而不是直接掉线。
             if (!flash::Metadata::get_instance().begin_flashing())
                 return fail(DFU_STATUS_ERR_ERASE);
 
@@ -78,9 +77,8 @@ public:
 
         const uint64_t downloaded_size_64 =
             static_cast<uint64_t>(downloaded_size_) + static_cast<uint64_t>(length);
-        // ERR_FILE, not ERR_ADDRESS: the transfer is well-formed, the image is
-        // simply larger than the application region. Distinguishing the two lets
-        // the host tell "the protocol went wrong" from "your file does not fit".
+        // 用 ERR_FILE 而非 ERR_ADDRESS: 传输本身合规, 只是镜像超出 App 区域大小。
+        // 区分二者可让主机分辨协议出错与文件过大。
         if (downloaded_size_64 > static_cast<uint64_t>(flash::kAppMaxImageSize))
             return fail(DFU_STATUS_ERR_FILE);
 

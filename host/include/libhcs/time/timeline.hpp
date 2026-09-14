@@ -133,6 +133,11 @@ private:
 
     void refit_locked();
 
+    // Callers must hold mutex_. host_time_of(double) takes the mutex once and
+    // uses this for both interpolation endpoints, so the two cannot come from
+    // different sources.
+    Clock::time_point host_time_of_locked(uint64_t microframe) const;
+
     mutable std::mutex mutex_;
     Clock::time_point origin_;
     std::chrono::system_clock::time_point unix_origin_;

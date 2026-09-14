@@ -15,16 +15,14 @@
 
 namespace libhcs::firmware::timer {
 
-// Timestamp source for IMU/GPIO telemetry.
+// IMU/GPIO 遥测的时间戳源。
 //
-// The protocol expresses timestamps in quarter-microseconds (a 4 MHz tick), the
-// same unit used by c_board and hpm_board. On mc02 the SYSCLK is 550 MHz, so
-// every timer kernel runs at 275 MHz; because 550 MHz carries a factor of 11, no
-// integer prescaler yields exactly 4 MHz. Instead TIM5 (a free-running 32-bit
-// timer) is prescaled to exactly 1 MHz and timepoint() returns CNT << 2, which is
-// an exact quarter-us value (1 us resolution -- ample for a <= 2 kHz IMU). TIM5's
-// ARR is 0x3FFFFFFF so that (CNT << 2) spans the full uint32 range and wraps
-// cleanly at 2^32 quarter-us (~1073 s); the host only consumes wrap-safe deltas.
+// 协议时间戳单位是 quarter-us(4 MHz tick), 与 c_board、hpm_board 一致。mc02 的
+// SYSCLK 为 550 MHz, 各定时器内核跑 275 MHz; 550 MHz 含因子 11, 任何整数预分频
+// 都得不到恰好 4 MHz。改为把 TIM5(自由运行 32 位定时器)预分频到恰好 1 MHz,
+// timepoint() 返回 CNT << 2 -- 精确的 quarter-us 值(分辨率 1 us, 对 <= 2 kHz 的
+// IMU 足够)。TIM5 的 ARR 取 0x3FFFFFFF, 使 (CNT << 2) 铺满整个 uint32 区间并在
+// 2^32 quarter-us(约 1073 s)处干净回绕; 主机只消费回绕安全的差值。
 class Timer {
 public:
     using Lazy = utility::Lazy<Timer>;
@@ -32,11 +30,11 @@ public:
     static constexpr uint32_t kClockFrequency = 4'000'000;
     using TickPeriod = std::ratio<1, kClockFrequency>;
 
-    // 1/4 us
+    // 单位为 1/4 us
     using Duration = std::chrono::duration<uint32_t, TickPeriod>;
     using TimePoint = std::chrono::time_point<uint32_t, Duration>;
 
-    // Keep the true-window at least half-cycle for stateless expiration checks.
+    // 真窗口至少保留半个计数周期, 到期检查才能无状态地做。
     static constexpr uint32_t kMaxDurationTicks = uint32_t{1} << 31;
 
     static constexpr TIM_HandleTypeDef* kTimer = &htim5;
@@ -65,9 +63,8 @@ public:
         return elapsed_ticks < kMaxDurationTicks;
     }
 
-    // Busy-wait for the given duration off the free-running TIM5 counter. Reads
-    // CNT directly, so it works with interrupts disabled (e.g. during init under an
-    // InterruptLockGuard); requires timer.init() to have started TIM5.
+    // 基于自由运行的 TIM5 计数器忙等给定时长。直接读 CNT, 故可在中断关闭时使用
+    // (如 InterruptLockGuard 下的初始化阶段); 要求 timer.init() 已启动 TIM5。
     void spin_wait(Duration delay) const {
         core::utility::assert_debug(delay.count() <= kMaxDurationTicks);
 

@@ -18,16 +18,14 @@
 
 namespace libhcs::firmware::flash {
 
-// Thin wrapper over the ROM XPI NOR API.
+// ROM XPI NOR API 的薄封装。
 //
-// Erase/program failures are returned to the caller rather than trapping: the
-// bootloader is the last line of recovery, so a NOR that stops accepting writes
-// has to surface as a DFU error status the host can act on, not as a fault that
-// takes the device off the bus with nothing to report.
+// 擦除/编程失败返回给调用方而非 trap: bootloader 是恢复的最后防线, 拒绝写入的
+// NOR 必须以主机可处理的 DFU 错误状态浮出, 而非以无从上报的 fault 把设备拽下
+// 总线。
 //
-// Availability of the flash itself is a separate matter: if auto-config fails
-// at construction there is no usable NOR at all, which is reported through
-// available() so callers can turn it into an error status too.
+// flash 本体是否可用是另一回事: 构造时 auto-config 失败即完全没有可用的 NOR,
+// 经 available() 上报, 调用方同样可将其转成错误状态。
 class XpiNor {
 public:
     static XpiNor& instance() {

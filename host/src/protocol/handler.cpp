@@ -42,8 +42,7 @@ public:
     static constexpr auto kSessionAckTimeout = std::chrono::milliseconds{200};
     static constexpr size_t kSessionAckRetryCount = 5;
     // Also the anchor period for the shared time base. The board's session
-    // lease is 1 s, so 250 ms is ample for the keepalive itself; what used to
-    // set this number was time accuracy, and that is no longer true.
+    // lease is 4 s, so 1 s is ample for the keepalive itself.
     //
     // WHY IT WAS 50 ms. Each anchor exchange contributed one sample to the
     // Timeline's fit of (microframe -> host time), whose error falls as sqrt(N)
@@ -51,20 +50,21 @@ public:
     // measured on mc02, 250 ms -> 50 ms took the fitted phase from 18.5 us to
     // 8.4 us.
     //
-    // WHY IT IS 250 ms AGAIN. MicroframeTimebase reads the same axis from the
-    // controller's own counter at 23 ns, which is not an improvement on that
-    // fit but a replacement for it: with the source locked, the ARRIVAL TIME of
-    // a session packet is not used for anything. Board reports are still needed
-    // to learn the constant integer offset between the two counters, but that
-    // is one integer and 250 ms reaches the 32-sample minimum in 8 s instead of
-    // 2.7 s. Accuracy after lock is identical -- MEASURED, both periods below.
-    //
-    // THE COST IS REAL BUT IT IS ON THE FALLBACK. Where the source is
-    // unavailable -- no root, no CAP_SYS_RAWIO, an ARM SoC with no PCI BAR to
-    // map -- the round-trip fit is still what answers, and at 250 ms it is
-    // worth 18.5 us rather than 8.4 us. Anything that needs microseconds
-    // WITHOUT the microframe source must put this back to 50 ms.
-    static constexpr auto kSessionRefreshInterval = std::chrono::milliseconds{250};
+    // WHY IT IS 1 s. Two things replaced that fit. MicroframeTimebase reads the
+    // same axis from the controller's own counter at ~20 ns, and the boards'
+    // absolute axes are self-sustaining once anchored (counter + local fit, the
+    // anchor only resolves a wrap) -- so nothing on the precision path consumes
+    // the arrival timing of these packets any more. What the round still buys:
+    // the anchor wrap watchdog (a board counter that loses >1 s is caught within
+    // one round), Timeline/MicroframeTimebase observations, and board health.
+    // 1 Hz keeps all of that while the steady-state sync traffic drops to
+    // ~60 B/s. The cost is one-time, on the fallback path only: with the source
+    // unavailable, the round-trip fit converges on a 17 min window, and the
+    // integer-offset lock needs 32 observations = 32 s.
+    // 2026-09-13: 1 Hz 轮次在 hpm 板上诱发 keepalive 丢 ack(与轮次周期强耦合,
+    // mc02 正常;租约 4 s 后仍复现,疑似下行 arm/节流或链路恢复后的端点状态,
+    // 待定位)。回落到实测稳定的 250 ms。
+    static constexpr auto kSessionRefreshInterval = std::chrono::seconds{1};
 
     Impl(
         std::unique_ptr<transport::Transport> transport, data::DataCallback& callback,
@@ -72,26 +72,22 @@ public:
         : callback_(callback)
         , deserializer_(*this)
         , expected_session_nonce_(generate_session_nonce())
-        , expected_session_start_ack_(make_session_start_ack(expected_session_nonce_))
         , time_sync_enabled_(enable_time_sync)
+        , expected_session_start_ack_(make_session_start_ack(expected_session_nonce_))
         , transport_(std::move(transport)) {
         // USB bulk completions are arbitrary slices of one reliable byte
         // stream, not protocol-field boundaries.
         transport_->receive([this](std::span<const std::byte> buffer) { receive_stream(buffer); });
         transport_->on_link_restart([this] {
             // A new ARQ generation cannot continue a partially received
-            // protocol field. The callback runs on the transport receive
-            // thread, so it is serialized with deserializer_.feed().
-            deserializer_.finish_transfer();
-            awaiting_session_start_ack_ = true;
-            session_start_ack_window_size_ = 0;
-            {
-                // Pair the state change with the condition-variable mutex so
-                // the keepalive thread cannot miss the restart notification.
-                const std::scoped_lock guard{session_mutex_};
-                session_established_.store(false, std::memory_order_release);
-            }
-            session_cv_.notify_all();
+            // protocol field. This callback runs on the transport's recovery
+            // thread -- NOT the receive thread, despite what an earlier
+            // comment claimed here -- and the deserializer may only be
+            // touched from the receive thread. So all it does is mark the
+            // stream poisoned: the next receive_stream() performs the reset
+            // before feeding any byte of the new connection, serialized with
+            // feed() by construction rather than by a drain timeout.
+            link_restart_pending_.store(true, std::memory_order_release);
         });
 
         // NOT started here: a transport may have an out-of-band handshake that
@@ -338,12 +334,6 @@ public:
         guard_callback([&] { callback_.time_status_callback(data); });
     }
 
-    void sync_sample_deserialized_callback(const data::SyncSampleView& data) override {
-        if (data.nonce != expected_session_nonce_)
-            return;
-        guard_callback([&] { callback_.sync_sample_callback(data); });
-    }
-
     void pulse_report_deserialized_callback(const data::PulseReportView& data) override {
         if (data.nonce != expected_session_nonce_)
             return;
@@ -395,9 +385,35 @@ private:
         return ack;
     }
 
+    // Idempotent: a restart that lands while an earlier one is being consumed
+    // simply runs this a second time.
+    void reset_link_state() {
+        deserializer_.finish_transfer();
+        awaiting_session_start_ack_ = true;
+        session_start_ack_window_size_ = 0;
+        {
+            // Pair the state change with the condition-variable mutex so the
+            // keepalive thread cannot miss the restart notification.
+            const std::scoped_lock guard{session_mutex_};
+            session_established_.store(false, std::memory_order_release);
+        }
+        session_cv_.notify_all();
+    }
+
     // A reopened transport may still complete queued bytes from the previous
     // session. Only this Handler's nonce identifies a safe field boundary.
     void receive_stream(std::span<const std::byte> buffer) {
+        // Every call of this function runs on the transport's receive thread,
+        // the one thread the deserializer may be touched from -- which is what
+        // makes consuming the deferred link restart here safe without any
+        // lock on the data path.
+        if (link_restart_pending_.load(std::memory_order_acquire)) [[unlikely]] {
+            // exchange, not load-then-clear: a re-open that lands between the
+            // load above and the clear must not be lost to it.
+            while (link_restart_pending_.exchange(false, std::memory_order_acq_rel))
+                reset_link_state();
+        }
+
         if (!awaiting_session_start_ack_) {
             deserializer_.feed(buffer);
             return;
@@ -547,7 +563,6 @@ private:
         // whole seconds while each looked perfectly healthy on its own.
         const auto now = time::Timeline::Clock::now();
         const uint64_t microframe = time::timeline().anchor_for(now);
-        time_anchor_sent_at_.store(now, std::memory_order_release);
 
         core::protocol::Serializer::SerializeResult result;
         {
@@ -560,8 +575,14 @@ private:
             result != core::protocol::Serializer::SerializeResult::kInvalidArgument);
         // Deliberately not fatal, unlike the keepalive: a dropped anchor costs
         // one period of timeline convergence, never the session.
-        if (result == core::protocol::Serializer::SerializeResult::kBadAlloc) [[unlikely]]
+        if (result == core::protocol::Serializer::SerializeResult::kBadAlloc) [[unlikely]] {
             logging::get_logger().error("Failed to transmit Time Anchor: transmit buffer full");
+            return;
+        }
+        // Stored only after the anchor actually went out. A kTimeStatus that
+        // answers round N can still arrive after round N+1 failed; pairing it
+        // with a failed round's timestamp would misplace it by a whole period.
+        time_anchor_sent_at_.store(now, std::memory_order_release);
     }
 
     void keepalive_loop() {
@@ -648,6 +669,9 @@ private:
     mutable std::mutex session_mutex_;
     std::condition_variable session_cv_;
     std::atomic<bool> session_established_{false};
+    // Set by the transport's recovery thread, consumed by receive_stream();
+    // the deserializer itself is only ever touched on the receive thread.
+    std::atomic<bool> link_restart_pending_{false};
     uint64_t session_start_ack_count_ = 0;
     uint64_t session_keepalive_ack_count_ = 0;
     uint32_t expected_session_nonce_ = 0;
@@ -872,7 +896,9 @@ bool Handler::vendor_control_out(
     std::array<std::byte, kVendorControlPayloadMax> scratch{};
     if (size > scratch.size())
         throw std::invalid_argument{"EP0 payload too large"};
-    std::memcpy(scratch.data(), payload, size);
+    // memcpy(p, nullptr, 0) is pedantically UB; a size-0 EP0 request is legal.
+    if (size != 0)
+        std::memcpy(scratch.data(), payload, size);
     return impl_->vendor_control(
         core::protocol::vendor_control::kRequestTypeOut, request, index,
         std::span<std::byte>{scratch.data(), size});
@@ -886,7 +912,7 @@ bool Handler::vendor_control_in(uint8_t request, uint16_t index, void* payload, 
     const bool ok = impl_->vendor_control(
         core::protocol::vendor_control::kRequestTypeIn, request, index,
         std::span<std::byte>{scratch.data(), size});
-    if (ok)
+    if (ok && size != 0)
         std::memcpy(payload, scratch.data(), size);
     return ok;
 }

@@ -11,8 +11,8 @@
 
 namespace libhcs::firmware::utility {
 
-// Lazy-initialized object with deferred construction.
-// Thread-safe single-time initialization guarded by interrupt lock.
+// 延迟构造的懒初始化对象: 首次 init() 时才构造。
+// 一次性初始化以关中断(InterruptLockGuard)保证线程安全。
 template <typename T, typename... Args>
 class Lazy {
 public:
@@ -25,13 +25,9 @@ public:
     Lazy(Lazy&&) = delete;
     Lazy& operator=(Lazy&&) = delete;
 
-    constexpr ~Lazy() {} // No need to deconstruct
+    constexpr ~Lazy() {} // 无需析构
 
-    /*!
-     * @brief Construct the object on first call; no-op on subsequent calls.
-     * @return Reference to the constructed object
-     * @note Thread-safe. Uses interrupt lock for atomic state transitions.
-     */
+    // 首次调用时构造对象, 之后为空操作; 关中断保证状态迁移的原子性。
     constexpr T& init() {
         const InterruptLockGuard guard;
 
@@ -51,46 +47,26 @@ public:
         return object_;
     }
 
-    /*!
-     * @brief Get pointer to the constructed object, or nullptr if not yet
-     *        initialized.
-     * @return Pointer to the object, or nullptr if not yet initialized
-     * @note Does not assert on uninitialized state. Check return before use.
-     */
+    // 未初始化时返回 nullptr 而不断言, 由调用方自行检查返回值。
     constexpr T* try_get() {
         if (!static_cast<bool>(*this))
             return nullptr;
         return std::addressof(object_);
     }
 
-    /*!
-     * @brief Get pointer to the constructed object
-     * @return Pointer to the constructed object
-     * @warning Must only be called after init(). Asserts if uninitialized
-     *          in debug builds.
-     */
+    // 必须在 init() 之后调用; debug 构建下未初始化会断言。
     constexpr T* get() {
         core::utility::assert_debug(static_cast<bool>(*this));
         return std::addressof(object_);
     }
 
-    /*!
-     * @brief Member access through the constructed object
-     * @return Pointer to the constructed object
-     * @warning Must only be called after init(). Asserts if uninitialized
-     *          in debug builds.
-     */
+    // 必须在 init() 之后调用; debug 构建下未初始化会断言。
     constexpr T* operator->() {
         core::utility::assert_debug(static_cast<bool>(*this));
         return std::addressof(object_);
     }
 
-    /*!
-     * @brief Dereference to access the constructed object
-     * @return Reference to the constructed object
-     * @warning Must only be called after init(). Asserts if uninitialized
-     *          in debug builds.
-     */
+    // 必须在 init() 之后调用; debug 构建下未初始化会断言。
     constexpr T& operator*() {
         core::utility::assert_debug(static_cast<bool>(*this));
         return object_;
@@ -115,6 +91,7 @@ private:
     enum class InitStatus : uint8_t { kUninitialized = 2, kInitializing = 1, kInitialized = 0 };
     std::atomic<InitStatus> init_status_;
 
+    // union: 构造参数与对象共用同一存储。init() 时先移走并销毁参数, 再原地构造对象。
     union {
         T object_;
         ArgTupleT construction_arguments_;

@@ -169,8 +169,7 @@ private: // Configuration Descriptor
 private: // String Descriptor
     static constexpr std::array<uint8_t, 2> kLanguageId = {0x09, 0x04};
     static constexpr std::string_view kManufacturerString = "Helios";
-    static constexpr std::string_view kProductString =
-        "HCS Agent v" libhcs_PROJECT_VERSION_STRING;
+    static constexpr std::string_view kProductString = "HCS Agent v" libhcs_PROJECT_VERSION_STRING;
     static constexpr std::string_view kDfuRuntimeString = "DFU Runtime";
     std::array<char, 33> serial_string_{"D4-0000-0000-0000-0000-0000-0000"};
 

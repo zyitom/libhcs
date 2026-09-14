@@ -75,7 +75,7 @@ public:
     void broadcast(const std::array<std::byte, 8>& frame) {
         board_->transmit([&](examples::BoardTransmitter& tx) {
             for (const uint32_t id : k_motor_ids)
-                tx.can(0, {.can_id = id, .can_data = frame, .is_fdcan = true});
+                tx.can(0, {.can_id = id, .can_data = frame});
         });
     }
 
@@ -89,7 +89,7 @@ public:
                 const std::array<std::byte, 8> frame = {
                     std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
                     std::byte{0}, std::byte{0}, std::byte{0}, cmd_byte(id)};
-                tx.can(0, {.can_id = id, .can_data = frame, .is_fdcan = true});
+                tx.can(0, {.can_id = id, .can_data = frame});
             }
             if (k_send_uart)
                 tx.uart(0, {.uart_data = k_uart_payload, .idle_delimited = true});

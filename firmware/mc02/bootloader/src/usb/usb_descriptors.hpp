@@ -17,24 +17,23 @@
 
 namespace libhcs::firmware::usb {
 
-// Why the bootloader stayed in DFU instead of launching the application.
-// Surfaced through the alt-setting string so `dfu-util -l` reports it without
-// any vendor-specific protocol: the bootloader has no vendor interface, and a
-// DFU status code cannot describe a decision made before the host showed up.
+// bootloader 停留 DFU 而未启动应用的原因。通过 alt-setting 字符串上报, 主机用
+// `dfu-util -l` 即可看到, 无需任何厂商自定义协议: bootloader 没有厂商接口, 且
+// DFU 状态码无法描述主机接入之前就已作出的决定。
 enum class DfuEntryReason : uint8_t {
-    kUnknown,       // Not set yet
-    kUserKey,       // KEY held at reset -- unconditional recovery path
-    kHostRequest,   // Application asked for DFU through the boot mailbox
-    kNoValidApp,    // No application image, or it failed validation
-    kInterrupted,   // A previous download lost power mid-session
+    kUnknown,       // 尚未设置
+    kUserKey,       // 复位时按住 KEY -- 无条件恢复路径
+    kHostRequest,   // 应用经 boot mailbox 请求进入 DFU
+    kNoValidApp,    // 无应用镜像, 或校验失败
+    kInterrupted,   // 上次下载中途掉电
 };
 
 class UsbDescriptors {
 public:
     UsbDescriptors() { update_serial_string(); }
 
-    // Must be called before the host enumerates (string descriptors are read
-    // during enumeration), i.e. before tusb_rhport_init() in main().
+    // 必须在主机枚举之前调用(字符串描述符在枚举期间读取), 即 main() 中的
+    // tusb_rhport_init() 之前。
     void set_entry_reason(DfuEntryReason reason) { entry_reason_ = reason; }
 
     static uint8_t const* get_device_descriptor() {
@@ -78,8 +77,8 @@ public:
     }
 
 private:
-    // dfu-util prints this as name="..." for the alt setting, so the tag rides
-    // along with the interface name the host already displays.
+    // dfu-util 会把该串作为 alt setting 的 name="..." 打印, 因此入口标记随主机
+    // 本就显示的接口名一并呈现。
     std::string_view alt0_string() const {
         switch (entry_reason_) {
         case DfuEntryReason::kUserKey: return "Internal Flash [KEY]";
@@ -140,7 +139,7 @@ private:
         return buffer;
     }
 
-private: // Device Descriptor
+private: // 设备描述符
     static constexpr tusb_desc_device_t kDeviceDescriptor = {
         .bLength = sizeof(tusb_desc_device_t),
         .bDescriptorType = TUSB_DESC_DEVICE,
@@ -162,7 +161,7 @@ private: // Device Descriptor
         .bNumConfigurations = 0x01,
     };
 
-private: // Configuration Descriptor
+private: // 配置描述符
     static constexpr uint8_t kItfNumDfu = 0;
     static constexpr uint8_t kItfNumTotal = 1;
 
@@ -173,7 +172,7 @@ private: // Configuration Descriptor
     };
     static_assert(sizeof(kConfigurationDescriptorFs) == kConfigTotalLen);
 
-private: // String Descriptor
+private: // 字符串描述符
     static constexpr std::array<uint8_t, 2> kLanguageId = {0x09, 0x04};
     static constexpr std::string_view kManufacturerString = "Helios";
     static constexpr std::string_view kProductString = "HCS DFU Bootloader";

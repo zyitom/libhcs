@@ -45,15 +45,11 @@ namespace {
 constexpr uint32_t kCanId = 0x556;
 constexpr size_t kPayloadSize = 8;
 
-// HCS_CAN_CLASSIC=1 sends classic CAN instead of CAN-FD. The board runs FD at
-// 1 Mbit/s arbitration + 5 Mbit/s data with BRS, so an 8-byte classic frame
-// spends far longer on the wire than the same payload in FD. Running both and
-// differencing the RTTs separates the CAN serialization time from the rest of
-// the loop (USB + cross-core rings + protocol), which no single run can do.
-bool use_fdcan() {
-    const char* classic = std::getenv("HCS_CAN_CLASSIC");
-    return !(classic && classic[0] == '1');
-}
+// This probe used to difference classic-vs-FD round trips (HCS_CAN_CLASSIC=1)
+// to separate CAN serialization time from the rest of the loop. That axis is
+// gone with the per-frame is_fdcan flag: the board now puts every frame on the
+// wire in its bus's compiled mode, so the CAN serialization share is a fixed
+// term of every measurement instead of a switchable one.
 constexpr uint32_t kWarmupSamples = 100;
 constexpr auto kEchoTimeout = std::chrono::milliseconds{20};
 
@@ -151,7 +147,7 @@ private:
         }
 
         const auto receive_time = Clock::now();
-        if (data.can_id != kCanId || data.is_fdcan != use_fdcan() || data.is_extended_can_id
+        if (data.can_id != kCanId || data.is_extended_can_id
             || data.is_remote_transmission || data.can_data.size() != kPayloadSize) {
             invalid_.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -214,7 +210,7 @@ int run_latency(
 
         receiver.arm(sequence, Receiver::Clock::now());
         board.start_transmit().can_transmit(tx_port,
-            {.can_id = kCanId, .can_data = payload, .is_fdcan = use_fdcan()});
+            {.can_id = kCanId, .can_data = payload});
 
         double rtt_us = 0.0;
         if (!receiver.wait(sequence, rtt_us)) {
@@ -320,7 +316,7 @@ int run_latency_paced(
 
         receiver.arm(sequence, tick_time);
         board.start_transmit().can_transmit(tx_port,
-            {.can_id = kCanId, .can_data = payload, .is_fdcan = use_fdcan()});
+            {.can_id = kCanId, .can_data = payload});
 
         double rtt_us = 0.0;
         if (receiver.wait(sequence, rtt_us)) {

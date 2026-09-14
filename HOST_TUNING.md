@@ -510,6 +510,27 @@ A/B/A，两块 5321 DualCan、`release` 固件、事件线程绑 `7,6`、各 200
 | 网卡 | `enp44s0`/`enp45s0`，均为 **r8169**（RTL8125） | `enp2s0`，`igc` | **本机没有 igc 网卡** |
 | clang 工具 | `clang-format-18` / `clang-tidy-18` | `ENV.md` 的安装命令写 `-20` | 满足 `ENV.md` 表里的"≥16"，只是装的版本不同 |
 
+### 4.1 MFINDEX 免 root 访问（udev 规则）[实测 2026-09-13]
+
+微帧时间源（`host/src/time/microframe_source.cpp`）读的是 xHCI 的 MFINDEX 寄存器，
+在 `resource0` 的 BAR 映射里。该文件默认 `root:root 0600`，导致这条路径此前只能在
+sudo 下工作。已安装 `/etc/udev/rules.d/99-libhcs-xhci-resource0.rules`，对全部
+xHCI 控制器（class `0x0c0330`）的 `resource0` 授 **组只读**（`chgrp helios` +
+`chmod g+r`）：
+
+```udev
+ACTION=="add", SUBSYSTEM=="pci", ATTR{class}=="0x0c0330", RUN+="/bin/sh -c '/bin/chgrp helios /sys/bus/pci/devices/%k/resource0 && /bin/chmod g+r /sys/bus/pci/devices/%k/resource0'"
+```
+
+- **验证**：`microframe_source_test 3 60` 不带 sudo 打印 `counter modulus` 即通过
+  `[实测：本机 16384（14 位），非 root 打开+边沿狩猎全链路通过]`。
+- **权限边界**：组内成员可只读映射整个 xHCI BAR（MFINDEX 无副作用，其余寄存器
+  读取一般也无副作用；代码从不写）。要收回就删掉这条规则并 `udevadm trigger`。
+- **跨机器**：MFINDEX 位宽规范为 10 位、Intel 实测为 14 位，构造期自适应探测
+  （`counter_modulus()` 发布结果），探测窗口 300 ms 保证两种宽度都被识别；行为
+  验证（8 kHz 速率 ±5%、逐区间一致性）拒绝挂起/D3/非 xHCI 控制器。换机器先跑
+  一次 `microframe_source_test` 看探测结果再信任它。
+
 ---
 
 ## 5. 还没测过的，按预期收益排序
@@ -1523,3 +1544,85 @@ p50 126.1 和 153.8，而 A→B 稳定在 116。该子指标不稳定，不能�
 
 **本机没有安装 `clang-format`**，`.scripts/clang-format-check` 因此无法运行，
 这两处改动未经格式化门禁。提交前需先安装。`[待办]`
+
+---
+
+## 11. 2026-09-12 三板复测：EP0 时代配置的完整延迟预算 + 一个新故障模式
+
+**背景**：HCS 侧（`~/Desktop/HCS`）两块 5321 DualCan + 一块 mc02 挂 `00:14.0`，`hcs_link`
+探针在真实 executor 里以生产线程布局跑 1 kHz。本节记录三件事：一个此前没记录过的故障
+模式、用 EP0 `latency_breakdown` 凑齐的完整预算、以及 §2 那批内核旋钮在 EP0 时代配置下的复验。
+
+工具：`host/examples/rtt_split.cpp`（生产线程布局 + 载荷扫描 + EP0 分解读取）、
+`tools/imod.c`（IMOD 寄存器读写，验证 §2 的 IMOD 结论）。
+
+### 11.1 新故障模式：总线上停在 DFU bootloader 的板子会造成微帧量化的延迟簇 [实测 A/B]
+
+**症状签名**：单拍 RTT 按 ~125 µs 的 microframe 粒度量化递增、成簇出现
+（300 → 400 → 500 → 600 µs 连续 4-5 拍），偶发跨过 1 ms；**两块板同刻成对**（同一次
+xHCI 事件批处理里一起被拖住）。trace-cmd（`-C mono`）对齐后看到：OUT `urb_enqueue`
+→ OUT `urb_giveback` 之间隔 1.0-1.4 ms，期间 xHCI 中断（CPU4）零事件、CPU4 零调度，
+giveback 一次冲出 5 个 URB——控制器整段沉默，直到下一拍 USB 提交把它冲出来。
+
+**A/B 定位**：把停在 DFU bootloader 的第二块 5321（AF-958F）`authorized=0`
+（不断电、不断链，仅内核层摘除）后，20000 拍里 ≥500 µs 的拍从 10 降到 **0**，中断
+最大空窗 1404 → 587 µs；恢复 authorized=1 且板上固件已被端口禁用周期复位后亦未复发。
+**机制是"被枚举在总线上"这件事本身**：整个 90 s trace 里该设备零 URB、零枚举、零端口
+状态事件，纯协议层存在性即可致病，`authorized=0` 不断电也能除病。
+
+**教训**：多板 rig 上任何"偶发、成簇、按 microframe 量化"的延迟，先查总线上有没有
+停在 bootloader 的板子，再谈别的。刷好应用固件后该现象消失（20000 拍 0 次 ≥1 ms）。
+
+### 11.2 完整延迟预算（EP0 `latency_breakdown` + 载荷扫描，全部实测）
+
+板端两段（`hcs_config.hpp` 的 EP0 查询，累计 778 万帧，480 MHz）：
+
+| 段 | 均值 | max |
+|---|---|---|
+| downlink（bulk OUT 回调 → 帧进 TX FIFO） | **2.66 µs** | 20.0 µs |
+| uplink（CAN RX ISR → 序列化进上行批） | **2.32 µs** | 8.3 µs |
+
+线上时间（载荷扫描差分，无时钟域问题）：RTT(8B) − RTT(1B) = **27.5 µs / 7 字节** ⇒
+**回环口的数据相位实测 ≈ 2 Mbit，不是 5 M**；8 字节帧线上 ≈ 55-60 µs。
+**待查**：§8.3 的 19870 f/s 上限按 1M/**5M** 核算，与本测量矛盾。可能回环 port 表
+与电机总线的位定时不同（位定时由 `can.hpp` 的求解器定，逐口可配），需读 MCAN 寄存器
+或示波器定案。在定案前，引用 §8.3 的 f/s 上限时注意它对应哪条总线的配置。
+
+整机预算（p50 = 114.6 µs，逐项实测，合Σ=115 吻合）：
+
+| 段 | µs | 测法 |
+|---|---|---|
+| CAN 帧线上（8B FD，1M/2M） | ~57 | 载荷扫描差分 |
+| 板内下行 + 上行 | ~5 | EP0 计数器 |
+| 主机 submit（SDK 提交） | ~8 | 探针 tx 指标 |
+| 主机 giveback → 回调（tasklet+IPI+RT 唤醒） | ~16 | trace 锚点 |
+| USB 微帧调度 + IN 轮询残差 + IRQ | ~25 | 余量扣算（中等置信） |
+
+**结论**：§10.11.6 "Linux 侧到底了" 在 EP0 时代配置下依旧成立，且板端两段也只有
+5 µs——单帧 RTT 的预算被线上时间和微帧格子占掉 ~75%，x86 与 MCU 都无值得动的项。
+
+### 11.3 内核旋钮复验（EP0 时代配置）[实测 2026-09-12]
+
+全核 `performance` + `cpu_dma_latency=0` 同时开，20000 拍 A/B：
+p50 114.6 → 114.9、p99 129.4 → 129.8，**均不动**——§2 的旧收益（PM QoS p99.9
+188→159）未在今天的干净配置上复现（20000 拍对 p99.9 以上分辨率不足；max 被单离群
+主导）。另两项寄存器/运行时状态核实：**IMOD 实读 = 0**（无聚合）；**xHCI 中断线程
+已在 FIFO 90**（trace 内部优先级 [9] = 99−90，多板必需值，§8 要求已满足）。
+
+教训重申（§1.3 已写，本轮再踩一次）：**隔离核上 `scaling_cur_freq` 恒读 400 MHz**，
+不代表真实频率；要读频率用 APERF/MPERF（`usb_ep0_rtt` 的 `CpuClock` 路径）。
+
+### 11.4 mc02 的 IO 线程必须绑核 [实测 2026-09-12]
+
+mc02 在 HCS 探针里 IO/发送线程曾留普通核 free-running（SCHED_OTHER）：远程桌面负载下
+rtt max **26.7 ms**、≥1 ms 计数爆 30 倍，而其内核侧 USB 延迟全程干净（max 268 µs）——
+纯 CFS 线程调度问题。绑 CPU7 FIFO78（排两块 5321 的 IO 80 与保活 79 之后）后
+max 490 µs。数值与设置见 HCS 仓库 `hcs_bringup/config/hcs_link.yaml` 头注。
+
+### 11.5 本轮为工具做的改动
+
+- 新增 `host/examples/rtt_split.cpp`（生产线程布局复刻 + 载荷扫描 + EP0 分解读取）
+- 新增 `tools/imod.c`（IMOD 寄存器读改写，验证 §2 的 IMOD 结论用）
+- `firmware/mc02/app/src/usb/vendor_control.cpp`：补 `namespace usb = libhcs::firmware::usb;`
+  别名（EP0 改造中 `handle_setup` 引用 `usb::vendor` 但别名缺失，编译失败）
+- 数据与探针日志：HCS 仓库 `traces/`（trace_baselineA2/B/C/D.dat + 三份探针日志）

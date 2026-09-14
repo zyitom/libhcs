@@ -27,9 +27,8 @@ namespace libhcs::firmware::usb {
 
 void poll_dfu_runtime_reboot();
 
-// USB vendor-class host transport: TinyUSB bring-up plus the transmission
-// shape (max-packet chunking + ZLP termination). Session lifecycle and
-// downlink dispatch live in the shared link::HostSession.
+// USB vendor class 主机传输: 负责 TinyUSB 启动与传输形态(max-packet 分块 + ZLP
+// 收尾)。会话生命周期与下行分发在共用的 link::HostSession 中。
 class Vendor : public link::HostSession {
 public:
     using Lazy = utility::Lazy<Vendor>;
@@ -44,88 +43,69 @@ public:
         core::utility::assert_always(tusb_rhport_init(0, &init_config));
 
 #if defined(libhcs_APP_USB_FULL_SPEED) && libhcs_APP_USB_FULL_SPEED
-        // The speed field above is advisory only: the ChipIdea device driver
-        // reports whatever the port negotiated and never forces it (grep
-        // dcd_ci_hs.c -- it only READS PORTSC1_PORT_SPEED). Forcing full speed
-        // is a controller bit: PFSC disables the high-speed chirp so the port
-        // can only ever come up at 12 Mbit. Set after tusb_rhport_init, because
-        // dcd_init resets the controller and would clear it. [RM: PORTSC1.PFSC]
+        // 上面的 speed 字段只是建议值: ChipIdea 设备驱动只报告端口实际协商出的
+        // 速率, 从不强制(见 dcd_ci_hs.c, 它只读 PORTSC1_PORT_SPEED)。强制全速靠
+        // 控制器位: PFSC 关掉高速 chirp, 端口便只能以 12 Mbit 起来。必须放在
+        // tusb_rhport_init 之后设置, dcd_init 会复位控制器并清掉它。[RM: PORTSC1.PFSC]
         HPM_USB0->PORTSC1 |= USB_PORTSC1_PFSC_MASK;
 #endif
 
-        // tusb_rhport_init -> dcd_init already enabled the USB IRQ; pin its
-        // priority explicitly so the CAN(3) > USB(2) > UART(1) preemption
-        // hierarchy is owned here and cannot silently regress if the SDK default
-        // changes. With preemptive interrupts on, this lets a CAN RX (3) preempt
-        // a running USB ISR (2) -- keeping motor feedback off the USB ISR's tail.
+        // tusb_rhport_init -> dcd_init 已使能 USB 中断; 这里显式钉住优先级, 让
+        // CAN(3) > USB(2) > UART(1) 的抢占层级归本文件所有, SDK 默认值变化时不会
+        // 悄悄退化。抢占式中断开启时, CAN RX(3) 可打断运行中的 USB ISR(2), 电机
+        // 反馈不必排在 USB ISR 的尾部之后。
         intc_m_enable_irq_with_priority(IRQn_USB0, 2);
     }
 
-    // USB transfers have boundaries (unlike the EtherCAT PD stream): a short
-    // packet finishes the transfer, so framing recovery can resynchronize.
+    // USB 传输有边界(不同于 EtherCAT PD 流): 短包即结束一次传输, 帧定界恢复因此
+    // 可以重新同步。
     void handle_downlink(std::span<const std::byte> buffer, bool finished) {
         link::HostSession::handle_downlink(buffer);
         if (finished)
             finish_downlink_transfer();
     }
 
-    // Re-arm the bulk OUT endpoint, unless the CAN transmit queues are too close
-    // to full to absorb another packet. Runs once per main-loop pass.
+    // 重新挂载 bulk OUT 端点, 除非 CAN 发送队列水位太高、再收一个包也装不下。
+    // 主循环每轮调用一次。
     //
-    // WHY THIS IS THROTTLED AT ALL. Left to itself the class driver re-arms the
-    // endpoint the moment tud_vendor_rx_cb() returns, so a board whose software
-    // queue is full keeps accepting frames it can only drop: the loss is silent
-    // and the host never learns to slow down. Leaving the endpoint un-armed
-    // makes the controller NAK instead, which stalls the host's in-flight URBs
-    // and, once its 64-transfer pool is exhausted, blocks the sender inside
-    // acquire_transmit_buffer(). That is the only backpressure signal this
-    // protocol has -- there is no flow-control field on the wire.
+    // 为什么要限流: 不加干预时类驱动在 tud_vendor_rx_cb() 返回后立刻重挂端点,
+    // 软件队列已满的板子会继续收下只能丢弃的帧 -- 丢帧无声, 主机也永远学不会放慢。
+    // 不挂端点则控制器以 NAK 应答, 拖住主机在飞的 URB, 其 64 个 transfer 池耗尽后
+    // 发送方便阻塞在 acquire_transmit_buffer() 里。这是本协议唯一的背压手段 --
+    // 线上没有任何流控字段。
     //
-    // WHY IT IS NOT A NO-LOSS GUARANTEE. One 512-byte OUT packet holds up to ~46
-    // eight-byte CAN records (11 bytes each), or ~170 DLC-0 ones, against a
-    // 64-deep queue -- and up to 64 packets are already in flight by the time the
-    // queue starts filling. This bounds the sustained rate; it cannot make
-    // overflow impossible. Sizing the watermark for a worst-case packet would
-    // mean throttling below a quarter of the queue and would cost throughput on
-    // every normal burst.
-    // Compiles away entirely with CFG_TUD_VENDOR_RX_MANUAL_XFER=0, where the
-    // class driver re-arms the endpoint itself and there is no backpressure.
-    // Keeping both paths alive makes the feature a one-macro A/B rather than a
-    // revert, which is how its cost on the packet rate gets measured at all.
+    // 为什么不是无损保证: 一个 512 字节 OUT 包最多装约 46 条 8 字节 CAN 记录
+    // (每条 11 字节)或约 170 条 DLC-0 记录, 而队列只有 64 深 -- 且队列开始积压时
+    // 最多已有 64 个包在途。它只约束持续速率, 杜绝不了溢出; 按最坏包深定水位会把
+    // 限流压到队列的 1/4 以下, 每次正常突发都损失吞吐。
+    // CFG_TUD_VENDOR_RX_MANUAL_XFER=0 时本段整体编译消失, 类驱动自行重挂端点,
+    // 无背压。保留两条路径让它成为一个宏即可切换的 A/B, 而不是回滚提交 -- 否则
+    // 根本无从测量它对包率的代价。
     void poll_downlink_arm() {
 #if CFG_TUD_VENDOR_RX_MANUAL_XFER
-        // Reads the answer cached by the main-loop hook rather than walking the
-        // CAN queues here: this runs in the receive completion callback, and
-        // anything added to that path costs 1.2-1.4x its own time in packet
-        // rate. Evaluating the policy per packet measured 2.3% for nothing.
+        // 只读主循环钩子缓存的结论, 不在这里遍历 CAN 队列: 本函数运行在接收完成
+        // 回调里, 该路径上新增的耗时按 1.2-1.4 倍折损包率 -- 逐包评估策略实测白损
+        // 2.3%。
         if (throttle_active_) {
             arm_pending_ = true;
             return;
         }
-        // Keep the debt outstanding if the endpoint would not take the transfer
-        // (not open yet, or one already in flight); the main-loop hook below then
-        // retries. This is also what performs the very first arm, which manual
-        // mode leaves to the application and nothing else would do.
+        // 端点暂时挂不上(尚未打开, 或已有一个 transfer 在飞)时保留欠账, 由下面的
+        // 主循环钩子重试。首次挂载也由这里完成: manual 模式把它留给应用, 别处无人
+        // 负责。
         arm_pending_ = !tud_vendor_n_read_xfer(0);
 #endif
     }
 
-    // Main-loop hook. Two loads and a return unless an arm is actually owed --
-    // which, in steady state, it never is: the rx completion callback has already
-    // re-armed. Calling the full policy from the main loop as well cost 2.3% of
-    // the packet rate for nothing, because it queried the CAN queues a second
-    // time on every packet. What still has to reach the main loop is the initial
-    // arm before any packet has arrived, and the release once a throttled queue
-    // drains -- neither of which has a completion callback to ride on.
-    // Main-loop hook. Re-evaluates the throttle off the hot path and caches the
-    // answer for the receive callback above, then settles any arm still owed.
+    // 主循环钩子。重估节流策略(避开热路径)、把结论缓存给上面的接收回调用, 然后
+    // 结清仍未完成的挂载。
     //
-    // Steady state is two bool loads and a return. The policy is re-evaluated
-    // only when it is already engaged (so it can release), when an arm is owed,
-    // or on a coarse tick -- every 16 passes is about 21 us, against a queue
-    // that needs milliseconds to drain and watermarks with 16 slots of
-    // headroom, so nothing can cross unnoticed. Evaluating it on every pass
-    // would be ~770k queue walks a second for no benefit.
+    // 稳态只是两次 bool 读取加一次返回: rx 完成回调早已重挂端点, 通常既无欠账也
+    // 无节流。策略只在节流已生效(以便解除)、有欠账或粗粒度 tick 到点(每 16 轮约
+    // 21 us; 队列排空需毫秒级、水位有 16 槽余量, 不会漏过任何状态变化)时重估。
+    // 每轮都评估意味着每秒约 77 万次队列遍历, 实测白损 2.3% 包率。仍必须落到主
+    // 循环的只有两件事: 首包到来前的初次挂载, 以及被节流队列排空后的解除 --
+    // 两者都没有完成回调可以搭乘。
     void poll_downlink_arm_if_pending() {
 #if CFG_TUD_VENDOR_RX_MANUAL_XFER
         if (arm_pending_ || throttle_active_ || (++throttle_tick_ & 0xFU) == 0U)
@@ -136,20 +116,15 @@ public:
 #endif
     }
 
-    // The debt above is the ONLY thing that ever re-arms the endpoint, and it is
-    // set by callbacks -- mount, suspend, session teardown. Anything that
-    // cancels the armed transfer WITHOUT one of those leaves the board deaf
-    // forever: arm_pending_ is false, so the hook does nothing, while the
-    // hardware holds no transfer. That is not hypothetical, it is how TinyUSB's
-    // own vendord_set_itf() behaves -- it stalls and clears both bulk endpoints
-    // to abort them, and the automatic re-arm right after is inside
-    // `#if CFG_TUD_VENDOR_RX_MANUAL_XFER == 0`, which this build compiles out.
+    // 上述欠账是端点唯一的重挂来源, 且只由回调设置 -- mount、suspend、会话拆除。
+    // 任何不经过这些回调就取消已挂 transfer 的路径都会让板子永久失聪: arm_pending_
+    // 为 false, 钩子不再动作, 而硬件上没有挂任何 transfer。这并非假想, TinyUSB
+    // 自己的 vendord_set_itf() 就是如此 -- 它 STALL 并清除两个 bulk 端点, 其后的
+    // 自动重挂在 `#if CFG_TUD_VENDOR_RX_MANUAL_XFER == 0` 内, 本构建把它编译掉了。
     //
-    // So stop trusting the debt and look at the endpoint. Every 256 passes is
-    // about 340 us; the failure it catches is permanent, so the sampling rate
-    // only has to be fast enough that a human never sees it. Steady state is one
-    // increment and a mask, because arm_pending_ is false and short-circuits
-    // ahead of the endpoint query.
+    // 所以不再信任欠账, 直接查端点。每 256 轮约 340 us 采样一次; 它捕捉的故障是
+    // 永久性的, 采样率只需快到人眼无感即可。稳态开销是一次自增加一次掩码 --
+    // arm_pending_ 为 false 时短路, 走不到端点查询。
     void audit_downlink_arm() {
 #if CFG_TUD_VENDOR_RX_MANUAL_XFER
         if (arm_pending_ || throttle_active_)
@@ -161,25 +136,17 @@ public:
 #endif
     }
 
-    // Re-owe the initial arm after the endpoints are torn down. Manual transfer
-    // mode leaves the very first arm to the application, and in steady state no
-    // arm is owed -- the rx completion callback has already re-armed, so
-    // arm_pending_ is false. A bus reset then destroys the transfer the hardware
-    // was holding, and nothing above would ever set the debt again: the hook is
-    // gated on a debt that no longer exists, so the board transmits fine and
-    // never receives another byte until the MCU restarts.
+    // 端点被拆除后重新欠下初次挂载。manual 传输模式把首次挂载留给应用, 而稳态下
+    // 无欠账 -- rx 完成回调已重挂端点, arm_pending_ 为 false。总线复位会摧毁硬件
+    // 持有的 transfer, 而上面的逻辑都不会再设置欠账: 钩子被一个已不存在的欠账
+    // 门控, 板子于是发送正常却再也收不到一个字节, 直到 MCU 重启。
+    // 实测 2026-09-03: 主机在板子仍由 VBUS 供电时重启, 两个 bulk OUT 端点对每个
+    // 字节都 NAK, EP0 控制传输却完好, 所有会话都死在 SESSION_ACK 上。
     //
-    // Measured 2026-09-03: after the host rebooted with the boards still powered
-    // on VBUS, both bulk OUT endpoints NAKed every byte while EP0 control
-    // transfers stayed healthy, and every session died on SESSION_ACK.
-    //
-    // Setting the debt is safe from any context: poll_downlink_arm() keeps it
-    // outstanding while tud_vendor_n_read_xfer() refuses, so the main loop
-    // retries until the endpoint is open again.
-    // Flipped by the EP0 configuration handler once this host has read the
-    // board's interface descriptor (usb/vendor_control.cpp). Cleared on every
-    // teardown so a new host must perform the handshake for itself rather than
-    // inheriting the previous one's.
+    // 任意上下文设置欠账都安全: tud_vendor_n_read_xfer() 拒绝时 poll_downlink_arm()
+    // 会保留欠账, 主循环重试到端点重新打开为止。
+    // 由 EP0 配置处理器在本主机读过板子的接口描述符后置位(usb/vendor_control.cpp)。
+    // 每次拆除时清零, 新主机必须自己做握手, 不能继承上一台主机的状态。
     void set_ep0_handshake_done(bool done) { ep0_handshake_done_ = done; }
 
     bool session_allowed() const override { return ep0_handshake_done_; }
@@ -209,10 +176,9 @@ public:
             const auto* src = reinterpret_cast<const uint8_t*>(data.data() + transmitted_size_);
             core::utility::assert_debug(tud_vendor_n_write(0, src, target_size) == target_size);
         } else {
-            // TinyUSB 0.21 direct mode submits a ZLP through the normal write
-            // API. Its return value is the transferred length, hence zero for
-            // both a successful ZLP and an error; write_available() above has
-            // already proved that the endpoint is mounted and unclaimed.
+            // TinyUSB 0.21 direct mode 经普通写 API 提交 ZLP。返回值是传输长度,
+            // 成功 ZLP 与出错同为 0; 上面的 write_available() 已证明端点已挂载且
+            // 未被占用。
             static constexpr uint8_t kZlpByte = 0;
             (void)tud_vendor_n_write(0, &kZlpByte, 0);
         }
@@ -228,48 +194,38 @@ public:
 
 protected:
     void session_activated_callback() override {
-        // Cache the endpoint size for the transmit paths. tud_speed_get() is a
-        // real call -- it lives in usbd.c and is not inlined across the TU
-        // boundary, so reading it per pass cost a jal/ret around a single byte
-        // load, on a function app.cpp calls once per traffic source per pass.
+        // 为发送路径缓存端点尺寸。tud_speed_get() 是真实调用 -- 位于 usbd.c, 跨
+        // TU 边界不会内联, 而 app.cpp 每轮对每个流量源调用一次本函数, 逐次读取
+        // 就是在单字节加载外包一圈 jal/ret。
         //
-        // Safe to cache here because the speed is fixed by enumeration and a
-        // session cannot exist before enumeration completed: the host has to
-        // reach the board over this very endpoint to open one. A renegotiation
-        // means a bus reset, which drops the session and runs this again.
+        // 在此缓存是安全的: 速率由枚举固定, 且枚举完成前不可能存在会话 -- 主机
+        // 必须先经这个端点连上板子才能开会话。重新协商意味着总线复位, 会话被丢弃
+        // 后会再次执行到这里。
         max_packet_size_ = (tud_speed_get() == TUSB_SPEED_HIGH) ? 512U : 64U;
 
         transmitted_size_ = 0;
-        // The CAN pipe's pool is separate, so HostSession's own reset does not
-        // reach it: a stale batch here would be transmitted into the new session
-        // and decoded against the wrong stream.
+        // CAN 管道的批缓冲池是独立的, HostSession 自身的 reset 够不到这里: 残留
+        // 批次会被发进新会话, 对着错误的流解码。
     }
 
 private:
-    // Hysteresis. Engage near the top of the queue, release only once it has
-    // really drained: with a single threshold the endpoint would re-arm on the
-    // pass after every single dequeue, and the throttle would chatter at exactly
-    // the depth where latency is already worst.
+    // 迟滞。在队列接近顶部时限流, 真正排空后才解除: 单阈值会让每次出队后的下一轮
+    // 就重挂端点, 节流恰好在延迟最差的深度上抖动。
     static constexpr size_t kThrottleEngageDepth = can::Can::kTransmitQueueSize * 3 / 4;
     static constexpr size_t kThrottleReleaseDepth = can::Can::kTransmitQueueSize / 4;
 
-    // Escape hatch. A bus that has stopped draining -- bus-off, or simply no
-    // other node to acknowledge -- would otherwise hold the OUT endpoint closed
-    // forever. That endpoint also carries the UART downlink and the session
-    // keepalive, so a fault on one CAN bus would take the whole link down with
-    // it, which is far worse than dropping the frames aimed at that bus. After
-    // this long with the queue still above the release watermark, stop
-    // withholding. A healthy bus drains all 64 slots in ~3.2 ms at the measured
-    // ~19.8k frames/s, so 20 ms only elapses when the bus really is stuck; the
-    // session lease is 1000 ms, well clear of it.
+    // 逃生阀。停止排空的总线(bus-off, 或根本没有其他节点应答)会让 OUT 端点永远
+    // 关闭; 而该端点同时承载 UART 下行与会话 keepalive, 一路 CAN 故障就会拖垮整条
+    // 链路, 比丢弃发往该总线的帧糟糕得多。队列在释放水位之上停留这么久后, 停止
+    // 扣住端点。健康总线按实测约 19.8k 帧/s 排空全部 64 槽约需 3.2 ms, 20 ms 只在
+    // 总线真正卡死时才会耗尽; 会话租期 1000 ms, 余量充分。
     static constexpr uint64_t kThrottleDeadlineQuarterUs = 20'000U * 4U;
 
     bool downlink_throttled() {
         const size_t depth = can::max_transmit_queue_depth();
 
-        // Backpressure was abandoned for this episode. Keep the pipe open until
-        // the bus proves it is draining again -- re-engaging at the engage
-        // watermark would just restart the same 20 ms stall in a loop.
+        // 本轮已放弃背压, 管道保持开放, 直到总线证明自己又在排空 -- 若在启动水位
+        // 重新限流, 只会把同一个 20 ms 停滞循环重演。
         if (throttle_abandoned_) {
             if (depth <= kThrottleReleaseDepth)
                 throttle_abandoned_ = false;
@@ -300,26 +256,22 @@ private:
     }
 
     size_t transmitted_size_ = 0;
-    // Endpoint size in bytes, refreshed on every session activation. The full
-    // speed value is the safe default: a batch chunked at 64 bytes is correct
-    // on a high speed endpoint too, only slower, whereas the reverse would
-    // overrun the endpoint.
+    // 端点尺寸(字节), 每次会话激活时刷新。全速值是安全默认: 按 64 字节分块在高速
+    // 端点上同样正确, 只是更慢; 反过来则会越过端点容量。
     std::size_t max_packet_size_ = 64;
 
-    // Starts true: the endpoint has to be armed once before any packet can
-    // arrive, and only the main-loop hook can do it.
+    // 初始为 true: 任何包到来之前端点必须先挂载一次, 而只有主循环钩子能做这件事。
     bool arm_pending_ = true;
 
-    // See set_ep0_handshake_done().
+    // 见 set_ep0_handshake_done()。
     bool ep0_handshake_done_ = false;
 
-    // Cached answer of downlink_throttled(), refreshed once per main-loop pass.
+    // downlink_throttled() 的缓存结论, 每轮主循环刷新一次。
     bool throttle_active_ = false;
     uint32_t throttle_tick_ = 0;
 
-    // Separate from throttle_tick_ on purpose: that one only advances on passes
-    // where nothing else already triggered a re-evaluation, so it is not a clock.
-    // See audit_downlink_arm().
+    // 刻意与 throttle_tick_ 分开: 后者只在未触发过重估的轮次上推进, 不是时钟。
+    // 见 audit_downlink_arm()。
     uint32_t arm_audit_tick_ = 0;
     bool throttling_ = false;
     bool throttle_abandoned_ = false;

@@ -15,41 +15,35 @@ namespace libhcs::firmware::sync::pulse {
 namespace {
 
 constexpr std::uint8_t kChannel = 1;
-// CMP1 drives the pin HIGH and CMP0 drives it low -- the opposite of what
-// "cmp_initial_polarity_high = false" reads like, and measured rather than
-// assumed: with the target on CMP0, the far board captured its rising edge
-// exactly kPulseWidthTicks late, and halving the width halved the offset
-// (10128 ns -> 5133 ns). So the timing edge goes on CMP1. [实测 2026-08-20]
+// CMP1 把引脚拉高, CMP0 把它拉低 -- 与 "cmp_initial_polarity_high = false"
+// 字面读起来的样子相反, 且是实测而非假定: 目标放 CMP0 时, 对端板捕获到的
+// 上升沿恰好晚 kPulseWidthTicks, 宽度减半偏移随之减半(10128 ns -> 5133 ns)。
+// 故定时边沿放在 CMP1。[实测 2026-08-20]
 constexpr std::uint8_t kRisingComparator = 1;
 constexpr std::uint8_t kFallingComparator = 0;
-// 10 us at 24 MHz. Long enough to cross the cable and the receiver's Schmitt
-// trigger, far shorter than the minimum lead, so the line is idle again well
-// before the next round is armed.
+// 24 MHz 下的 10 us。足以越过线缆与接收端施密特触发器, 又远短于最小提前量,
+// 下一轮布防之前线路早已回到空闲。
 constexpr std::uint32_t kPulseWidthTicks = 240;
 
-// How far ahead a pulse must be armed. The compare register has to be written
-// before the counter passes it, and the main loop is the writer, so this covers
-// one comfortable main-loop period plus the host's scheduling slack. The upper
-// bound keeps the extrapolation short enough that the fit's slope error stays
-// well under one tick.
+// 脉冲必须提前多久布防。比较寄存器须在计数器越过它之前写入, 而写入者是主
+// 循环, 故下界覆盖一个宽裕的主循环周期加主机调度余量; 上界让外推距离足够
+// 短, 拟合斜率误差远小于一个 tick。
 constexpr std::int64_t kMinLeadMicroframes = 16;
 constexpr std::int64_t kMaxLeadMicroframes = 8000;
 
 constexpr std::uint32_t kFitPeriodMs = 64;
 
-// The fit is rejected outside +-1% of nominal. Two independent crystals are tens
-// of ppm apart, never percent, so a percent means the ring was corrupted or the
-// clock tree is not what init() asked for.
+// 拟合在标称值 +-1% 之外即拒收。两颗独立晶振相差至多几十 ppm, 绝不会是
+// 百分之几; 出现百分比只能说明环形缓冲损坏, 或时钟树与 init() 的要求不符。
 constexpr std::int64_t kMinTicksPerMicroframeQ16 =
     static_cast<std::int64_t>(kNominalTicksPerMicroframe) * 65536 * 99 / 100;
 constexpr std::int64_t kMaxTicksPerMicroframeQ16 =
     static_cast<std::int64_t>(kNominalTicksPerMicroframe) * 65536 * 101 / 100;
 
-// SOF samples, decimated. Only the counter is stored: samples are exactly
-// kSampleDecimation microframes apart by construction (any gap resets the ring),
-// so the microframe of entry i is base_microframe + i * kSampleDecimation. That
-// keeps every element a single 32-bit word, which matters because the fit runs
-// in the main loop against an interrupt that appends.
+// SOF 样本, 抽取存储。只存计数器值: 按构造, 样本恰间隔 kSampleDecimation
+// 个 microframe(任何断档都会重置环形), 故条目 i 的 microframe 为
+// base_microframe + i * kSampleDecimation。每个元素因此只占一个 32 位字 --
+// 这很重要, 因为拟合在主循环里运行, 而中断在并发追加。
 std::uint32_t sample_ticks[kSampleCount];
 std::uint32_t sample_head = 0;
 std::uint32_t sample_count = 0;
@@ -57,28 +51,25 @@ std::uint64_t sample_base_microframe = 0;
 std::uint64_t next_sample_microframe = 0;
 std::uint64_t last_microframe = 0;
 bool sampling_started = false;
-// Bumped on every append. The fit takes it before and after summing the ring and
-// retries if it moved -- a seqlock, so the 8 kHz interrupt is never blocked by
-// the fit, and the fit never reads a half-updated ring.
+// 每次追加时递增。拟合在读环形前后各取一次, 有变化即重试 -- 一个 seqlock:
+// 既不让 8 kHz 中断被拟合阻塞, 也不让拟合读到更新到一半的环形。
 volatile std::uint32_t sample_sequence = 0;
 
-// Published line: ticks = reference_ticks + slope * (microframe - reference).
+// 发布的直线: ticks = reference_ticks + slope * (microframe - reference)。
 bool fit_valid = false;
 std::uint64_t fit_reference_microframe = 0;
 std::int64_t fit_reference_ticks_q16 = 0;
 std::uint32_t fit_slope_q16 = 0;
 std::uint32_t last_fit_tick_ms = 0;
 
-// Captured pulses waiting for the main loop to convert them. The ISR only stores
-// the raw counter value; the conversion needs the fit and a division, neither of
-// which belongs in an interrupt.
+// 已捕获、待主循环换算的脉冲。ISR 只存原始计数值; 换算需要拟合结果和一次
+// 除法, 两者都不该出现在中断里。
 constexpr std::uint32_t kCaptureCapacity = 8;
 std::uint32_t capture_ticks[kCaptureCapacity];
 std::uint32_t capture_head = 0;
 std::uint32_t capture_count = 0;
 
-// False until the first host schedule request brings the peripheral up; see
-// init() for why the bring-up is not done at boot.
+// 首个主机排程请求把外设拉起之前为 false; 为何不在开机时初始化, 见 init()。
 bool hardware_ready = false;
 
 std::uint32_t counter_now() {
@@ -91,9 +82,8 @@ void reset_samples(std::uint64_t microframe, std::uint32_t ticks) {
     sample_ticks[0] = ticks;
     sample_base_microframe = microframe;
     next_sample_microframe = microframe + kSampleDecimation;
-    // The published line refers to microframe numbers from the epoch that just
-    // ended, so it is not merely stale, it is wrong. Anything scheduled against
-    // it would be off by the whole epoch shift.
+    // 已发布的直线引用的是刚结束那个纪元的 microframe 编号, 不只是过时,
+    // 而是错的: 依据它排程会差出整个纪元偏移。
     fit_valid = false;
 }
 
@@ -107,12 +97,12 @@ void push_sample(std::uint32_t ticks) {
     }
 }
 
-// One pass of the fit over the current ring. False when the ring moved
-// underneath it (the caller retries) or there is not enough of it yet.
+// 对当前环形做一遍拟合。环形在读取期间被更新(调用方重试)或样本尚不足时
+// 返回 false。
 bool try_fit() {
     const std::uint32_t sequence_before = sample_sequence;
     const std::uint32_t head = sample_head;
-    const std::uint32_t count = sample_count & ~1U; // whole halves only
+    const std::uint32_t count = sample_count & ~1U; // 只取整数个半窗
     const std::uint64_t base = sample_base_microframe;
     if (count < 32U)
         return false;
@@ -122,8 +112,7 @@ bool try_fit() {
     std::int64_t first_half_sum = 0;
     std::int64_t second_half_sum = 0;
     for (std::uint32_t index = 0; index < count; index++) {
-        // Relative to the oldest sample and signed, so the counter's 179 s wrap
-        // is just arithmetic.
+        // 相对最老样本取有符号值, 计数器 179 s 的回绕就只是普通算术。
         const auto value = static_cast<std::int64_t>(
             static_cast<std::int32_t>(sample_ticks[(head + index) % kSampleCount] - origin));
         if (index < half)
@@ -134,18 +123,17 @@ bool try_fit() {
     if (sample_sequence != sequence_before)
         return false;
 
-    // Difference of the two half-window means: the means are half*half samples
-    // apart, i.e. half*half*kSampleDecimation microframes. Within a few percent
-    // of least squares for slope, and it cannot overflow, which least squares on
-    // absolute counter values very much can.
+    // 两个半窗均值之差: 两均值相距 half*half 个样本, 即 half*half *
+    // kSampleDecimation 个 microframe。斜率与最小二乘相差仅百分之几, 且绝不
+    // 溢出 -- 对计数器绝对值做最小二乘则很可能溢出。
     const std::int64_t denominator =
         static_cast<std::int64_t>(half) * static_cast<std::int64_t>(half) * kSampleDecimation;
     const std::int64_t slope_q16 = ((second_half_sum - first_half_sum) << 16) / denominator;
     if (slope_q16 < kMinTicksPerMicroframeQ16 || slope_q16 > kMaxTicksPerMicroframeQ16)
         return false;
 
-    // Phase from the mean of every sample, referred back to the oldest one. The
-    // mean sample sits (count-1)/2 decimation periods after it.
+    // 相位取全部样本的均值, 再折算回最老样本处: 均值样本位于其后
+    // (count-1)/2 个抽取周期。
     const std::int64_t mean_q16 = ((first_half_sum + second_half_sum) << 16) / count;
     const std::int64_t mean_offset_microframes =
         static_cast<std::int64_t>(kSampleDecimation) * (count - 1U);
@@ -175,35 +163,31 @@ bool take_fit(Fit& out) {
 }
 
 void bring_up_hardware() {
-    // GPTMR0 is NOT in the board's resource group -- board.c adds gpio, mchtmr,
-    // ptpc and friends, and each driver adds its own (see init_can_clock in
-    // boards/hpm5321/app/board_app.cpp). Without this the peripheral stays
-    // clock-gated and the very first register access below stalls the core
-    // forever: no USB, no DFU, a board recoverable only by pulling PA07 low or
-    // by JTAG. [Measured the hard way, 2026-08-20: this exact omission bricked
-    // both boards.]
+    // GPTMR0 不在板级资源组里 -- board.c 只加了 gpio、mchtmr、ptpc 等, 各
+    // 驱动自行添加自己的(见 boards/hpm5321/app/board_app.cpp 的
+    // init_can_clock)。缺了这句, 外设保持时钟门控, 下方首次访问寄存器就会
+    // 永久卡死内核: 无 USB、无 DFU, 只能拉低 PA07 或用 JTAG 救回。
+    // [实测 2026-08-20: 正是漏掉这句把两块板都变砖。]
     clock_add_to_group(clock_gptmr0, 0);
 
-    // Crystal, not PLL. This is the entire point of using GPTMR here; see the
-    // header. Divider 1 keeps the full 24 MHz.
+    // 用晶振, 不用 PLL -- 这正是在此处选 GPTMR 的全部意义, 见头文件。分频
+    // 1 保留完整 24 MHz。
     clock_set_source_divider(clock_gptmr0, clk_src_osc24m, 1);
     core::utility::assert_always(clock_get_frequency(clock_gptmr0) == 24'000'000U);
 
-    // Steal the UART0 pins. Deliberate and documented: UART0 does not work while
-    // this build option is on.
+    // 占用 UART0 引脚。刻意为之且已有文档: 本编译选项开启期间 UART0 不可用。
     HPM_IOC->PAD[IOC_PAD_PB08].FUNC_CTL = IOC_PB08_FUNC_CTL_GPTMR0_COMP_1;
     HPM_IOC->PAD[IOC_PAD_PB09].FUNC_CTL = IOC_PB09_FUNC_CTL_GPTMR0_CAPT_1;
 
     gptmr_channel_config_t config{};
     gptmr_channel_get_default_config(HPM_GPTMR0, &config);
-    // Capture the incoming edge in hardware, and let the counter free-run over
-    // its full range: a reload would fold the line the fit describes.
+    // 用硬件捕获来边沿, 计数器在整个量程内自由运行: 一旦重装, 拟合描述的
+    // 直线就会被折叠。
     config.mode = gptmr_work_mode_capture_at_rising_edge;
     config.reload = 0xFFFFFFFFU;
     config.enable_cmp_output = true;
     config.cmp_initial_polarity_high = false;
-    // Park both comparators out of reach so no pulse is emitted before one is
-    // asked for.
+    // 两个比较器都停到够不着的位置, 无人请求前绝不发出脉冲。
     config.cmp[0] = 0xFFFFFFFFU;
     config.cmp[1] = 0xFFFFFFFFU;
     core::utility::assert_always(
@@ -220,48 +204,35 @@ void bring_up_hardware() {
 } // namespace
 
 void init() {
-    // Deliberately empty. Everything this module touches -- a peripheral clock
-    // gate, a pin mux, a timer channel, an interrupt -- is brought up on the
-    // FIRST host schedule request instead, which can only arrive once USB has
-    // enumerated and a session exists.
+    // 刻意留空。本模块触及的一切 -- 外设时钟门控、引脚复用、定时器通道、
+    // 中断 -- 都推迟到首个主机排程请求时拉起, 该请求只可能在 USB 枚举完成、
+    // 会话建立之后到来。
     //
-    // The reason is recoverability, not tidiness. This is an experimental
-    // measurement path; a fault in it during boot leaves a board with no USB and
-    // therefore no DFU, and this board has no button (PA07 is JTAG_TMS), so the
-    // only way back is a debugger. Deferring the bring-up turns any such fault
-    // from "brick" into "the diagnostic does not work", with the flashing path
-    // still alive.
+    // 出发点是可恢复性而非整洁。这是一条实验性测量路径: 若开机期间在其中
+    // 出错, 板子将没有 USB、也就没有 DFU, 且板上无按键(PA07 是 JTAG_TMS),
+    // 唯一退路是调试器。推迟初始化把这类故障从"变砖"降级为"诊断不可用",
+    // 烧录通路仍在。
 }
 
 void note_sof(std::uint64_t microframe) {
     if (!hardware_ready)
         return;
 
-    // One plain register read, on the same interrupt that already reads FRINDEX
-    // and the machine timer, minus the time the SOF packet itself took on the
-    // wire. Without that subtraction a full-speed board's whole axis sits about
-    // 2.8 us behind a high-speed one -- measured, and equal to the packet-time
-    // difference to within 1%. Subtracting each board's OWN packet time puts
-    // every board on the instant the packet started, whatever its speed.
-    const std::uint32_t ticks =
-        counter_now() - (timebase::sof_packet_delay_ns() * 24U) / 1000U;
+    // 一次普通寄存器读, 挂在已经在读 FRINDEX 和机器定时器的同一中断里, 再
+    // 减去 SOF 包本身在线缆上的传输耗时。不减的话, 全速板的整条轴比高速板
+    // 落后约 2.8 us -- 实测值, 与包耗时之差吻合到 1% 以内。各板减去各自的
+    // 包耗时后, 不论速率, 所有板都对齐到包起始的那一瞬。
+    const std::uint32_t ticks = counter_now() - (timebase::sof_packet_delay_ns() * 24U) / 1000U;
 
-    // Any step other than +1 means the NUMBERING moved, not just time: a missed
-    // SOF interrupt, or -- far more common -- the timeline taking a host anchor
-    // from a fresh host process, which shifts the epoch by whole seconds in
-    // EITHER direction. The ring and the fit both describe the old epoch, so
-    // both are discarded.
-    //
-    // Getting this wrong is not a small error: an earlier revision only handled
-    // a FORWARD jump and returned early whenever the counter appeared to move
-    // backwards, which wedged the sampler permanently -- the fit froze on the
-    // dead epoch and every schedule was refused for the whole run. It looked
-    // exactly like broken wiring. [实测 2026-08-20]
-    // "Consecutive" is one SOF apart, which is one microframe at high speed and
-    // EIGHT at full speed -- FRINDEX counts microframes either way, but a
-    // full-speed port only receives one SOF per 1 ms frame. Hard-coding +1 here
-    // wedges the sampler on a full-speed link exactly the way it wedges on an
-    // epoch jump: the ring resets every SOF and no fit is ever published.
+    // 步进不是 +1 意味着编号动了, 而不只是时间: 或是丢失 SOF 中断, 或是
+    // (更常见)时间线从新起的主机进程拿到 anchor, 纪元向任一方向整体平移
+    // 数秒。环形与拟合描述的都是旧纪元, 一并丢弃。此判据必须同时接受后退:
+    // 只认前进曾把采样器永久卡死 -- 拟合冻结在死纪元上, 整轮运行拒绝所有
+    // 排程, 症状与断线一模一样。[实测 2026-08-20]
+    // "相邻"指一个 SOF 间隔: 高速是一个 microframe, 全速是八个 -- FRINDEX
+    // 两种速率都数 microframe, 但全速端口每 1 ms 帧只收到一个 SOF。在此
+    // 硬编码 +1 会让全速链路上的采样器以纪元跳变完全相同的方式卡死: 每个
+    // SOF 重置环形, 拟合永远发不出来。
     const std::uint64_t step = timebase::microframes_per_sof();
     const bool consecutive = sampling_started && microframe == last_microframe + step;
     last_microframe = microframe;
@@ -284,9 +255,8 @@ void poll(std::uint32_t tick_ms) {
     if (tick_ms - last_fit_tick_ms < kFitPeriodMs)
         return;
     last_fit_tick_ms = tick_ms;
-    // Three attempts is generous: a sample arrives every 8 ms and the sum takes
-    // microseconds. Failing all three leaves the previous fit in place, which is
-    // still good to well under a tick over one refit period.
+    // 三次尝试已属宽裕: 样本每 8 ms 一个, 求和只耗微秒级。三次全败则沿用
+    // 上一条拟合, 一个重拟合周期内它的误差仍远小于一个 tick。
     for (std::uint32_t attempt = 0; attempt < 3U; attempt++) {
         if (try_fit())
             return;
@@ -298,8 +268,8 @@ void isr_handler() {
         return;
     gptmr_clear_status(HPM_GPTMR0, GPTMR_CH_CAP_IRQ_MASK(kChannel));
 
-    // The hardware latched this at the edge, so when the interrupt runs is
-    // irrelevant -- which is the whole reason for doing it this way.
+    // 该值由硬件在边沿处锁存, 中断何时运行无关紧要 -- 这正是如此实现的
+    // 全部原因。
     const std::uint32_t ticks =
         gptmr_channel_get_counter(HPM_GPTMR0, kChannel, gptmr_counter_type_rising_edge);
     if (capture_count >= kCaptureCapacity)
@@ -318,12 +288,11 @@ bool schedule(std::uint64_t microframe) {
 
     const auto ahead_of_reference =
         static_cast<std::int64_t>(microframe - fit.reference_microframe);
-    // Lead is measured from where the counter is NOW, not from the fit's
-    // reference point, which sits about half a window in the past.
+    // 提前量从计数器当前值量起, 而非从拟合参考点 -- 后者位于约半个窗口
+    // 之前。
     const std::int64_t now_offset_microframes =
-        (static_cast<std::int64_t>(
-             static_cast<std::int32_t>(counter_now() - static_cast<std::uint32_t>(
-                                                           fit.reference_ticks_q16 >> 16)))
+        (static_cast<std::int64_t>(static_cast<std::int32_t>(
+             counter_now() - static_cast<std::uint32_t>(fit.reference_ticks_q16 >> 16)))
          << 16)
         / static_cast<std::int64_t>(fit.slope_q16);
     const std::int64_t lead = ahead_of_reference - now_offset_microframes;
@@ -335,10 +304,10 @@ bool schedule(std::uint64_t microframe) {
     const auto target =
         static_cast<std::uint32_t>(static_cast<std::uint64_t>(target_q16 >> 16) & 0xFFFFFFFFU);
 
-    // The output goes high at CMP0 and low again at CMP1, so BOTH have to move
-    // every round. Arming CMP0 alone would work exactly once: the pin stays high
-    // afterwards (CMP1 was parked at 0xFFFFFFFF), and a second CMP0 match that
-    // does not change the level emits no edge for the far side to capture.
+    // 输出在 CMP1 匹配时变高、CMP0 匹配时变低(同文件顶部实测结论), 因此
+    // 每轮两个比较器都必须更新。只更新 CMP1 恰好能成功一次: 随后引脚一直
+    // 保持高(CMP0 停在 0xFFFFFFFF), 第二次 CMP1 匹配不改变电平, 对端便无
+    // 边沿可捕获。
     gptmr_update_cmp(HPM_GPTMR0, kChannel, kRisingComparator, target);
     gptmr_update_cmp(HPM_GPTMR0, kChannel, kFallingComparator, target + kPulseWidthTicks);
     return true;
@@ -357,10 +326,8 @@ bool take_capture(std::uint64_t& microframe_q16) {
         fit = {fit_reference_microframe, fit_reference_ticks_q16, fit_slope_q16};
     }
 
-    // Invert the same line the pulse was scheduled on. No bracketing search and
-    // no interpolation between two neighbouring SOF samples: either would hand
-    // back the single-sample interrupt jitter that the fit exists to average
-    // away.
+    // 沿脉冲布防所用的同一条直线做逆变换。不做夹逼搜索, 也不在相邻两个
+    // SOF 样本间插值: 那会把拟合本要平均掉的单样本中断抖动原样交回。
     const auto delta_ticks = static_cast<std::int64_t>(static_cast<std::int32_t>(
         ticks - static_cast<std::uint32_t>(fit.reference_ticks_q16 >> 16)));
     const std::int64_t delta_ticks_q16 = (delta_ticks << 16) - (fit.reference_ticks_q16 & 0xFFFF);

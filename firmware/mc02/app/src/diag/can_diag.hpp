@@ -1,21 +1,17 @@
 #pragma once
 
-// CAN telemetry for mc02, modelled on hpm_board's app/src/diag/can_diag.hpp.
+// mc02 的 CAN 遥测, 仿照 hpm_board 的 app/src/diag/can_diag.hpp。
 //
-// This board had NO way to report CAN controller state: no PSR/ECR/TXFQS readout,
-// no counters, nothing. Debugging a suspected forwarding fault in August 2026
-// stalled on exactly that -- the only observable was what the host did or did not
-// receive, so "the frame never reached the wire" and "the frame was sent and then
-// lost" were indistinguishable from the host side. hpm_board has had this channel
-// since its own CAN latch-up investigation; mc02 now gets the equivalent.
+// 本板此前完全无法上报 CAN 控制器状态: 读不到 PSR/ECR/TXFQS, 也没有任何计数器。
+// 于是排查疑似转发故障时唯一的观测手段就是上位机收到与否, "帧根本没上总线"与
+// "发了但随后丢了"在上位机侧无法区分。hpm_board 因自身 CAN 闩锁问题的排查
+// 早已有此通道, mc02 现在补上等价物。
 //
-// Rides DataId::kUart0, which is not a silkscreen UART on this board (those are
-// kUart1/2/3/7/10 plus DBUS). Diagnostic builds therefore no longer collide with
-// the enclosure RS-485 ports. hpm_board's diagnostic uses the same id, so a
-// host-side decoder can share the header; the record version distinguishes them.
+// 借用 DataId::kUart0 上行: 该 id 在本板并不对应丝印 UART(丝印为
+// kUart1/2/3/7/10 加 DBUS), 诊断构建因此不再与外壳 RS-485 口冲突。
+// hpm_board 的诊断用同一 id, 上位机解码器可共用头部, 由 record version 区分两者。
 //
-// Compiled out unless libhcs_APP_CAN_DIAG is set, so the forwarding hot path
-// carries nothing in production builds.
+// 未定义 libhcs_APP_CAN_DIAG 时整体编译剔除, 生产构建的转发热路径零负担。
 
 #include <cstddef>
 #include <cstdint>
@@ -26,27 +22,24 @@ namespace libhcs::firmware::diag {
 
 inline constexpr bool kEnabled = true;
 
-// Wire format of the kUart0 uplink payload. Little endian, fixed layout so the
-// host decoder needs no length negotiation. Version 64+ marks the mc02 variant:
-// its per-controller block is FDCAN (PSR/ECR/TXFQS), not MCAN, so a decoder must
-// not treat it as hpm_board's record.
+// kUart0 上行负载的线上格式。小端, 固定布局, 上位机解码器无需长度协商。
+// 版本 >= 64 表示 mc02 变体: 每控制器块是 FDCAN(PSR/ECR/TXFQS)而非 MCAN,
+// 解码器不得将其当作 hpm_board 的记录。
 inline constexpr std::uint8_t kRecordMagic = 0xD1U;
 inline constexpr std::uint8_t kRecordVersion = 64U;
 
-// Hot-path notifications: a single relaxed atomic add each. The RX ISR calls the
-// first two per interrupt and per forwarded frame respectively.
+// 热路径通知: 各自只是一次 relaxed 原子加。前两个由 RX ISR 调用,
+// 分别按中断次数与按转发的帧数计数。
 void note_isr_entry(std::size_t can_index);
 void note_frame(std::size_t can_index);
-// Frames the board was asked to send but could not queue (software ring full).
+// 已被要求发送但未能入队(软件环形队列满)的帧数。
 void note_tx_fail(std::size_t can_index);
-// Received frames dropped because the uplink batch pool was full. This is the
-// silent-drop path that went uncounted until 2026-08-05.
+// 因上行批量池满而丢弃的已收帧数, 即曾经的静默丢帧路径。
 void note_uplink_drop(std::size_t can_index);
 
 void note_main_loop();
 
-// Main-loop sampler. Emits one record every kEmitPeriodMs; a no-op when the
-// session is not up.
+// 主循环采样器, 每 kEmitPeriodMs 发出一条记录; 会话未建立时为空操作。
 void poll();
 
 #else

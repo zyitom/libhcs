@@ -260,20 +260,20 @@ uint64_t send_loop(Node& node, Mode mode, uint32_t iterations_per_sec, Clock::ti
         } else if (mode == Mode::kCombined) {
             auto builder = node.board().start_transmit();
             builder.can_transmit(CanPort::kCan1, 
-                {.can_id = kCanIdBase, .can_data = can_payload, .is_fdcan = true});
+                {.can_id = kCanIdBase, .can_data = can_payload});
             builder.can_transmit(CanPort::kCan2, 
-                {.can_id = kCanIdBase + 1, .can_data = can_payload, .is_fdcan = true});
+                {.can_id = kCanIdBase + 1, .can_data = can_payload});
             packets += 1;
         } else {
             {
                 auto builder = node.board().start_transmit();
                 builder.can_transmit(CanPort::kCan1, 
-                    {.can_id = kCanIdBase, .can_data = can_payload, .is_fdcan = true});
+                    {.can_id = kCanIdBase, .can_data = can_payload});
             }
             {
                 auto builder = node.board().start_transmit();
                 builder.can_transmit(CanPort::kCan2, 
-                    {.can_id = kCanIdBase + 1, .can_data = can_payload, .is_fdcan = true});
+                    {.can_id = kCanIdBase + 1, .can_data = can_payload});
             }
             packets += 2;
             if (mode == Mode::kSplit3) {

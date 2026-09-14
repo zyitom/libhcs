@@ -17,10 +17,9 @@
 
 namespace libhcs::firmware::link {
 
-// Transport-neutral serializer sink: ISR producers (CAN/UART uplink) allocate
-// through the protocol Serializer while the transport's main-loop consumer
-// pops whole batches. Shared by the USB vendor application and the EtherCAT
-// bridge's fieldbus core.
+// 传输层中立的 serializer 缓冲: 中断生产者 (CAN/UART 上行) 经协议 Serializer
+// 分配, 传输层的主循环消费者整批弹出。USB vendor 应用与 EtherCAT 桥的
+// fieldbus core 共用。
 class InterruptSafeBuffer final
     : public core::protocol::SerializeBuffer
     , private core::utility::Immovable {
@@ -106,7 +105,7 @@ public:
 
     static void release_batch(const Batch* batch) {
         const_cast<Batch*>(batch)->reset(); // NOLINT(cppcoreguidelines-pro-type-const-cast)
-                                            // Compromises made to maintain encapsulation.
+                                            // 为维持封装而作的妥协。
     }
 
     void clear() {

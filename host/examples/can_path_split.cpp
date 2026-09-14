@@ -253,7 +253,7 @@ int run(int burst, int trials) {
                 put_u32_le(payload, static_cast<uint32_t>(i));
                 put_u32_le(payload + 4, 0);
                 builder.can_transmit(CanPort::kCan1, 
-                    {.can_id = kCanIdBase, .can_data = payload, .is_fdcan = true});
+                    {.can_id = kCanIdBase, .can_data = payload});
             }
         }
 

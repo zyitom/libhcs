@@ -45,8 +45,8 @@ constexpr std::uint8_t kMaxCapLength = 0x80;
 // loose enough that a busy machine's scheduling does not fail a good one. The
 // 2 ms window this replaced admitted only 16 counts and could not do better
 // than +-6%, which is how a first cut of this check reported 0.95x on a
-// perfectly healthy controller.
-constexpr std::chrono::milliseconds kValidationWindow{50};
+// perfectly healthy controller. The width detection below runs the same ratio
+// over a 300 ms window, so only the ratio bounds are shared.
 constexpr double kMinValidationRatio = 0.95;
 constexpr double kMaxValidationRatio = 1.05;
 
@@ -144,6 +144,11 @@ struct MicroframeSource::Impl {
     mutable std::mutex mutex;
     State state = State::kValid;
 
+    // Wrap width of THIS counter, detected at construction: 1024 (spec 10-bit
+    // MFINDEX) or 16384 (14-bit, observed on Intel xHC). Zero only on a
+    // moved-from source.
+    std::uint32_t modulus = 0;
+
     // 64-bit extension.
     bool seeded = false;
     std::uint32_t last_raw = 0;
@@ -175,13 +180,16 @@ struct MicroframeSource::Impl {
     EdgeStats stats{};
 
     [[nodiscard]] std::uint32_t read_raw() const noexcept {
+        // The 14-bit mask is a superset: a 10-bit register simply reads zero
+        // above bit 9. Deltas must be masked with the DETECTED modulus, not
+        // this one -- see extend_locked().
         return *mfindex & (kCounterModulus - 1);
     }
 
     // Continues the 64-bit axis, or fails. Resolving the wrap from the counter
-    // alone is impossible past 2.048 s, so elapsed host time picks the wrap
-    // count -- and the same comparison, run the other way, is what detects a
-    // counter that has stopped.
+    // alone is impossible past half the wrap period, so elapsed host time picks
+    // the wrap count -- and the same comparison, run the other way, is what
+    // detects a counter that has stopped.
     bool extend_locked(std::uint32_t raw, std::int64_t now_raw_ns) noexcept {
         if (!seeded) {
             seeded = true;
@@ -200,14 +208,16 @@ struct MicroframeSource::Impl {
 
         const double predicted = static_cast<double>(elapsed_ns)
                                / static_cast<double>(MicroframeSource::kMicroframePeriod.count());
-        const std::uint32_t raw_delta = (raw - last_raw) & (kCounterModulus - 1);
+        // The DETECTED width, not the 14-bit read mask: masking a 10-bit
+        // counter's deltas with 16383 turns its 1024 wrap into an apparent
+        // 15/16-of-span jump, i.e. a confidently wrong kCounterStopped.
+        const std::uint32_t raw_delta = (raw - last_raw) & (modulus - 1);
 
-        double wraps = std::round(
-            (predicted - static_cast<double>(raw_delta)) / static_cast<double>(kCounterModulus));
+        double wraps =
+            std::round((predicted - static_cast<double>(raw_delta)) / static_cast<double>(modulus));
         if (wraps < 0.0)
             wraps = 0.0;
-        const std::uint64_t delta =
-            raw_delta + (static_cast<std::uint64_t>(wraps) * kCounterModulus);
+        const std::uint64_t delta = raw_delta + (static_cast<std::uint64_t>(wraps) * modulus);
 
         const double residual = std::fabs(predicted - static_cast<double>(delta));
         const double tolerance = std::max(kConsistencyFloor, predicted * kConsistencyFraction);
@@ -367,24 +377,68 @@ std::expected<MicroframeSource, MicroframeSource::Error>
         return std::unexpected{Error::kNotXhci};
     impl->mfindex = reinterpret_cast<volatile std::uint32_t*>(impl->bar + rtsoff);
 
-    // Behavioural validation: does the thing actually run at 8 kHz? Every way
-    // of being wrong -- wrong register, wrong controller, suspended, all-ones
-    // -- fails this, and none of them can imitate 8 kHz to within 5%.
-    const std::int64_t validation_start_ns = raw_now_ns();
-    const std::uint32_t start_raw = impl->read_raw();
-    sleep_until_monotonic(monotonic_now_ns() + std::chrono::nanoseconds{kValidationWindow}.count());
-    const std::int64_t validation_end_ns = raw_now_ns();
-    const std::uint32_t end_raw = impl->read_raw();
+    // Behavioural validation and counter-width detection in one pass. xHCI
+    // 5.5.1 gives MFINDEX 10 bits; the controller this was built on implements
+    // 14. Over a 300 ms window a 10-bit counter MUST cross its 128 ms wrap at
+    // least twice, and every crossing shows up as a masked delta past half the
+    // 14-bit span -- which a 14-bit counter cannot reach in 300 ms at 8 kHz
+    // (2400 counts). Every way of being otherwise wrong -- wrong register,
+    // suspended, all-ones, a stopped counter -- fails the per-interval
+    // consistency and rate checks below.
+    constexpr std::chrono::milliseconds kDetectionWindow{300};
+    constexpr std::chrono::milliseconds kDetectionInterval{30};
 
-    const std::uint32_t advanced = (end_raw - start_raw) & (kCounterModulus - 1);
-    const double seconds = static_cast<double>(validation_end_ns - validation_start_ns) / 1e9;
+    struct DetectionSample {
+        std::int64_t gap_ns;
+        std::uint32_t delta;
+    };
+    std::vector<DetectionSample> detection;
+    detection.reserve(kDetectionWindow / kDetectionInterval);
+
+    std::uint32_t previous_raw = impl->read_raw();
+    const std::int64_t detection_start_ns = raw_now_ns();
+    std::int64_t previous_ns = detection_start_ns;
+    bool wide_wrap_seen = false;
+    for (std::size_t sample = 0; sample < kDetectionWindow / kDetectionInterval; ++sample) {
+        sleep_until_monotonic(
+            monotonic_now_ns() + std::chrono::nanoseconds{kDetectionInterval}.count());
+        const std::uint32_t raw = impl->read_raw();
+        const std::int64_t now_ns = raw_now_ns();
+
+        const std::uint32_t delta = (raw - previous_raw) & (kCounterModulus - 1);
+        if (delta > kCounterModulus / 2)
+            wide_wrap_seen = true;
+        detection.push_back({now_ns - previous_ns, delta});
+        previous_raw = raw;
+        previous_ns = now_ns;
+    }
+
+    impl->modulus = wide_wrap_seen ? kCounterModulus / 16U : kCounterModulus;
+
+    std::uint64_t total_advanced = 0;
+    for (const DetectionSample& interval : detection) {
+        const double predicted = static_cast<double>(interval.gap_ns)
+                               / static_cast<double>(MicroframeSource::kMicroframePeriod.count());
+        double wraps = std::round(
+            (predicted - static_cast<double>(interval.delta)) / static_cast<double>(impl->modulus));
+        if (wraps < 0.0)
+            wraps = 0.0;
+        const double advanced =
+            static_cast<double>(interval.delta) + (wraps * static_cast<double>(impl->modulus));
+        const double tolerance = std::max(kConsistencyFloor, predicted * kConsistencyFraction);
+        if (std::fabs(predicted - advanced) > tolerance)
+            return std::unexpected{Error::kCounterStopped};
+        total_advanced += static_cast<std::uint64_t>(std::llround(advanced));
+    }
+
+    const double seconds = static_cast<double>(previous_ns - detection_start_ns) / 1e9;
     const double expected = seconds * 8000.0;
     if (expected <= 0.0)
         return std::unexpected{Error::kCounterStopped};
-    const double ratio = static_cast<double>(advanced) / expected;
+    const double ratio = static_cast<double>(total_advanced) / expected;
     if (ratio < kMinValidationRatio || ratio > kMaxValidationRatio)
         return std::unexpected{Error::kCounterStopped};
-    impl->validated_rate_hz = static_cast<double>(advanced) / seconds;
+    impl->validated_rate_hz = static_cast<double>(total_advanced) / seconds;
 
     // Cost of one read, timed in batches so the two clock_gettime calls a
     // single-read timing would need do not land inside the number. What a
@@ -584,6 +638,8 @@ MicroframeSource::State MicroframeSource::state() const noexcept {
     const std::scoped_lock guard{impl_->mutex};
     return impl_->state;
 }
+
+std::uint32_t MicroframeSource::counter_modulus() const noexcept { return impl_->modulus; }
 
 const std::string& MicroframeSource::pci_device() const noexcept { return impl_->pci_device; }
 

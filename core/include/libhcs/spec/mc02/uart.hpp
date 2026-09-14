@@ -39,7 +39,7 @@ class UartDescriptors {
         UartDescriptor{   data::DataId::kUart2,    data::DataId::kUart2Config},
         UartDescriptor{   data::DataId::kUart3,    data::DataId::kUart3Config},
         UartDescriptor{   data::DataId::kUart7,    data::DataId::kUart7Config},
-        UartDescriptor{ data::DataId::kUart10,  data::DataId::kUart10Config},
+        UartDescriptor{  data::DataId::kUart10,   data::DataId::kUart10Config},
     };
 
 public:

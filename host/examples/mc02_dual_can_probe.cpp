@@ -33,7 +33,6 @@ using namespace std::chrono_literals;
 struct CanEvent {
     uint32_t id;
     std::vector<std::byte> payload;
-    bool is_fdcan;
     bool is_extended;
     Clock::time_point arrival;
 };
@@ -41,7 +40,7 @@ struct CanEvent {
 class Receiver final : public Board::Callback {
 public:
     std::optional<double> wait_can(
-        int bus, uint32_t id, std::span<const std::byte> expected, bool is_fdcan, bool is_extended,
+        int bus, uint32_t id, std::span<const std::byte> expected, bool is_extended,
         Clock::time_point sent, std::chrono::milliseconds timeout = 500ms) {
         std::unique_lock lock{mutex_};
         std::optional<double> latency_us;
@@ -51,7 +50,7 @@ public:
                 auto event = std::move(queue.front());
                 queue.pop_front();
                 if (event.id == id && std::ranges::equal(event.payload, expected)
-                    && event.is_fdcan == is_fdcan && event.is_extended == is_extended) {
+                    && event.is_extended == is_extended) {
                     latency_us =
                         std::chrono::duration<double, std::micro>{event.arrival - sent}.count();
                     return true;
@@ -74,7 +73,6 @@ private:
             queues_[static_cast<size_t>(bus)].push_back({
                 data.can_id,
                 {data.can_data.begin(), data.can_data.end()},
-                data.is_fdcan,
                 data.is_extended_can_id,
                 arrival,
             });
@@ -96,13 +94,11 @@ std::vector<std::byte> make_payload(size_t size, uint32_t sequence) {
 }
 
 void transmit_can(
-    Board& board, int bus, uint32_t id, std::span<const std::byte> payload, bool is_fdcan,
-    bool is_extended) {
+    Board& board, int bus, uint32_t id, std::span<const std::byte> payload, bool is_extended) {
     auto builder = board.start_transmit();
     const libhcs::data::CanDataView data{
         .can_id = id,
         .can_data = payload,
-        .is_fdcan = is_fdcan,
         .is_extended_can_id = is_extended,
     };
     switch (bus) {
@@ -115,14 +111,19 @@ void transmit_can(
 
 bool run_direction(
     std::string_view tx_label, Board& tx_board, std::string_view rx_label, Receiver& rx_receiver,
-    int tx_bus, int rx_bus, bool is_fdcan, bool is_extended, size_t payload_size, uint32_t rounds) {
+    int tx_bus, int rx_bus, bool is_extended, size_t payload_size, uint32_t rounds) {
+    // The frame type is the TX bus's own compiled mode (mc02 runs all three
+    // buses CAN-FD); the case name reports what the wire actually carries.
+    const bool bus_is_fd = tx_bus == 1   ? tx_board.can1_is_fd()
+                           : tx_bus == 2 ? tx_board.can2_is_fd()
+                                         : tx_board.can3_is_fd();
     uint32_t passed = 0;
     for (uint32_t sequence = 0; sequence < rounds; ++sequence) {
         const auto payload = make_payload(payload_size, sequence);
         const uint32_t id = is_extended ? 0x1234500U + sequence : 0x500U + sequence;
         const auto sent = Clock::now();
-        transmit_can(tx_board, tx_bus, id, payload, is_fdcan, is_extended);
-        if (!rx_receiver.wait_can(rx_bus, id, payload, is_fdcan, is_extended, sent))
+        transmit_can(tx_board, tx_bus, id, payload, is_extended);
+        if (!rx_receiver.wait_can(rx_bus, id, payload, is_extended, sent))
             break;
         ++passed;
     }
@@ -130,7 +131,7 @@ bool run_direction(
     const bool ok = passed == rounds;
     std::println(
         "{}.CAN{} -> {}.CAN{} {} {} payload={}: {}/{} {}", tx_label, tx_bus, rx_label, rx_bus,
-        is_fdcan ? "FD+BRS" : "classic", is_extended ? "extended" : "standard", payload_size,
+        bus_is_fd ? "FD+BRS" : "classic", is_extended ? "extended" : "standard", payload_size,
         passed, rounds, ok ? "PASS" : "FAIL");
     return ok;
 }
@@ -169,9 +170,8 @@ bool run_latency_direction(
     for (uint32_t sequence = 0; sequence < k_warmup_rounds + rounds; ++sequence) {
         const auto payload = make_payload(8, sequence);
         const auto sent = Clock::now();
-        transmit_can(tx_board, tx_bus, k_can_id, payload, true, false);
-        const auto latency =
-            rx_receiver.wait_can(rx_bus, k_can_id, payload, true, false, sent, 10ms);
+        transmit_can(tx_board, tx_bus, k_can_id, payload, false);
+        const auto latency = rx_receiver.wait_can(rx_bus, k_can_id, payload, false, sent, 10ms);
         if (!latency) {
             if (sequence >= k_warmup_rounds)
                 ++lost;
@@ -260,22 +260,16 @@ int main(int argc, char** argv) {
             return ok ? 0 : 1;
         }
 
-        for (const bool is_fdcan : {false, true}) {
-            for (const bool is_extended : {false, true}) {
-                for (const size_t payload_size : {0U, 8U}) {
-                    ok &= run_direction(
-                        "A", board_a, "B", receiver_b, 1, 1, is_fdcan, is_extended, payload_size,
-                        50);
-                    ok &= run_direction(
-                        "B", board_b, "A", receiver_a, 1, 1, is_fdcan, is_extended, payload_size,
-                        50);
-                    ok &= run_direction(
-                        "A", board_a, "B", receiver_b, 3, 2, is_fdcan, is_extended, payload_size,
-                        50);
-                    ok &= run_direction(
-                        "B", board_b, "A", receiver_a, 2, 3, is_fdcan, is_extended, payload_size,
-                        50);
-                }
+        for (const bool is_extended : {false, true}) {
+            for (const size_t payload_size : {0U, 8U}) {
+                ok &= run_direction(
+                    "A", board_a, "B", receiver_b, 1, 1, is_extended, payload_size, 50);
+                ok &= run_direction(
+                    "B", board_b, "A", receiver_a, 1, 1, is_extended, payload_size, 50);
+                ok &= run_direction(
+                    "A", board_a, "B", receiver_b, 3, 2, is_extended, payload_size, 50);
+                ok &= run_direction(
+                    "B", board_b, "A", receiver_a, 2, 3, is_extended, payload_size, 50);
             }
         }
 
