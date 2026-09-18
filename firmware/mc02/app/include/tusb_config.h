@@ -63,12 +63,6 @@ extern "C" {
 #define CFG_TUD_VENDOR_RX_EPSIZE libhcs_APP_USB_RX_XFER_SIZE
 #if libhcs_APP_USB_RX_XFER_SIZE > 64
 # define CFG_TUD_VENDOR_RX_NEED_ZLP 1
-
-// 不让类驱动自行重挂 bulk OUT 端点。由应用在主循环重挂, 并在 CAN 软件发送队列
-// 接近满时扣住不放: 过载的板子对主机回 NAK, 而不是收下只能丢弃的帧。挂载策略、
-// 迟滞水位与 20ms 逃生阀见 app/src/usb/vendor.hpp 的下行流控一节。
-// (此开关来自本仓库 TinyUSB fork; 置 0 时类驱动自行重挂, 整个流控编译消失。)
-# define CFG_TUD_VENDOR_RX_MANUAL_XFER 0
 #endif
 
 #define CFG_TUD_VENDOR_TX_EPSIZE 64

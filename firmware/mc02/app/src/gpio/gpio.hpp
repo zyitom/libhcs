@@ -57,10 +57,26 @@ public:
         set_pwm_compare(channel_index, duty16_to_pwm_compare(channel_index, data.value));
     }
 
+    // 会话结束(租约过期、USB 挂起或拔出、被新会话取代)时由 usb::Vendor 调用。写这些输出
+    // 的主机已经不在, 最后一个占空比不能无限期保持 -- 接电调或电机时那就是一直转。比较值
+    // 归零使输出通道恒低、不再有脉冲(数字输出同样拉低), 设备看到的是信号丢失而非一条仍然
+    // 有效的旧指令。不切回高阻输入: 悬空的信号线可能被读成杂波脉冲。输入通道的引脚不接
+    // 定时器, 写比较值对它们无影响。
+    //
+    // 只写比较寄存器, 新值在下一个 PWM 周期(50 Hz 下至多 20 ms)生效。刻意不用 UG 立即
+    // 更新: 那会复位整个定时器的计数器, 而 TIM2 的计数器同时是 SOF 捕获的时基
+    // (sync/sof.cpp)。
+    void stop_outputs() {
+        for (const auto& gpio : spec::mc02::kGpioDescriptors)
+            set_pwm_compare(gpio.channel_index, 0);
+    }
+
     void handle_digital_read(uint8_t channel_index, const data::GpioReadConfigView& data) {
-        configure_digital_input_mode(channel_index, data);
+        const bool reconfigured = configure_digital_input_mode(channel_index, data);
 
         if (data.asap) {
+            if (reconfigured)
+                wait_pull_settle();
             const auto& hardware = channel_hardware(channel_index);
             const bool high =
                 HAL_GPIO_ReadPin(hardware.gpio_port, hardware.gpio_pin) == GPIO_PIN_SET;
@@ -126,7 +142,8 @@ private:
         // 所属定时器的 ARR。运行时读取而非编译期常量: 这四个通道背后的两个定时器
         // 不必再共用周期。TIM2 同时是 USB-SOF 捕获定时器(sync/sof.cpp), 要让
         // 捕获精细到值得使用须跑 275 MHz、ARR 5499999; TIM1 保持 1 MHz、
-        // ARR 19999。两者仍都产生 50 Hz。
+        // ARR 19999。两者仍都产生 50 Hz。只读不写: TIM2 的 ARR/PSC 只能在 .ioc 里改,
+        // 捕获在启动时缓存了二者, 运行时改写 PWM 频率会让 SOF 修正静默算错。
         volatile uint32_t* autoreload_register;
     };
     static constexpr auto kNoPeriod = timer::Timer::Duration::zero();
@@ -142,7 +159,9 @@ private:
         configure_hal_gpio_output(channel_index);
     }
 
-    void configure_digital_input_mode(uint8_t channel_index, const data::GpioReadConfigView& data) {
+    // 返回 true 表示硬件被重新配置过(电平/边沿/上拉/采样周期任一变化)。调用方
+    // 若要立刻采样, 需先 wait_pull_settle()。
+    bool configure_digital_input_mode(uint8_t channel_index, const data::GpioReadConfigView& data) {
         auto& state = channel_state(channel_index);
 
         auto rising_edge = data.rising_edge;
@@ -167,7 +186,19 @@ private:
             state.next_sample_deadline = timer::timer->timepoint();
 
             configure_hal_gpio_input(channel_index, rising_edge, falling_edge, pull);
+            return true;
         }
+        return false;
+    }
+
+    // 上拉/下拉翻转后, 内部 ~40 kOhm 拉阻给走线电容充放电需要数微秒; 重配后立即
+    // 采样读到的是翻转前的电平(实测 2026-09-18: 上拉重配后的 asap 采样稳定读回
+    // 旧的低电平)。只在重配后的 asap 路径上等待, 周期采样与边沿捕获不在重配
+    // 瞬间读引脚, 不受影响。主循环上下文, 100 us 一次性的代价可忽略。
+    static void wait_pull_settle() {
+        const auto deadline = timer::timer->timepoint()
+                            + timer::Timer::to_duration_checked(std::chrono::microseconds{100});
+        while (!timer::timer->check_reached(deadline)) {}
     }
 
     void set_pwm_compare(uint8_t channel_index, uint32_t compare) {
@@ -176,6 +207,13 @@ private:
 
     void configure_hal_gpio_output(uint8_t channel_index) {
         const auto& hardware = channel_hardware(channel_index);
+
+        // HAL_GPIO_Init() 只在新模式带中断时才改 EXTI 寄存器: 以边沿触发读过的通道切到
+        // 输出后, 边沿中断仍然使能, PWM 每个边沿都白进一次 EXTI 中断(PE13 与 BMI088
+        // 数据就绪共用 EXTI15_10)。HAL_GPIO_DeInit() 解除该线的映射与使能, 再清掉可能
+        // 已挂起的标志。state.mode 已先置为输出, 其间进来的中断会被丢弃。
+        HAL_GPIO_DeInit(hardware.gpio_port, hardware.gpio_pin);
+        __HAL_GPIO_EXTI_CLEAR_IT(hardware.gpio_pin);
 
         GPIO_InitTypeDef gpio_init = {};
         gpio_init.Pin = hardware.gpio_pin;

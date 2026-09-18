@@ -2,7 +2,7 @@
 
 > **文档类型**：过程记录
 > **适用范围**：`firmware/hpm_board/`，HPM5321 DualCan，USB High-Speed vendor bulk 链路
-> **状态**：现行有效（2026-08-07 完成的一轮完整调优与证伪）
+> **状态**：现行有效（2026-08-07 完成的一轮完整调优与证伪；第 2 节的 OUT 背压已于 2026-09-14 撤下并删除代码，数据保留）
 > **相关文档**：[AGENTS.md](AGENTS.md)（现行命令与约束） · [../../HOST_TUNING.md](../../HOST_TUNING.md)（主机侧调优）
 
 ## 摘要
@@ -136,6 +136,14 @@ payload 1023（3 个包） -> 14498 URB/s -> 14.83 MB/s   更差
 | 1 | TinyUSB 0.21 迁移 + 3 个上游修复 | 共享 submodule，已 push | SETUP 撕裂**正确性**修复；dcache + ctz 合计 +1.24% 包率 |
 | 2 | USB OUT 背压（`RX_MANUAL_XFER`） | `tusb_config.h` / `vendor.hpp` / `app.cpp` | 21000 f/s 丢 5.5% -> **0%**；25000 f/s **零丢失** |
 | 3 | ~~CAN 独立端点对（`SPLIT_CAN_ENDPOINT`）~~ | 描述符 + 协议 + host SDK | ~~UART 线速下 p99 143.9 -> 122.8 us~~ **已作废，见 4.5** |
+
+> **2026-09-14 更新：第 2 项已从交付配置撤下，代码同日删除**，`CFG_TUD_VENDOR_RX_MANUAL_XFER` 回到 TinyUSB 默认 0。
+> 上表数据仍然成立，但它衡量的是"主机以超过 CAN 线速洪泛时一帧不丢"，这不是控制场景要的
+> 目标：下行是周期性控制命令，背压把旧命令憋在主机与板上队列里、过载缓解后按序补发，且 NAK
+> 作用于整个 bulk OUT 端点，连带卡住 UART 下行与会话保活。同日在 HCS 里做了过载对照：5321 以
+> 30 帧/拍（约 30000 帧/s）过载时，新旧固件丢帧同为约 32%，发到线上的帧年龄 p50 4.31 ms 对旧版
+> 4.65 ms——HCS 每拍只提交一个包，主机发送池从未被 NAK 耗尽，背压实际只是"扣 20 ms 再丢"。现行约束见
+> [AGENTS.md](AGENTS.md)「USB 现行约束」。`[决策 2026-09-14，未上板复测]`
 
 第 3 项 **2026-09-05 被复测推翻并整体拆除**，见第 4.5 节。现状：描述符里只有一对 bulk
 端点（`0x01`/`0x81`），编译期宏 `libhcs_SPLIT_CAN_ENDPOINT`、运行时协商用的 EP0 请求
@@ -496,7 +504,7 @@ sudo ./host/build/examples/usb_packet_rate uartonly 0 6   # 输出含 turnaround
 | 开关 | 值 | 位置 |
 |---|---|---|
 | ~~`enable_priority_can_channel`~~ | **已删除**（2026-09-05，见 4.5），只剩一对 bulk 端点 | 曾在 `host/include/libhcs/board/common.hpp` |
-| `CFG_TUD_VENDOR_RX_MANUAL_XFER` | **1** | 同上 |
+| `CFG_TUD_VENDOR_RX_MANUAL_XFER` | **未设置，取 TinyUSB 默认 0**（2026-09-14 前为 1，背压代码同日删除，见第 2 节更新） | `app/include/tusb_config.h` |
 | ~~`libhcs_COPY_THEN_ARM`~~ | **开关已删除**（2026-09-05），恒为原顺序（处理完再 arm） | `app/src/usb/vendor.cpp` |
 | `kTransmitTransferCount` | 64 | `host/src/transport/usb/usb.cpp` |
 

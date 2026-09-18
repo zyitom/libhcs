@@ -24,9 +24,13 @@ class Temperature final
 public:
     using Lazy = utility::Lazy<Temperature, Spi::Lazy*>;
 
-    static constexpr uint32_t kProbeFrequencyHz = 977U;
+    // BMI088 温度寄存器 (TEMP_MSB/TEMP_LSB) 每 1.28 s 才更新一次 (数据手册)。探询周期
+    // 必须短于它: 每个探询间隔内至多一次更新, 才不会漏掉更新, handle_uplink() 以前后两次
+    // 探询的中点估计变化时刻才成立。1 Hz 留约 22% 余量, 变化时刻误差 ±0.5 s, 对温度无影响。
+    static constexpr uint32_t kProbeFrequencyHz = 1U;
     static constexpr timer::Timer::Duration kProbePeriod{
         (timer::Timer::kClockFrequency + (kProbeFrequencyHz / 2U)) / kProbeFrequencyHz};
+    // 值未变时的重发间隔。1 s 探询下落在第一个不早于 1.3 s 的探询上, 即每 2 s 一次。
     static constexpr uint32_t kHeartbeatPeriodQuarterUs = 1'300U * 1'000U * 4U;
 
     explicit Temperature(Spi::Lazy* spi)

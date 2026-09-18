@@ -199,8 +199,9 @@ inline constexpr Note kAlarmMelody[]{
 // 计数器恰以 275 MHz / 275 = 1 MHz 走 -- 即下面传入的值。生成代码的默认参数恰好
 // 发出 1 MHz / 250 = 4 kHz。
 //
-// 本文件出现之前无人调用 MX_TIM12_Init(): 定时器在 .ioc 里但从未启动, PB15 保持
-// 未配置 GPIO, 蜂鸣器哑。该调用现位于 App() 中其他 MX_TIM*_Init 旁边。
+// app 目前不调用 MX_TIM12_Init(), 也不初始化本驱动: TIM12 在 .ioc 里但从未启动, PB15
+// 保持未配置 GPIO, 蜂鸣器哑(diag/knobs.cpp 引用了它, 但 knobs::poll() 同样无人调用)。
+// 要启用, 须在 App() 中其他 MX_TIM*_Init 旁边调用 MX_TIM12_Init(), 再 init() 并 start()。
 //
 // 仅限主循环: play() 与 poll() 不碰原子量、绝不在 ISR 中调用; 不像 LED, 其
 // buffer-full 计数器会从中断上下文置位。

@@ -85,11 +85,6 @@ extern "C" {
 #define CFG_TUD_VENDOR_RX_BUFSIZE 0
 #define CFG_TUD_VENDOR_TX_BUFSIZE 0
 
-// 不让类驱动自行重挂 bulk OUT 端点。由应用在主循环重挂, 并在 CAN 软件发送队列
-// 接近满时扣住不放: 过载的板子对主机回 NAK, 而不是收下只能丢弃的帧。挂载策略与
-// 有界停滞的逃生阀见 app/src/usb/vendor.hpp。
-#define CFG_TUD_VENDOR_RX_MANUAL_XFER 1
-
 #ifdef __cplusplus
 }
 #endif

@@ -224,3 +224,45 @@ add_executable(time_sync_matrix time_sync_matrix.cpp)
 target_link_libraries(time_sync_matrix PRIVATE libhcs-sdk)
 add_executable(rtt_split rtt_split.cpp)
 target_link_libraries(rtt_split PRIVATE libhcs-sdk)
+
+# Two mc02 boards wired PE9<->PE9 and PE13<->PE13. Exercises the GPIO
+# session-end firmware changes on real hardware: stop_outputs() on lease
+# expiry and on session replacement, the held-duty bug on a root-commit
+# board, and the EXTI disarm round-trip on one channel.
+add_executable(mc02_gpio_session_test mc02_gpio_session_test.cpp)
+target_link_libraries(mc02_gpio_session_test PRIVATE libhcs-sdk)
+
+# Discriminator for mc02_gpio_session_test's P4 anomaly: link state + asap
+# liveness around every drive attempt on both wires, both directions, several
+# rounds. Separates a loose jumper from a faulted link from a stuck output.
+add_executable(mc02_gpio_wire_probe mc02_gpio_wire_probe.cpp)
+target_link_libraries(mc02_gpio_wire_probe PRIVATE libhcs-sdk)
+
+# Closes the P4 round-trip phase inside the root-commit board's fresh-link
+# window, with a liveness gate on every leg. See mc02_gpio_session_test.
+add_executable(mc02_gpio_p4_finish mc02_gpio_p4_finish.cpp)
+target_link_libraries(mc02_gpio_p4_finish PRIVATE libhcs-sdk)
+
+# Per-second health+level table for the P2 lease-expiry measurement, run inside
+# the root-commit board's fresh-link window so the quiet tail is provably
+# sampled rather than merely silent.
+add_executable(mc02_gpio_lease_confirm mc02_gpio_lease_confirm.cpp)
+target_link_libraries(mc02_gpio_lease_confirm PRIVATE libhcs-sdk)
+
+# Full GPIO driver matrix on two mc02 boards wired PE9<->PE9 and PE13<->PE13:
+# digital write, duty sweep, asap/periodic/edge reads, pulls, mode churn,
+# cross-timer independence and invalid-channel robustness.
+add_executable(mc02_gpio_matrix mc02_gpio_matrix.cpp)
+target_link_libraries(mc02_gpio_matrix PRIVATE libhcs-sdk)
+
+# Sends a GPIO frame with an out-of-range channel index from the session owner
+# itself: the firmware must refuse it, tear the session down, zero the outputs
+# (stop_outputs through the teardown path) and let the link recover.
+add_executable(mc02_gpio_invalid_channel_test mc02_gpio_invalid_channel_test.cpp)
+target_link_libraries(mc02_gpio_invalid_channel_test PRIVATE libhcs-sdk)
+
+# Net-topology discovery (one driver at a time, everything else reads) plus the
+# remaining duty coverage per discovered wire: run this after re-jumpering the
+# bench to learn what is actually connected before testing it.
+add_executable(mc02_gpio_topology_test mc02_gpio_topology_test.cpp)
+target_link_libraries(mc02_gpio_topology_test PRIVATE libhcs-sdk)

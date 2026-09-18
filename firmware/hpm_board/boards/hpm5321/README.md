@@ -59,6 +59,50 @@ PID `0x53FF`（与单 CAN `0x5321`、双 CAN `0x5322` 同属 53xx，但不是已
 （见 [../hpm6e8y/README.md](../hpm6e8y/README.md)），只有本目录通过
 `libhcs_BOARD_OTP_IDENTITY=1` 打开它。
 
+## 实例 OTP 全量读数 [实测 2026-09-18，1 颗芯片]
+
+**结论：这颗芯片没有启用任何安全功能。** 生命周期是非安全态，JTAG/调试口未禁用，
+签名与加密所需的密钥区全为 0（未烧写）；bootloader 与 app 都以明文、未签名的形式运行。
+
+样本是双 CAN-FD 板（PID `0x5322`），lot 375，USB 序列号
+`AF-90A7-144F-BAB7-6363-7E81-5FB4-59F2-DC3C`。与 2026-08-05 的四颗一致（双 CAN 来自
+375/377），**不能**打破上一节所说的板型/批次共线。
+
+读取方式：J-Link 走 JTAG，经系统总线读 shadow `0xF3050000-0xF30501FC`，CPU 不停机，
+USB 全程在线。本机接线下 4 MHz 连不上，1 MHz 时好时坏，100 kHz 稳定。用读到的 UUID
+按 `app/src/usb/usb_descriptors.hpp` 的算法算出的序列号与 lsusb 一致，读数可信。字段名
+按 SDK `soc/HPM5300/HPM5361/hpm_otp_table.h`。
+
+非零字如下，其余字全部为 0：
+
+| Word | 值 | SDK 字段 / 含义 |
+|---|---|---|
+| 0 | `0x30400016` | `HARD_LOCK`（SDK 只给整字 mask，没有逐位定义） |
+| 1 | `0x10000001` | `LIFECYCLE_A=1`、`LIFECYCLE_B=1`；`PUK_REVOKE`、`JTAG_DISABLE`、`DEBUG_DISABLE`、`TCU_DISABLE` 均为 0 |
+| 5 | `0x01770000` | SDK 未定义；高 16 位 `0x177` = 375，即批次号 |
+| 7 | `0x1D705001` | SDK 未定义 |
+| 8-11 | `42373650 02C43534 000C9801 D07F0000` | `DIE_TRACE`，前 6 字节 ASCII 为 `P67B45` |
+| 17 | `0x006000C0` | SDK 未定义 [推断：出厂校准] |
+| 18 | `0x00000FFB` | SDK 未定义 [推断：出厂校准] |
+| 21 | `0x03A008DA` | `TSNS_BASE=0x8DA`、`TSNS_SLOPE=0x3A0` |
+| 25 | `0x00000002` | 板型标志：双 CAN-FD（见上节） |
+| 64 | `0x11705144` | `CHIP_ID` |
+| 79-83 | `32627375 61636466 79625F6E 6D61645F 206F6169` | ASCII `"usb2fdcan_by_damiao "`，达妙写入的标记；其中 80-83 落在 `PUBLIC_KEY_HASH`（80-87）区内 |
+| 88-91 | `5169D319 DCF45C15 EB78AE78 32FB0075` | `UUID`，固件据此生成 USB 序列号 |
+| 120-127 | `41263637 3911491C 50157E74 D0FBE465 D0B70060 B28EE925 54BE74D7 E8E29554` | SDK 未定义，来源不明，固件不使用 |
+
+`SHADOW_LOCK[0..7]`（`0xF3050200`）与 `FUSE_LOCK[0..7]`（`0xF3050600`）同样全为 0。
+
+安全相关的判读：
+
+- **生命周期**：SEC 寄存器 `LIFECYCLE`（`0xF3044014`）实时读数为 `0x04`，即
+  `lifecycle_nonsec`；`SECURE_STATE = 0x00020040`（`ALLOW_NSC=1`、`ALLOW_SEC=0`）。
+- **加密**：`EXIP0_KEY`（96-103）与 `MASTER_KEY`（112-119）全为 0，没有 flash 实时解密
+  密钥。`DEBUG_KEY`（12-15）、`SW_VER`（3）、`USB_VID/PID`（68）也全为 0。
+- **签名**：`PUBLIC_KEY_HASH` 区内是一段 ASCII 加零，不是真正的公钥哈希。当前生命周期下
+  ROM 不验签，所以无害；**但生命周期一旦推进到安全态，没有任何签名镜像能与之匹配，芯片将
+  无法启动**。不要烧写生命周期字段或 80-87 区。
+
 ## 标识信息
 
 | 项目 | 取值 |

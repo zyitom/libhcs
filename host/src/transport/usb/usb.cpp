@@ -232,24 +232,31 @@ public:
 
     std::unique_ptr<TransportBuffer> acquire_transmit_buffer() noexcept override {
         TransferWrapper* transfer = nullptr;
+        bool stalled = false;
         {
             std::unique_lock guard{transmit_transfer_mutex_};
-            transmit_transfer_cv_.wait(guard, [this]() {
-                return stop_handling_events_.load(std::memory_order::relaxed)
-                    || link_faulted_.load(std::memory_order::relaxed)
-                    || free_transmit_transfers_.readable() != 0;
-            });
+            if (free_transmit_transfers_.readable() == 0) [[unlikely]]
+                stalled = wait_for_free_transmit_transfer(guard);
             // A faulted link must not park a caller here forever waiting for a
             // completion that can no longer arrive. StreamBuffer treats nullptr
             // as "no buffer this round" and drops the batch, which is the
             // truthful answer.
-            if (stop_handling_events_.load(std::memory_order::relaxed)
-                || link_faulted_.load(std::memory_order::relaxed))
-                return nullptr;
-            free_transmit_transfers_.pop_front(
-                [&transfer](TransferWrapper* value) noexcept { transfer = value; });
+            if (!stalled && !stop_handling_events_.load(std::memory_order::relaxed)
+                && !link_faulted_.load(std::memory_order::relaxed)) {
+                free_transmit_transfers_.pop_front(
+                    [&transfer](TransferWrapper* value) noexcept { transfer = value; });
+                core::utility::assert_debug(transfer != nullptr);
+            }
         }
-        core::utility::assert_debug(transfer != nullptr);
+        // Outside the pool lock: fault() takes it to wake the other waiters.
+        if (stalled) [[unlikely]] {
+            fault(
+                "no transmit transfer completed for 1 s with the whole pool in flight -- the "
+                "OUT endpoint stopped draining");
+            return nullptr;
+        }
+        if (transfer == nullptr)
+            return nullptr;
 
         return std::unique_ptr<TransportBuffer>{transfer};
     }
@@ -316,6 +323,7 @@ public:
             // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
             auto* wrapper = static_cast<TransferWrapper*>(buffer.release());
             free_transmit_transfers_.emplace_back(wrapper);
+            ++transmit_pool_returns_;
         }
         transmit_transfer_cv_.notify_one();
     }
@@ -1203,8 +1211,83 @@ private:
             }
 
             pool.emplace_back(wrapper);
+            ++transmit_pool_returns_;
         }
         cv.notify_one();
+    }
+
+    // Parks a sender until a transmit transfer is free, the link faults or the
+    // transport stops -- or until the OUT endpoint is judged stalled, which is
+    // the true return. Entered with `guard` held and the pool empty.
+    //
+    // WHY IT MAY NOT WAIT FOREVER. Transmit transfers carry no libusb timeout
+    // (timeout 0 in init_transmit_transfers()), so an OUT endpoint that NAKs
+    // indefinitely -- a hung board main loop, an endpoint left un-armed --
+    // completes nothing: all kTransmitTransferCount transfers stay in flight
+    // and every sender parks here. The keepalive sends through this path too,
+    // so it parks with them, never reaches try_recover_link(), and the link is
+    // never faulted; Handler's destructor then hangs joining it. A stall is
+    // therefore turned into fault(), which wakes every waiter and routes the
+    // keepalive's next failure into a reconnect -- the only path that cancels
+    // stuck transfers (quiesce_device() closes the handle under them).
+    //
+    // WHY NOT A LIBUSB TIMEOUT INSTEAD. libusb (1.0.27 io.c,
+    // add_to_flying_list / remove_from_flying_list) arms its timerfd whenever
+    // a timed transfer becomes the earliest deadline in flight and re-arms or
+    // disarms it when that transfer leaves. The receive transfers are untimed,
+    // so every transmit submit would be first in line: two timerfd_settime
+    // calls per packet on the hot path, to catch a failure that is free to
+    // detect here, off it.
+    //
+    // WHAT COUNTS AS A STALL. Not "this caller waited 1 s": with several
+    // senders, one can lose every race for buffers that do come back. The test
+    // is whether ANY buffer returned to the pool (completion or release)
+    // during a whole kTransmitStallTimeout window while transfers were in
+    // flight. None is the endpoint's fault. An empty pool with nothing in flight
+    // is not: every buffer is then held by a caller, and faulting the link
+    // would not bring one back, so that case only warns and keeps waiting.
+    [[nodiscard]] bool wait_for_free_transmit_transfer(
+        std::unique_lock<utility::PriorityInheritingMutex>& guard) noexcept {
+        const auto ready = [this] {
+            return stop_handling_events_.load(std::memory_order::relaxed)
+                || link_faulted_.load(std::memory_order::relaxed)
+                || free_transmit_transfers_.readable() != 0;
+        };
+
+        uint64_t returns_seen = transmit_pool_returns_;
+        auto deadline = std::chrono::steady_clock::now() + kTransmitStallTimeout;
+        uint64_t held_windows = 0;
+        while (!ready()) {
+            transmit_transfer_cv_.wait_until(guard, deadline);
+            if (ready())
+                return false;
+
+            const auto now = std::chrono::steady_clock::now();
+            if (transmit_pool_returns_ != returns_seen) {
+                // A buffer came back and another sender took it first: the
+                // endpoint is draining, this caller only lost the race.
+                returns_seen = transmit_pool_returns_;
+                deadline = now + kTransmitStallTimeout;
+                continue;
+            }
+            if (now < deadline)
+                continue; // spurious wakeup inside the window
+
+            if (transmit_transfers_in_flight_.load(std::memory_order::relaxed) != 0)
+                return true;
+
+            ++held_windows;
+            if (logging::should_log_occurrence(held_windows))
+                logger_.warn(
+                    "acquire_transmit_buffer: no free transmit buffer for {} s and none in "
+                    "flight -- all {} are held by callers that have not handed them back",
+                    held_windows
+                        * std::chrono::duration_cast<std::chrono::seconds>(kTransmitStallTimeout)
+                              .count(),
+                    kTransmitTransferCount);
+            deadline = now + kTransmitStallTimeout;
+        }
+        return false;
     }
 
     void note_transmit_completion(const libusb_transfer* transfer) noexcept {
@@ -1587,6 +1670,15 @@ private:
     static constexpr unsigned char kOutEndpoint = 0x01;
     static constexpr unsigned char kInEndpoint = 0x81;
 
+    // How long the transmit pool may sit exhausted with no buffer coming back
+    // before wait_for_free_transmit_transfer() calls the OUT endpoint stalled.
+    // Healthy completions take ~100 us, and the TinyUSB boards no longer hold
+    // OUT back (downlink backpressure removed 2026-09-14; even the old one had
+    // a 20 ms escape valve), so a full second without a single return is a
+    // hung endpoint, not load. Long on purpose: a false stall costs a
+    // reconnect.
+    static constexpr std::chrono::seconds kTransmitStallTimeout{1};
+
     // Second vendor interface, carrying CAN only. Presence is detected from the
     // configuration descriptor rather than assumed from a build flag, so one host
     // binary drives both a split-endpoint board and a single-pipe one.
@@ -1709,6 +1801,15 @@ private:
     };
 
     utility::RingBuffer<TransferWrapper*> free_transmit_transfers_;
+    // Despite RingBuffer's SPSC contract, every access here is serialized by
+    // transmit_transfer_mutex_ (senders, completions, teardown all meet on it),
+    // so this pool is an ordinary mutex-protected queue, not a lock-free SPSC
+    // channel. The SPSC class is reused for its power-of-two slot storage.
+    //
+    // Buffers handed back to the pool (completions and releases) since open.
+    // Guarded by transmit_transfer_mutex_, like the pool: it is the progress
+    // signal wait_for_free_transmit_transfer() tells a stall from contention by.
+    uint64_t transmit_pool_returns_ = 0;
     // Connections are numbered; a transmit completion that belongs to an older
     // one must never re-enter the pool of the current one, because its
     // transfer is bound to a handle that has since been closed. Bumped in

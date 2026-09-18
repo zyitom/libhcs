@@ -140,17 +140,14 @@ arm-none-eabi-nm firmware/mc02/build/app/mc02_app.elf | grep -c bmi088   # IMU: 
   `thread_setup`，事件线程没绑核**，而这是 [HOST_TUNING.md](../../HOST_TUNING.md) 1.3
   记的尾部最差一档。**要评估板级抖动，得先给测量工具加上绑核能力**，否则测的是主机调度。
   `[实测 2026-08-24，mc02 <-> 5321，已调优主机、事件线程未绑核]`
-- **下行流控：机制已移植但被控制器阻断，默认关闭** `[实测 2026-09-12]`。
-  hpm 的机制（`CFG_TUD_VENDOR_RX_MANUAL_XFER=1` + `usb/vendor.hpp` 四件套：手动重挂、
-  迟滞水位、20ms 逃生阀、审计钩子）已完整移植进本板源码（`usb/vendor.hpp`，宏置 1 启用），
-  但**不能在这块芯片上用**：hpm 的 ChipIdea 控制器不重挂端点就自动回 NAK，而本板的
-  DWC2 **不重挂时照样把包 ACK 进接收 FIFO 然后在 dcd 层无声丢弃**（实测：主机全速灌
-  24k 帧/s 零阻塞）；显式写 `DOEPCTL.SNAK` 扣住端点则与 TinyUSB dcd 的状态机冲突，
-  上电即死/USB 退化（`[实测 2026-09-12]`，两轮 DFU 恢复后搁置）。**正确出路**是在
-  TinyUSB fork 的 dcd_dwc2 层加每端点 NAK API（`dcd_edpt_nak/cnak`，fork 是本仓库
-  自己的），应用侧策略已就绪等它；启用前 `MANUAL_XFER` 保持 0。-->
-  `diag::note_tx_fail()` 在默认构建下仍是空实现（`libhcs_APP_CAN_DIAG` 默认 OFF），
-  过载行为维持静默丢弃 + LED。
+- **下行不背压**：与 hpm_board 统一的决定（2026-09-14，理由与实测见
+  [hpm_board AGENTS.md](../hpm_board/AGENTS.md)「USB 现行约束」）。`CFG_TUD_VENDOR_RX_MANUAL_XFER`
+  不设置，取 TinyUSB 默认 0。过载行为是 CAN 软件发送队列满即静默丢弃 + LED；
+  `diag::note_tx_fail()` 在默认构建下仍是空实现（`libhcs_APP_CAN_DIAG` 默认 OFF）。
+  **从 hpm 移植的背压代码（手动重挂、迟滞水位、20 ms 逃生阀、审计钩子、`DOEPCTL.SNAK`
+  写入）已删除，不要加回。** 硬件事实留作参考：本板 DWC2 **不重挂时照样把包 ACK 进接收
+  FIFO 然后在 dcd 层无声丢弃**（主机全速灌 24k 帧/s 零阻塞），显式写 `DOEPCTL.SNAK`
+  扣住端点则与 TinyUSB dcd 的状态机冲突，上电即死/USB 退化 `[实测 2026-09-12]`。
 - 热路径 `Can::handle_uplink/handle_downlink` 与排空发送队列的
   `drain_transmit_queue`/`drain_pending_transmits_slow` 等放 `.itcm`，启动时从 FLASH 拷入；
   `try_transmit()` 已改为头文件内联的空队列快测，主循环入口是 `drain_pending_transmits()`。

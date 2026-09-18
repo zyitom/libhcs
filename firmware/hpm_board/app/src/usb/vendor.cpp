@@ -88,9 +88,9 @@ void tud_vendor_rx_cb(uint8_t itf, const uint8_t* buffer, uint32_t size) {
     diag::note_usb_out_complete();
     diag::latency::open_downlink();
 
-    // 先处理, 后挂端点: 类驱动交给本回调的指针指向端点自己的 DMA 缓冲, 此刻重新
-    // 挂端点会让控制器开始覆写同一块缓冲。因此端点保持未挂载 -- 设备对主机 NAK --
-    // 贯穿下面的全部处理。
+    // 先处理, 后挂端点: 类驱动交给本回调的指针指向端点自己的 DMA 缓冲, 类驱动在本
+    // 回调返回后才重挂端点, 否则控制器会开始覆写同一块缓冲。因此端点保持未挂载 --
+    // 设备对主机 NAK -- 贯穿下面的全部处理。
     //
     // 先把包拷出去可以解除该约束(turnaround 实测 2.22 -> 1.27 us), 2026-09-05 前
     // 试过。在这里没有收益: 本主机对每个设备每 125 us 微帧恰好调度 8 个 bulk
@@ -100,7 +100,6 @@ void tud_vendor_rx_cb(uint8_t itf, const uint8_t* buffer, uint32_t size) {
     usb::vendor->handle_downlink(
         {reinterpret_cast<const std::byte*>(buffer), payload_size}, finished);
 
-    usb::vendor->poll_downlink_arm();
     diag::note_usb_out_armed();
 }
 
@@ -114,8 +113,6 @@ void tud_suspend_cb(bool remote_wakeup_en) {
     (void)remote_wakeup_en;
     usb::vendor->deactivate_session();
     usb::vendor->finish_downlink_transfer();
-    // 恢复不会重新枚举, 下面的 tud_mount_cb 不会因此运行。
-    usb::vendor->reset_downlink_arm();
     // 新主机必须自己完成 EP0 握手。
     usb::vendor->set_ep0_handshake_done(false);
 }
@@ -124,9 +121,6 @@ void tud_resume_cb() {}
 
 void tud_mount_cb() {
     g_packet_size = (tud_speed_get() == TUSB_SPEED_HIGH) ? 512U : 64U;
-    // SET_CONFIGURATION 会(重)建端点, 硬件原来持有的挂载随之消失。此刻端点尚不
-    // 存在 -- 无妨, 这里只是记下欠账, 主循环会重试到 transfer 被接受为止。
-    usb::vendor->reset_downlink_arm();
     // 新主机必须自己完成 EP0 握手。
     usb::vendor->set_ep0_handshake_done(false);
 }
@@ -134,7 +128,6 @@ void tud_mount_cb() {
 void tud_umount_cb() {
     usb::vendor->deactivate_session();
     usb::vendor->finish_downlink_transfer();
-    usb::vendor->reset_downlink_arm();
     // 新主机必须自己完成 EP0 握手。
     usb::vendor->set_ep0_handshake_done(false);
 }

@@ -42,11 +42,6 @@ option(libhcs_PULSE_TEST "Measure cross-board skew with GPTMR pulses (takes over
 # 透传给 app 子构建为 libhcs_APP_SOF_DIAG; 见 app/CMakeLists.txt。
 option(libhcs_SOF_DIAG "Emit USB SOF / FRINDEX validation telemetry on the UART0 uplink" OFF)
 
-# 透传给 app 子构建为 libhcs_APP_USB_FULL_SPEED。以 FULL 速度而非 HIGH 枚举设备
-# -- 是测试手段, 不是产品设置: 损失 bulk 吞吐(64 字节包), 并把 SOF 时基从 125 us
-# 微帧粗化到 1 ms 帧。见 SOF_TIMEBASE.md。
-option(libhcs_USB_FULL_SPEED "Enumerate USB at full speed (test only)" OFF)
-
 # 透传给 app 子构建为 libhcs_APP_ILM_HOT_PATH。HPM5321 始终用板自有的链接布局;
 # 该开关只作用于 HPM6E8Y。
 option(libhcs_ILM_HOT_PATH "Run the HPM6E8Y CAN driver from ILM" OFF)
@@ -100,7 +95,6 @@ add_hpm_board_subbuild(
     -Dlibhcs_APP_TIME_SYNC=${libhcs_TIME_SYNC}
     -Dlibhcs_APP_PULSE_TEST=${libhcs_PULSE_TEST}
     -Dlibhcs_APP_SOF_DIAG=${libhcs_SOF_DIAG}
-    -Dlibhcs_APP_USB_FULL_SPEED=${libhcs_USB_FULL_SPEED}
     -Dlibhcs_APP_ILM_HOT_PATH=${libhcs_ILM_HOT_PATH}
 )
 add_hpm_board_subbuild(

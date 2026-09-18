@@ -41,8 +41,10 @@ class Handler::Impl : public core::protocol::DeserializeCallback {
 public:
     static constexpr auto kSessionAckTimeout = std::chrono::milliseconds{200};
     static constexpr size_t kSessionAckRetryCount = 5;
-    // Also the anchor period for the shared time base. The board's session
-    // lease is 4 s, so 1 s is ample for the keepalive itself.
+    // Also the anchor period for the shared time base. It must sit well under
+    // the SHORTEST board lease, which is not the same everywhere: 4 s on
+    // hpm_board (link/host_session.hpp) and mc02 (usb/vendor.hpp), but 1 s on
+    // c_board (usb/vendor.hpp) and ch32_board (link/host_session.hpp).
     //
     // WHY IT WAS 50 ms. Each anchor exchange contributed one sample to the
     // Timeline's fit of (microframe -> host time), whose error falls as sqrt(N)
@@ -50,21 +52,32 @@ public:
     // measured on mc02, 250 ms -> 50 ms took the fitted phase from 18.5 us to
     // 8.4 us.
     //
-    // WHY IT IS 1 s. Two things replaced that fit. MicroframeTimebase reads the
-    // same axis from the controller's own counter at ~20 ns, and the boards'
-    // absolute axes are self-sustaining once anchored (counter + local fit, the
-    // anchor only resolves a wrap) -- so nothing on the precision path consumes
-    // the arrival timing of these packets any more. What the round still buys:
-    // the anchor wrap watchdog (a board counter that loses >1 s is caught within
-    // one round), Timeline/MicroframeTimebase observations, and board health.
-    // 1 Hz keeps all of that while the steady-state sync traffic drops to
-    // ~60 B/s. The cost is one-time, on the fallback path only: with the source
-    // unavailable, the round-trip fit converges on a 17 min window, and the
-    // integer-offset lock needs 32 observations = 32 s.
-    // 2026-09-13: 1 Hz 轮次在 hpm 板上诱发 keepalive 丢 ack(与轮次周期强耦合,
-    // mc02 正常;租约 4 s 后仍复现,疑似下行 arm/节流或链路恢复后的端点状态,
-    // 待定位)。回落到实测稳定的 250 ms。
-    static constexpr auto kSessionRefreshInterval = std::chrono::seconds{1};
+    // WHY PRECISION NO LONGER SETS IT. Two things replaced that fit.
+    // MicroframeTimebase reads the same axis from the controller's own counter
+    // at ~20 ns, and the boards' absolute axes are self-sustaining once
+    // anchored (counter + local fit, the anchor only resolves a wrap) -- so
+    // nothing on the precision path consumes the arrival timing of these
+    // packets any more. What the round still buys: the anchor wrap watchdog (a
+    // board counter that loses >1 s is caught within one round),
+    // Timeline/MicroframeTimebase observations, and board health. A slower
+    // round costs only on the fallback path: with the source unavailable, the
+    // round-trip fit converges on a 17 min window, and the integer-offset lock
+    // needs 32 observations.
+    //
+    // WHY IT IS 250 ms AGAIN, NOT 1 s. 1 Hz was adopted 2026-09-14 (46b0da7)
+    // together with raising the hpm and mc02 leases from 1 s to 4 s: at a
+    // lease equal to the period, hpm lost ~70% of its rounds at the expiry
+    // boundary. (The 09-13 hpm ack loss that briefly blamed the period was a
+    // board left on stale firmware; see firmware/hpm_board/SOF_TIMEBASE.md.)
+    // The c_board and ch32_board leases were not raised and are still 1 s --
+    // that same boundary. 250 ms gives every board at least 4x margin without
+    // touching firmware, for three more rounds a second (a keepalive, plus an
+    // anchor with time sync on, each way) -- noise beside a 1 kHz control
+    // stream -- and locks the fallback offset in
+    // 8 s instead of 32 s. Going back to 1 Hz
+    // needs every lease raised first, and a longer lease is also how long a
+    // board keeps driving a dead host's GPIO outputs.
+    static constexpr auto kSessionRefreshInterval = std::chrono::milliseconds{250};
 
     Impl(
         std::unique_ptr<transport::Transport> transport, data::DataCallback& callback,
@@ -460,11 +473,8 @@ private:
                     lock, kSessionAckTimeout, [this, previous_session_start_ack_count] {
                         return stop_keepalive_.load(std::memory_order_relaxed)
                             || session_start_ack_count_ > previous_session_start_ack_count;
-                    })) {
-                if (stop_keepalive_.load(std::memory_order_relaxed))
-                    return;
+                    }))
                 return;
-            }
         }
 
         throw std::runtime_error{"Timed out waiting for SESSION_ACK"};
@@ -623,6 +633,12 @@ private:
     // halted or un-armed, which is the one thing a transport-level recovery can
     // fix and no amount of protocol retrying can.
     void handle_session_failure(const std::exception& exception) noexcept try {
+        // Shutting down: a send that fails now is the teardown, not a fault to
+        // repair. try_recover_link() can reopen the device and wait up to 2 s
+        // for it to re-arrive, all of which ~Impl() would sit through in join().
+        if (stop_keepalive_.load(std::memory_order_relaxed))
+            return;
+
         // refresh_session() gives up without clearing the flag, so clear it
         // here: the next pass must re-open the session rather than keep
         // keepaliving one the board has already forgotten.

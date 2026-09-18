@@ -12,7 +12,12 @@
     "customizations": {
         "vscode": {
             "settings": {
-                "remote.autoForwardPorts": false
+                "remote.autoForwardPorts": false,
+                // Lets clangd ask each cross compiler for its newlib/libstdc++
+                // include directories (see the root .clangd).
+                "clangd.arguments": [
+                    "--query-driver=/opt/arm-none-eabi/bin/arm-none-eabi-*,/opt/riscv32-none-elf/bin/riscv32-*,/opt/wch-gcc15/bin/riscv32-wch-elf-*"
+                ]
             },
             "extensions": [
                 "llvm-vs-code-extensions.vscode-clangd",

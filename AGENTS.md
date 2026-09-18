@@ -114,7 +114,9 @@ AGENTS.md 里留一句结论加链接。**
 
 ## 测试指南
 - 目前尚未启用 CTest/GTest 测试目标；当前 CI 质量门禁为：clang-format、clang-tidy 和 编译验证。
-- 每次修改后，应在本地运行 lint 工具，并至少构建一个相关的构建目标。
+- 每次修改后，运行 `clang-format-check` 并至少构建一个相关的构建目标。
+- **clang-tidy 很慢，不要每次修改都跑** [用户要求 2026-09-18]：只在准备提交/推送前跑一次，
+  或用户明确要求时跑；只跑改动涉及的 target，不整仓扫。
 
 ## 提交指南
 - Git unstaged changes 是必要的 code review 渠道。Agent 严禁执行 git add。 

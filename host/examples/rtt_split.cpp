@@ -138,6 +138,8 @@ int main(int argc, char** argv) {
 
     libhcs::board::AdvancedOptions options;
     options.set_io_thread_affinity(7, 80);
+    // 与其他测量工具一致：探针常对 dirty 工作树固件跑，版本串校验会拒开。
+    options.dangerously_skip_version_checks = true;
 
     printf("Connecting (serial filter '%s') ...\n", serial);
     SplitCallback callback;

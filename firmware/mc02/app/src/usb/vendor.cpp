@@ -58,9 +58,6 @@ void tud_vendor_rx_cb(uint8_t itf, const uint8_t* buffer, uint32_t size) {
     // 每个包之后传输都会被判结束, 协议帧会被拆散。
     usb::vendor->handle_downlink(
         {reinterpret_cast<const std::byte*>(buffer), size}, size < CFG_TUD_VENDOR_RX_EPSIZE);
-
-    // 处理完立即重挂端点(节流时不挂, 由主循环在水位回落后再挂)。
-    usb::vendor->poll_downlink_arm();
 }
 
 void tud_dfu_runtime_reboot_to_dfu_cb() {
@@ -79,9 +76,6 @@ void tud_suspend_cb(bool remote_wakeup_en) {
     (void)remote_wakeup_en;
     usb::vendor->deactivate_session();
     usb::vendor->finish_downlink_transfer();
-    // 恢复不会重新枚举, 下面的 tud_mount_cb 不会因此运行。
-    usb::vendor->reset_downlink_arm();
-    usb::vendor->set_vendor_mounted(false);
     // 新主机必须自己完成 EP0 握手。
     usb::vendor->set_ep0_handshake_done(false);
 }
@@ -89,10 +83,6 @@ void tud_suspend_cb(bool remote_wakeup_en) {
 void tud_resume_cb() {}
 
 void tud_mount_cb() {
-    // SET_CONFIGURATION 会(重)建端点, 硬件原来持有的挂载随之消失。此刻端点尚不
-    // 存在 -- 无妨, 这里只是记下欠账, 主循环会重试到 transfer 被接受为止。
-    usb::vendor->reset_downlink_arm();
-    usb::vendor->set_vendor_mounted(true);
     // 新主机必须自己完成 EP0 握手。
     usb::vendor->set_ep0_handshake_done(false);
 }
@@ -100,8 +90,6 @@ void tud_mount_cb() {
 void tud_umount_cb() {
     usb::vendor->deactivate_session();
     usb::vendor->finish_downlink_transfer();
-    usb::vendor->reset_downlink_arm();
-    usb::vendor->set_vendor_mounted(false);
     // 新主机必须自己完成 EP0 握手。
     usb::vendor->set_ep0_handshake_done(false);
 }

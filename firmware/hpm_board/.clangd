@@ -1,3 +1,0 @@
-CompileFlags:
-  Add:
-    - "--gcc-toolchain=/opt/riscv32-none-elf"

@@ -27,6 +27,7 @@
 // path -- the very path being protected here. Hence the thin pthread_cond_t
 // wrapper rather than a standard-library type.
 
+#include <chrono>
 #include <cstdlib>
 #include <mutex>
 
@@ -80,7 +81,17 @@ private:
 
 class PriorityInheritingConditionVariable {
 public:
-    PriorityInheritingConditionVariable() noexcept { pthread_cond_init(&condition_, nullptr); }
+    PriorityInheritingConditionVariable() noexcept {
+        pthread_condattr_t attributes;
+        pthread_condattr_init(&attributes);
+        // Timeouts must run on the monotonic clock: pthread_cond_timedwait
+        // measures against the clock the condattr pins, and the default is
+        // CLOCK_REALTIME -- a wall-clock step (settimeofday, an NTP step at
+        // boot) would stretch or cut short every bounded wait on this condvar.
+        pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
+        pthread_cond_init(&condition_, &attributes);
+        pthread_condattr_destroy(&attributes);
+    }
 
     ~PriorityInheritingConditionVariable() { pthread_cond_destroy(&condition_); }
 
@@ -100,6 +111,22 @@ public:
     void wait(std::unique_lock<PriorityInheritingMutex>& lock, Predicate predicate) {
         while (!predicate())
             pthread_cond_wait(&condition_, lock.mutex()->native_handle());
+    }
+
+    // Bounded wait against an absolute deadline, so a caller that loops on
+    // spurious wakeups keeps one fixed deadline instead of restarting the clock
+    // on every pass. Returns on notify, spurious wakeup or deadline alike: the
+    // caller re-checks its own condition. libstdc++'s steady_clock is
+    // CLOCK_MONOTONIC, the clock the condattr above pins, so its epoch count
+    // converts to the timespec directly.
+    void wait_until(
+        std::unique_lock<PriorityInheritingMutex>& lock,
+        std::chrono::steady_clock::time_point deadline) noexcept {
+        const auto seconds = std::chrono::time_point_cast<std::chrono::seconds>(deadline);
+        const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - seconds);
+        const timespec until{
+            .tv_sec = seconds.time_since_epoch().count(), .tv_nsec = nanos.count()};
+        (void)pthread_cond_timedwait(&condition_, lock.mutex()->native_handle(), &until);
     }
 
 private:

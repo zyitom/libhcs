@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <stdexcept>
 #include <string_view>
@@ -117,7 +118,7 @@ public:
         , handler_(
               0xA511, 0x6E84, serial_filter, options, callback,
               [this](host::protocol::Handler& handler) {
-                  interface_ = hcs::apply(handler, configuration_);
+                  interface_.store(hcs::apply(handler, configuration_), std::memory_order_release);
               }) {}
 
     Hpm6e8y(const Hpm6e8y&) = delete;
@@ -184,13 +185,21 @@ public:
     // It is a property of the bus, not of a frame: the wire protocol carries no
     // per-frame type flag any more, and this board's firmware sends every frame
     // in its bus's compiled mode. Read this instead of assuming.
-    [[nodiscard]] bool can0_is_fd() const { return interface_.can_fd(0); }
+    [[nodiscard]] bool can0_is_fd() const {
+        return interface_.load(std::memory_order_relaxed).can_fd(0);
+    }
 
-    [[nodiscard]] bool can1_is_fd() const { return interface_.can_fd(1); }
+    [[nodiscard]] bool can1_is_fd() const {
+        return interface_.load(std::memory_order_relaxed).can_fd(1);
+    }
 
-    [[nodiscard]] bool can2_is_fd() const { return interface_.can_fd(2); }
+    [[nodiscard]] bool can2_is_fd() const {
+        return interface_.load(std::memory_order_relaxed).can_fd(2);
+    }
 
-    [[nodiscard]] bool can3_is_fd() const { return interface_.can_fd(3); }
+    [[nodiscard]] bool can3_is_fd() const {
+        return interface_.load(std::memory_order_relaxed).can_fd(3);
+    }
 
     // The controller's own error registers for one CAN port. Read over EP0 on
     // the shipping image; see libhcs/board/hcs_config.hpp for how to read it.
@@ -215,8 +224,12 @@ public:
 
     // Channels the board reports it has. On a board directory that serves more
     // than one PCB (the hpm5321 image serves both the single- and dual-CAN
-    // variants) this is the run-time truth, not the image's capacity.
-    [[nodiscard]] const hcs::Interface& interface() const { return interface_; }
+    // variants) this is the run-time truth, not the image's capacity. A
+    // snapshot: the live copy is atomic because the before-session hook
+    // re-learns it from the keepalive thread on every reconnect.
+    [[nodiscard]] hcs::Interface interface() const {
+        return interface_.load(std::memory_order_relaxed);
+    }
 
 private:
     static inline Callback default_callback_{};
@@ -225,7 +238,11 @@ private:
     // lifetimes must already have begun -- member initialisation runs in
     // declaration order. configuration_ is a COPY: the hook runs again on every
     // reconnect, long after the constructor argument has gone.
-    hcs::Interface interface_{};
+    //
+    // interface_ is atomic for the same reason: the hook re-learning it on a
+    // reconnect runs on the keepalive thread, while can0_is_fd() and friends
+    // read it from application threads. See hcs_config.hpp's static_assert.
+    std::atomic<hcs::Interface> interface_;
     Configuration configuration_;
     host::protocol::Handler handler_;
 };

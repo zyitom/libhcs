@@ -96,12 +96,6 @@ bool host_session_established() { return usb::vendor->session_established(); }
         for (size_t i = 0; i < can::can_count(); ++i)
             can::can_array[i]->try_transmit();
 
-        // 结清仍欠着的 USB bulk OUT 挂载。稳态的重新挂载走接收完成回调, 这里
-        // 只覆盖首次挂载与被限流端点的解除, 因此必须放在上面的排空之后 --
-        // 这样节流策略看到的队列才是已排空的。水位与有界停顿出口见
-        // usb/vendor.hpp 的说明。
-        usb::vendor->poll_downlink_arm_if_pending();
-
         usb::poll_dfu_runtime_reboot();
 
         // LED 记账放在这里按 1 kHz tick 节奏跑, 而不在 mchtmr ISR 里: MTIP

@@ -52,7 +52,11 @@ public:
     // USB enumeration, which says nothing about whether a host is talking.
     bool session_established() const { return session_established_; }
 
-    void deactivate_session() { session_established_ = false; }
+    void deactivate_session() {
+        session_established_ = false;
+        // A session takes the GPIO outputs it set with it; see Gpio::stop_outputs().
+        gpio::gpio->stop_outputs();
+    }
 
     void handle_downlink(std::span<const std::byte> buffer, bool finished) {
         deserializer_.feed(buffer);
@@ -107,6 +111,8 @@ public:
 
 private:
     void activate_session(uint32_t nonce) {
+        // A new session replacing an old one must not inherit the old host's outputs.
+        gpio::gpio->stop_outputs();
         if (transmitting_batch_) {
             transmit_buffer_.release_batch(transmitting_batch_);
             transmitting_batch_ = nullptr;

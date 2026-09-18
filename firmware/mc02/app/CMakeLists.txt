@@ -64,7 +64,7 @@ target_link_libraries(mc02_app PRIVATE
     tinyusb_app
 )
 
-option(libhcs_APP_IMU_ENABLE "Enable BMI088 initialization and runtime sampling" ON)
+option(libhcs_APP_IMU_ENABLE "Enable BMI088 initialization and runtime sampling" OFF)
 if(libhcs_APP_IMU_ENABLE)
     target_compile_definitions(mc02_app PRIVATE libhcs_APP_IMU_ENABLE=1)
 endif()
@@ -74,7 +74,7 @@ endif()
 # Set OFF when a build will never talk on those buses -- skips MX_USARTx_UART_Init,
 # the two D2 SRAM objects (~1.8 KB), and the per-pass NDTR polls. DataIds stay
 # kUart2 / kUart3 either way; an OFF image just rejects those fields.
-option(libhcs_APP_RS485_ENABLE "Enable USART2/USART3 RS-485 (silkscreen UART2/UART3)" ON)
+option(libhcs_APP_RS485_ENABLE "Enable USART2/USART3 RS-485 (silkscreen UART2/UART3)" OFF)
 if(libhcs_APP_RS485_ENABLE)
     target_compile_definitions(mc02_app PRIVATE libhcs_APP_RS485_ENABLE=1)
 endif()

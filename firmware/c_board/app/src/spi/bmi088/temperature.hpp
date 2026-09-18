@@ -24,9 +24,16 @@ class Temperature final
 public:
     using Lazy = utility::Lazy<Temperature, Spi::Lazy*>;
 
-    static constexpr uint32_t kProbeFrequencyHz = 977U;
+    // The BMI088 temperature register (TEMP_MSB/TEMP_LSB) only updates every 1.28 s
+    // (datasheet). The probe period must stay below that, so each probe interval holds at
+    // most one update: none is missed, and handle_uplink()'s midpoint estimate of the change
+    // time stays valid. 1 Hz leaves ~22% margin; the change time is then known to +-0.5 s,
+    // which does not matter for a temperature.
+    static constexpr uint32_t kProbeFrequencyHz = 1U;
     static constexpr timer::Timer::Duration kProbePeriod{
         (timer::Timer::kClockFrequency + (kProbeFrequencyHz / 2U)) / kProbeFrequencyHz};
+    // Re-send interval for an unchanged value. With 1 s probes it fires on the first probe
+    // at or past 1.3 s, i.e. every 2 s.
     static constexpr uint32_t kHeartbeatPeriodQuarterUs = 1'300U * 1'000U * 4U;
 
     explicit Temperature(Spi::Lazy* spi)

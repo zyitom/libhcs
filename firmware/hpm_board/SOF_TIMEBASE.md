@@ -465,6 +465,13 @@ SOF"的判断一直在翻，每翻一次就是 **125 µs 的静默跳变**。
 > 布局由 protocol.hpp 的 `session_layout_fingerprint()` 自动计算，
 > `data::kSessionWireVersion` 由 static_assert 钉死到该计算值——改 session
 > 载荷而不更新常数已无法通过编译。
+>
+> **2026-09-18 续：session 周期回到 250 ms。** 1 Hz 定下时只有 hpm、mc02 的租约改成
+> 4 s，c_board 与 ch32_board 的 `kSessionLease` 仍是 1 s——正是上文 hpm 在 1 Hz 下
+> 约 70% 轮次超时的那个边界 [代码核对，未上板]。主机侧 `kSessionRefreshInterval` 改回
+> 250 ms，所有板不改固件即有至少 4 倍余量；代价是每秒多 3 轮（keepalive，开 time sync
+> 时另加锚点），回退路径的整数偏移锁定从 32 s 缩回 8 s。要回 1 Hz，先把所有板的租约
+> 提到远高于 1 s；租约越长，主机死后板子保持 GPIO 输出的时间也越长。
 
 #### 为什么这些都没有牵连到 42 ns
 
@@ -598,7 +605,10 @@ skew = ((b_rx - a_tx) - (a_rx - b_tx)) / 2
 **结论：能，但要改一处策略、补一个 2.8 us 的固定偏置；补完之后跨板 sigma 约 25~30 ns，
 只比全 HS 的 20 ns 差一点。**
 
-复现：`-Dlibhcs_USB_FULL_SPEED=ON` 把一块板强制成全速枚举（该开关默认 OFF，是测试载具）。
+复现：把一块板强制成全速枚举。本节实验用测试开关 `libhcs_USB_FULL_SPEED`（置
+`PORTSC1.PFSC`）实现；实验结论落定后（除非硬件只能跑全速，没有理由混速），该开关已
+随代码移除（2026-09-15）。需要复现时临时令 `usb_use_high_speed()` 返回 false 并在
+`tusb_rhport_init` 之后置 PFSC 位即可，做法见 git 历史。
 注意 `tusb_rhport_init` 的 `.speed` 字段**是无效的**——ChipIdea 的 device 驱动只读
 `PORTSC1_PORT_SPEED` 汇报，从不强制；真正强制全速的是控制器位 **`PORTSC1.PFSC`**（禁掉
 高速 chirp），而且必须在 `tusb_rhport_init` 之后设，因为 `dcd_init` 会复位控制器。

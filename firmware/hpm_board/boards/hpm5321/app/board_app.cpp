@@ -118,13 +118,10 @@ void init_can_indicator_pins() {
 }
 
 bool usb_use_high_speed() {
-#if defined(libhcs_APP_USB_FULL_SPEED) && libhcs_APP_USB_FULL_SPEED
-    // 仅测试构建(-Dlibhcs_USB_FULL_SPEED=ON)。PHY 本身支持高速, 这里强制较慢
-    // 的枚举, 使 HS/FS 混合对可接到同一主机控制器上并测量共享 SOF 时间基。
-    return false;
-#else
+    // 板上收发器与 PHY 均支持高速, 始终以 480 Mbit 枚举。曾有强制全速的测试开关
+    // (PORTSC1.PFSC) 用于混速 SOF 时间基实验, 结论见 SOF_TIMEBASE.md 5.7: 除非
+    // 硬件只能跑全速, 没有理由混速; 实验结束, 开关随结论一并移除。
     return true;
-#endif
 }
 
 SDK_DECLARE_EXT_ISR_M(IRQn_MCAN0, can0_isr)

@@ -56,10 +56,25 @@ public:
         set_pwm_compare(channel_index, duty16_to_pwm_compare(data.value));
     }
 
+    // Called by usb::Vendor when a session ends (lease expiry, USB suspend or unplug,
+    // replacement by a new session). The host that set these outputs is gone, so the last duty
+    // cycle must not be held indefinitely -- on an ESC or motor that means it keeps running. A
+    // zero compare holds output channels low with no pulses (digital outputs go low too), which
+    // a device sees as signal loss rather than a still-valid old command. Not switched back to
+    // high-impedance inputs: a floating signal line can read as noise pulses. Input channels'
+    // pins are not connected to the timer, so the write does not affect them. The new compare
+    // takes effect at the next PWM period (at most 20 ms at 50 Hz).
+    void stop_outputs() {
+        for (const auto& gpio : spec::c_board::kGpioDescriptors)
+            set_pwm_compare(gpio.channel_index, 0);
+    }
+
     void handle_digital_read(uint8_t channel_index, const data::GpioReadConfigView& data) {
-        configure_digital_input_mode(channel_index, data);
+        const bool reconfigured = configure_digital_input_mode(channel_index, data);
 
         if (data.asap) {
+            if (reconfigured)
+                wait_pull_settle();
             const auto& hardware = channel_hardware(channel_index);
             const bool high =
                 HAL_GPIO_ReadPin(hardware.gpio_port, hardware.gpio_pin) == GPIO_PIN_SET;
@@ -138,7 +153,10 @@ private:
         configure_hal_gpio_output(channel_index);
     }
 
-    void configure_digital_input_mode(uint8_t channel_index, const data::GpioReadConfigView& data) {
+    // Returns true when the hardware was actually reconfigured (mode, edges,
+    // pull or sample period changed). A caller that samples immediately must
+    // wait_pull_settle() first.
+    bool configure_digital_input_mode(uint8_t channel_index, const data::GpioReadConfigView& data) {
         auto& state = channel_state(channel_index);
 
         auto rising_edge = data.rising_edge;
@@ -163,7 +181,22 @@ private:
             state.next_sample_deadline = timer::timer->timepoint();
 
             configure_hal_gpio_input(channel_index, rising_edge, falling_edge, pull);
+            return true;
         }
+        return false;
+    }
+
+    // After flipping a pull-up/pull-down, the internal ~40 kOhm resistor needs
+    // a few microseconds to charge or discharge the trace capacitance; a read
+    // issued with the reconfiguration samples the pre-charge level (measured
+    // 2026-09-18: a pull-up asap read stably returned the old low level). The
+    // wait runs only on the asap path after an actual reconfiguration --
+    // periodic sampling and edge capture do not read at the reconfiguration
+    // instant. Main-loop context, a one-off 100 us is negligible.
+    static void wait_pull_settle() {
+        const auto deadline = timer::timer->timepoint()
+                            + timer::Timer::to_duration_checked(std::chrono::microseconds{100});
+        while (!timer::timer->check_reached(deadline)) {}
     }
 
     void set_pwm_compare(uint8_t channel_index, uint32_t compare) {
@@ -173,6 +206,14 @@ private:
 
     void configure_hal_gpio_output(uint8_t channel_index) {
         const auto& hardware = channel_hardware(channel_index);
+
+        // HAL_GPIO_Init() only rewrites the EXTI registers when the new mode is an interrupt
+        // mode, so a channel last read with edge interrupts would keep them armed after
+        // switching to output and take an EXTI interrupt on every PWM edge. HAL_GPIO_DeInit()
+        // unmaps and disarms the line; then drop any edge already pending. state.mode is
+        // already output, so an interrupt that slips in meanwhile is discarded.
+        HAL_GPIO_DeInit(hardware.gpio_port, hardware.gpio_pin);
+        __HAL_GPIO_EXTI_CLEAR_IT(hardware.gpio_pin);
 
         GPIO_InitTypeDef gpio_init = {};
         gpio_init.Pin = hardware.gpio_pin;

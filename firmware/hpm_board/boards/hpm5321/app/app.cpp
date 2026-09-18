@@ -93,12 +93,6 @@ bool host_session_established() { return usb::vendor->session_established(); }
         // Can::drain_pending_transmits()。
         can::Can::drain_pending_transmits();
 
-        // 结清尚未完成的 USB bulk OUT 使能。稳态的重新使能挂在接收完成回调上,
-        // 这里只覆盖首次使能与被限流端点的解除, 故必须放在上面的排空之后 --
-        // 排空让队列在限流策略看来已经清空。水位线与有界阻塞的逃生机制见
-        // usb/vendor.hpp。
-        usb::vendor->poll_downlink_arm_if_pending();
-
         usb::poll_dfu_runtime_reboot();
 
         // LED 簿记放在这里按 1 kHz tick 节奏跑, 而非 mchtmr ISR 内: MTIP 绕过

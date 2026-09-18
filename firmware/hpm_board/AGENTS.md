@@ -145,11 +145,14 @@ init 和 `abort_transmit()` 之后采样，遥测只读快照；`uart_set_baudra
 
 ## USB 现行约束（机制与全部数据见 [USB_OPTIMIZATION_LOG.md](USB_OPTIMIZATION_LOG.md)）
 
-- **OUT 背压**：CAN 过载时板端不再 arm OUT 端点、让控制器 NAK 把主机压回 CAN 线速，
-  不静默丢帧。开关 `CFG_TUD_VENDOR_RX_MANUAL_XFER`，`usb::Vendor::poll_downlink_arm()`
-  门控看 `can::max_transmit_queue_depth()`：48/64 停 arm、16/64 恢复（迟滞）。**必须有
-  逃生门**：扣满 20 ms 就放弃背压（session lease 1000 ms），宁可丢帧也不丢会话。它限的
-  是稳态速率，不是无损保证；代价 −4.4% 峰值包率（`USB_OPTIMIZATION_LOG.md` 10.1）。
+- **下行不背压**（2026-09-14 起）：`CFG_TUD_VENDOR_RX_MANUAL_XFER` 不再设置，取 TinyUSB
+  默认 0，类驱动在接收回调返回后自行重挂 bulk OUT 端点。下行是周期性控制命令，背压会把
+  旧命令憋在主机与板上队列里、过载缓解后按序补发，且 NAK 作用于整个端点，连带卡住 UART
+  下行与会话保活；过载时改为 CAN 软件发送队列（64 深）满即丢帧 + LED。**原背压代码
+  （手动重挂、48/64 迟滞水位、20 ms 逃生阀、端点审计钩子）已删除，不要加回**；要加回
+  先重做 `USB_OPTIMIZATION_LOG.md` 第 2 节的洪泛测量和 HCS `HcsLinkProbe` 的 `burst`
+  过载对照。`[实测 2026-09-14，三板 hcs_link：正常工况无退化；5321 以 30 帧/拍过载时
+  新旧固件丢帧同为约 32%，出队帧年龄 p50 4.31 ms 对旧版 4.65 ms]`
 - **主循环里 CAN 要排在 bulk 前面。** 一趟主循环内的调用顺序是板端唯一的优先级机制：
   92 kB/s 下 CAN 优先 p99 123.7，bulk 优先 128.4。
 - **UART 会顶掉 CAN 的尾部延迟**（head-of-line blocking，p99 +40us 量级）：分端点方案

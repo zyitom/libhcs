@@ -71,13 +71,8 @@ public:
     [[nodiscard]] bool fd_mode() const { return canfd_; }
     void set_fd_mode(bool fd) { canfd_ = fd; }
 
-    // 软件 TX 环的深度。usb/vendor.hpp 的下行流控按它推导水位, 因此公开。
+    // 软件 TX 环的深度。
     static constexpr size_t kTransmitQueueSize = 64;
-
-    // 本控制器软件 TX 环里的待发帧数。USB 下行流控 (vendor.hpp 的
-    // poll_downlink_arm_if_pending) 读它决定是否继续接收 OUT 包: 任一路接近满
-    // 就该让主机减速, 而不是收下只能丢弃的帧。
-    [[nodiscard]] size_t transmit_queue_depth() const { return transmit_buffer_.readable(); }
 
     // CAN 转发热路径。函数体在 can.cpp 中定义并放入零等待 ITCM(.itcm 段),
     // 使最坏转发延迟不受 I-cache miss 和 FLASH-XIP 取指抖动影响。
@@ -277,17 +272,6 @@ inline Can* can_by_index(size_t index) {
     case 2: return can3.get();
     default: return nullptr;
     }
-}
-
-// 三路控制器中最深的软件 TX 队列。USB 下行流控按它节流: 任一路背压即足够 --
-// 主机无从知道帧发往哪条总线, 也没有必要知道。
-inline size_t max_transmit_queue_depth() {
-    size_t depth = 0;
-    for (size_t i = 0; i < kCanCount; ++i) {
-        if (const Can* can = can_by_index(i))
-            depth = std::max(depth, can->transmit_queue_depth());
-    }
-    return depth;
 }
 
 } // namespace libhcs::firmware::can

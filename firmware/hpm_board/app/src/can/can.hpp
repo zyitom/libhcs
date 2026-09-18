@@ -287,8 +287,7 @@ public:
         drain_pending_transmits_slow();
     }
 
-    // 软件发送队列中等待的帧数。USB 下行 arm 策略据此判断再收一个 OUT 包是否
-    // 会撑爆队列; 见 usb/vendor.hpp。
+    // 软件发送队列中等待的帧数。
     [[nodiscard]] size_t transmit_queue_depth() const { return transmit_buffer_.readable(); }
 
     static constexpr size_t kTransmitQueueSize = 64;
@@ -425,9 +424,9 @@ consteval std::array<Can::Lazy, sizeof...(indices)>
 
 inline constinit auto can_array = internal::make_can_array(std::make_index_sequence<kCanCount>{});
 
-// 本 PCB 实有控制器中最深的软件发送队列。USB 下行 arm 策略以此限流: 任意一路
-// 总线积压就足以开始丢帧, 与是哪一路无关。以 can_count() 为界并用 try_get()
-// 保护, 理由同其他对 can_array 的循环: 单路 hpm5321 的尾部槽位从未构造。
+// 本 PCB 实有控制器中最深的软件发送队列(Can::transmit_queues_empty() 用它)。以
+// can_count() 为界并用 try_get() 保护, 理由同其他对 can_array 的循环: 单路
+// hpm5321 的尾部槽位从未构造。
 inline size_t max_transmit_queue_depth() {
     size_t depth = 0;
     for (size_t i = 0; i < can_count(); ++i) {

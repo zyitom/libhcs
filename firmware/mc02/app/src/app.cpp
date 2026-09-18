@@ -178,10 +178,6 @@ App::App() {
 #endif
     MX_UART5_Init();
 #ifdef libhcs_APP_RS485_ENABLE
-    // 两个 RS-485 端口(机箱侧 UART2/UART3)。两个 MX_*_Init 都会执行
-    // HAL_RS485Ex_Init, 即 CR3.DEM 的开启之处。这对端口合计约占 32 KB D2 SRAM 区
-    // 的 1.8 KB -- 见 uart.hpp。libhcs_APP_RS485_ENABLE 关闭时整体编译掉,
-    // 与 IMU 跳过 MX_SPI2_Init 的方式一致。
     MX_USART2_UART_Init();
     MX_USART3_UART_Init();
 #endif
@@ -252,8 +248,6 @@ App::App() {
 
         // 每趟主循环一次, 而非每次 try_transmit() 一次; 见 Vendor::poll_session。
         usb::vendor->poll_session();
-        // USB 下行流控: 重估节流策略并结清端点挂载欠账(见 usb/vendor.hpp)。
-        usb::vendor->poll_downlink_arm_if_pending();
         usb::poll_dfu_runtime_reboot();
 
         // 共享时基: 重新拟合微帧-周期计数直线, 并重设 SOF 使能, 让挂钩在控制器于

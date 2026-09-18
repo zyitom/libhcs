@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <stdexcept>
 #include <string_view>
 
@@ -114,7 +116,6 @@ public:
         void gyroscope_receive_callback(const libhcs::data::ImuGyroscopeDataView& data) override {
             (void)data;
         }
-        // mc02 firmware does not report IMU temperature; kept to satisfy the interface.
         void temperature_receive_callback(
             const libhcs::data::ImuTemperatureDataView& data) override {
             (void)data;
@@ -180,7 +181,8 @@ public:
         , handler_(
               0xA511, 0x0723, serial_filter, options, callback,
               [this](host::protocol::Handler& handler) {
-                  interface_ = hcs::apply(handler, configuration_);
+                  const std::scoped_lock guard{reconfigure_mutex_};
+                  interface_.store(hcs::apply(handler, configuration_), std::memory_order_release);
               }) {}
 
     Mc02(const Mc02&) = delete;
@@ -349,7 +351,11 @@ public:
     // every EP0 reconfiguration it is NOT ordered against queued data: quiesce
     // the link before switching a bus mid-traffic. Mind the far end too -- an
     // FD peer keeps decoding classic frames, but a classic-only peer errors on
-    // FD frames, which is why the firmware default is FD for every bus.
+    // FD frames, which is why the firmware default is FD for every bus. A
+    // reconnect re-runs the construction Configuration: a bus it names is
+    // switched back to that mode, one it leaves unset keeps whatever the board
+    // runs by then (the firmware default if the board reset). canN_is_fd()
+    // follows the board either way.
     void configure_can1(bool fd) { configure_can(0, fd); }
     void configure_can2(bool fd) { configure_can(1, fd); }
     void configure_can3(bool fd) { configure_can(2, fd); }
@@ -357,9 +363,15 @@ public:
     // Frame type of each CAN bus. Seed from the construction handshake, kept in
     // step by the configure_canN() calls above; the wire itself carries no
     // per-frame type flag any more. Read this instead of assuming.
-    [[nodiscard]] bool can1_is_fd() const { return interface_.can_fd(0); }
-    [[nodiscard]] bool can2_is_fd() const { return interface_.can_fd(1); }
-    [[nodiscard]] bool can3_is_fd() const { return interface_.can_fd(2); }
+    [[nodiscard]] bool can1_is_fd() const {
+        return interface_.load(std::memory_order_relaxed).can_fd(0);
+    }
+    [[nodiscard]] bool can2_is_fd() const {
+        return interface_.load(std::memory_order_relaxed).can_fd(1);
+    }
+    [[nodiscard]] bool can3_is_fd() const {
+        return interface_.load(std::memory_order_relaxed).can_fd(2);
+    }
 
     // The controller's own error registers for one CAN port: TEC/REC, the last
     // protocol error, bus state flags, and the forwarded-frame count that tells
@@ -388,18 +400,30 @@ public:
     // Channels the board reports it has. This image carries all three CAN buses
     // and all six UART indexes, so this is the static truth -- but it is read
     // over EP0 like every other board's, which keeps the construction handshake
-    // uniform (and is what the session gate on the firmware keys off).
-    [[nodiscard]] const hcs::Interface& interface() const { return interface_; }
+    // uniform (and is what the session gate on the firmware keys off). A
+    // snapshot: the live copy is atomic -- see the member declaration below.
+    [[nodiscard]] hcs::Interface interface() const {
+        return interface_.load(std::memory_order_relaxed);
+    }
 
 private:
     // Shared body of configure_canN(): apply the mode over EP0, then mirror it
     // into the cached mask so canN_is_fd() stays truthful without another
     // round trip.
+    //
+    // Serialized against the reconnect hook as a whole, EP0 exchange
+    // included. Making only the mirror atomic (a CAS) is not enough: if the
+    // hook's apply() lands between this request and this mirror, the board
+    // ends in the hook's mode while the mask says this call's. Under one lock,
+    // whichever runs second defines both.
     void configure_can(std::size_t bus, bool fd) {
+        const std::scoped_lock guard{reconfigure_mutex_};
         hcs::request_can_mode(handler_, bus, fd, true);
-        const uint8_t bit = static_cast<uint8_t>(1U << bus);
-        interface_.can_fd_mask = fd ? static_cast<uint8_t>(interface_.can_fd_mask | bit)
-                                    : static_cast<uint8_t>(interface_.can_fd_mask & ~bit);
+        auto interface = interface_.load(std::memory_order_relaxed);
+        const auto bit = static_cast<uint8_t>(1U << bus);
+        interface.can_fd_mask = fd ? static_cast<uint8_t>(interface.can_fd_mask | bit)
+                                   : static_cast<uint8_t>(interface.can_fd_mask & ~bit);
+        interface_.store(interface, std::memory_order_release);
     }
 
     // mc02 uses the shared HCS vendor id (0xA511) and the fixed board-type PID
@@ -411,8 +435,16 @@ private:
     // must already have begun -- member initialisation runs in declaration
     // order. configuration_ is a COPY: the hook runs again on every reconnect,
     // long after the constructor argument has gone.
-    hcs::Interface interface_{};
+    //
+    // interface_ is atomic because it is written off the reading threads: the
+    // hook re-learns it on the keepalive thread at every reconnect, and
+    // configure_can() writes it from whichever thread calls it, while
+    // canN_is_fd()/interface() read it concurrently. The writers serialize on
+    // reconfigure_mutex_; readers never take it. See hcs_config.hpp's
+    // static_assert.
+    std::atomic<hcs::Interface> interface_;
     Configuration configuration_;
+    std::mutex reconfigure_mutex_;
     host::protocol::Handler handler_;
 };
 

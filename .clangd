@@ -23,11 +23,13 @@ Diagnostics:
 #
 # Cross-compiled subtrees additionally need clangd to learn the toolchain's own
 # system headers, which is a command-line flag and cannot live in this file:
-#   --query-driver=/opt/arm-gnu-toolchain-*/bin/arm-none-eabi-*,\
-#                  /home/zyi/3rd_party/hpm/*/bin/riscv32-unknown-elf-*,\
-#                  /home/zyi/3rd_party/MRS_Toolchain_*/Toolchain/*/bin/riscv*-wch-elf-*
-# Without it <cstdint> and friends resolve against the host libstdc++ instead of
-# newlib, which produces its own wave of false errors.
+# --query-driver with globs matching each cross compiler. The Dev Container sets it
+# in .devcontainer/devcontainer.json; on a bare machine put it in the
+# (gitignored) .vscode/settings.json with that machine's toolchain paths.
+# Without it <algorithm>, <cstdint> and friends are not found at all. Do not
+# hardcode toolchain paths or --target in the per-board .clangd files instead:
+# they are machine-specific, and --target breaks the query-driver probe.
+# .scripts/clang-tidy-check asks the compiler for the same directories itself.
 CompileFlags:
   # Default for core/ and host/: the native build, since core/ is board-agnostic.
   CompilationDatabase: host/build

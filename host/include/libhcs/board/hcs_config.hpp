@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -52,6 +53,13 @@ struct Interface {
         return bus < can_count && ((can_fd_mask >> bus) & 1U) != 0U;
     }
 };
+
+// The board classes keep the learned interface in a std::atomic: the
+// before-session hook that writes it re-runs on every reconnect from the
+// keepalive thread, while application transmit paths read it concurrently.
+// An oversized or non-lock-free layout would put an implicit lock on the
+// transmit path -- refuse to compile instead.
+static_assert(std::atomic<Interface>::is_always_lock_free);
 
 // Desired configuration, all optional. An unset field is left alone: the board
 // keeps whatever its firmware brought the channel up with, which is the right
@@ -392,8 +400,13 @@ inline vc::LatencyBreakdownPayload
 // One place for the whole construction-time exchange, so every board class in
 // this directory performs it identically and in the same order: learn what the
 // board is, assert the CAN modes, then apply the UART rates.
+//
+// The board classes run it again from the keepalive thread before every
+// re-opened session, with the configuration they were CONSTRUCTED with: every
+// channel that configuration names is set back to it, whatever configure_*()
+// calls changed since; channels it leaves unset keep what the board runs.
 inline Interface apply(host::protocol::Handler& handler, const Configuration& configuration) {
-    const Interface interface = read_interface(handler);
+    Interface interface = read_interface(handler);
 
     for (std::size_t bus = 0; bus < std::size(configuration.can_fd); ++bus) {
         const auto& can_fd = configuration.can_fd[bus];
@@ -405,6 +418,13 @@ inline Interface apply(host::protocol::Handler& handler, const Configuration& co
                 interface.can_count)};
         }
         request_can_mode(handler, bus, *can_fd, interface.can_mode_settable);
+        // The mask above was read before this request. On a settable board
+        // (mc02) the request can change the mode, and request_can_mode() has
+        // just confirmed the board now runs *can_fd -- without this, canN_is_fd()
+        // would report the firmware's mode instead of the configured one.
+        const auto bit = static_cast<uint8_t>(1U << bus);
+        interface.can_fd_mask = *can_fd ? static_cast<uint8_t>(interface.can_fd_mask | bit)
+                                        : static_cast<uint8_t>(interface.can_fd_mask & ~bit);
     }
 
     for (std::size_t port = 0; port < std::size(configuration.uart_baudrate); ++port) {

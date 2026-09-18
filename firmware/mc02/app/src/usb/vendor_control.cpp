@@ -106,8 +106,12 @@ uart::UartCommon* uart_by_index(uint16_t index) {
 }
 
 // 该总线当前实际发送的帧型。init() 运行前没有对象可问, 由编译期端口表作答; 此后
-// 以运行值为准 -- 主机可能已通过 kSetCanConfig 重配过该总线。
+// 以运行值为准 -- 主机可能已通过 kSetCanConfig 重配过该总线。下标非法时无总线
+// 可言, 返回 classic 兜底: 下标源自主机请求, 调用方虽都先经 can_index_valid 校验,
+// 本函数不依赖这一点也能保证查表在界内。
 vc::CanMode can_mode(uint16_t index) {
+    if (!can_index_valid(index))
+        return vc::CanMode::kClassic;
     const can::Can* bus = can::can_by_index(index);
     const bool fd =
         bus != nullptr ? bus->fd_mode() : can::kCanPorts[index].mode == can::CanMode::kCanFd;
