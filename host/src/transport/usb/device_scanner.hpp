@@ -15,6 +15,8 @@
 #include <libusb.h>
 #include <sys/types.h>
 
+#include <libhcs/protocol/usb_identity.hpp>
+
 #include "core/src/utility/assert.hpp"
 #include "host/src/logging/logging.hpp"
 #include "host/src/transport/transport.hpp"
@@ -236,6 +238,13 @@ private:
         return filter_it == filter_end;
     }
 
+    // The DM USB2FDCAN identities the HPM5321 enumerates under so DMTool accepts
+    // it (libhcs/protocol/usb_identity.hpp); genuine DM adapters share them.
+    static constexpr bool is_borrowed_identity(const libusb_device_descriptor& descriptor) {
+        return core::protocol::usb_identity::is_dmtool_identity(
+            descriptor.idVendor, descriptor.idProduct);
+    }
+
     static bool match_product_version(
         libusb_device_handle* handle, DeviceInfo& info, bool warn_only_when_mismatch) {
         if (info.descriptor.iProduct == 0) {
@@ -259,6 +268,18 @@ private:
         const bool product_matches =
             product_string == agent_product
             || (info.descriptor.idProduct == mc02_product_id && product_string == mc02_product);
+
+        // Under a borrowed identity the product string is the only thing that
+        // tells our board from the real DM adapter it impersonates, so it must
+        // name an HCS agent even when version checks are skipped -- the
+        // measurement tools all skip them, and would otherwise open the adapter
+        // and fail at the interface claim, or report two compatible devices.
+        if (!product_matches && is_borrowed_identity(info.descriptor)
+            && !product_string.starts_with("HCS Agent v")) {
+            info.result = DeviceInfo::ProtocolVersionMismatch{std::string{product_string}};
+            return false;
+        }
+
         if (!product_matches) {
             if (warn_only_when_mismatch) {
                 logging::get_logger().warn(

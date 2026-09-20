@@ -101,6 +101,11 @@
 set -euo pipefail
 
 USB_VENDOR_ID="a511"   # every libhcs board; the product id differs per board
+# ...except the HPM5321 application, which enumerates under the DM USB2FDCAN
+# identity so DMTool accepts it (core/include/libhcs/protocol/usb_identity.hpp).
+# Genuine DM adapters share that id; the product string tells ours apart. The
+# HPM5321 DFU bootloader stays on a511.
+HPM5321_APP_ID="34b7:6877"
 CHECK_ONLY=0
 PMQOS_ONLY=0
 case "${1:-}" in
@@ -325,19 +330,24 @@ done
 
 echo "== USB board =="
 BOARD_CONTROLLERS=""
-# Match on vendor id only: the product id differs per board (5321 HPM5321 single
-# CAN, 5322 HPM5321 dual CAN-FD, 6e84 hpm6e8y), and hardcoding one silently reports
-# "board not enumerated" the moment a different board is plugged in.
+# Match on vendor id only: the product id differs per board (5321/5322 the HPM5321
+# bootloader, 6e84 hpm6e8y), and hardcoding one silently reports "board not
+# enumerated" the moment a different board is plugged in. The HPM5321 app is the
+# one board on a borrowed id, see HPM5321_APP_ID.
 FOUND_BOARD=0
 for d in /sys/bus/usb/devices/*/; do
-    [[ "$(cat "$d/idVendor" 2>/dev/null)" == "$USB_VENDOR_ID" ]] || continue
-    FOUND_BOARD=1
+    VID="$(cat "$d/idVendor" 2>/dev/null || echo '?')"
     PID="$(cat "$d/idProduct" 2>/dev/null || echo '?')"
-    BUS="$(cat "$d/busnum" 2>/dev/null || echo '?')"
-    SPEED="$(cat "$d/speed" 2>/dev/null || echo '?')"
     PRODUCT="$(cat "$d/product" 2>/dev/null || echo '')"
+    if [[ "$VID" != "$USB_VENDOR_ID" ]]; then
+        [[ "$VID:$PID" == "$HPM5321_APP_ID" && "$PRODUCT" == "HCS Agent"* ]] || continue
+    fi
+    FOUND_BOARD=1
+    BUS="$(cat "$d/busnum" 2>/dev/null || echo '?')"
+    DEVNUM="$(cat "$d/devnum" 2>/dev/null || echo '?')"
+    SPEED="$(cat "$d/speed" 2>/dev/null || echo '?')"
     CTRL="$(readlink -f "$d" | grep -o '0000:[0-9a-f]*:[0-9a-f]*\.[0-9a-f]*' | tail -1)"
-    ok "$USB_VENDOR_ID:$PID on bus $BUS at ${SPEED}M via ${CTRL:-unknown}  $PRODUCT"
+    ok "$VID:$PID on bus $BUS at ${SPEED}M via ${CTRL:-unknown}  $PRODUCT"
 
     PCTL="$(cat "$d/power/control" 2>/dev/null || echo n/a)"
     if [[ "$PCTL" == "on" ]]; then
@@ -353,15 +363,17 @@ for d in /sys/bus/usb/devices/*/; do
     # Anything else on the same root hub competes for the same microframes.
     # Measured no effect for btusb here, but a device with real periodic
     # bandwidth (a camera streaming isoc) is a different story, so show it.
+    # The board's own interfaces (the HPM5321's cdc_acm) are not neighbours.
     if [[ "$BUS" != "?" ]]; then
         NEIGHBOURS="$(lsusb -t 2>/dev/null | awk -v b="$BUS" '
             /^\/:/ { inbus = ($0 ~ ("Bus 00" b "\\.")) ; next }
-            inbus && /Driver=/ { print }' | grep -v "Driver=\[none\]" | wc -l)"
+            inbus && /Driver=/ { print }' | grep -v "Driver=\[none\]" \
+            | grep -v "Dev 0*$DEVNUM," | wc -l)"
         [[ "$NEIGHBOURS" -gt 0 ]] \
             && info "  $NEIGHBOURS other device interface(s) share this root hub"
     fi
 done
-[[ "$FOUND_BOARD" == "0" ]] && warn "no $USB_VENDOR_ID:* board enumerated"
+[[ "$FOUND_BOARD" == "0" ]] && warn "no $USB_VENDOR_ID:* or $HPM5321_APP_ID board enumerated"
 
 # xHCI IRQ priority. Boards sharing one controller also share ONE IRQ thread, and
 # at the RT default of FIFO 50 that thread is where their tail latency goes.

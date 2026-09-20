@@ -6,6 +6,7 @@
 #include <span>
 
 #include "core/include/libhcs/data/datas.hpp"
+#include "core/include/libhcs/protocol/can_dlc.hpp"
 #include "core/src/protocol/constant.hpp"
 #include "core/src/protocol/protocol.hpp"
 #include "core/src/utility/assert.hpp"
@@ -45,14 +46,22 @@ public:
 
         const std::size_t can_data_length = view.can_data.size();
         const bool has_data = can_data_length != 0;
+        const bool is_long_frame = can_data_length > kCanClassicMaxPayload;
+        // Long form stores the wire DLC offset by kCanFdLongDlcBase; the
+        // length was already validated against the table by
+        // required_can_size(), so the subtraction cannot underflow.
         const std::uint8_t data_length_code =
-            has_data ? static_cast<std::uint8_t>(can_data_length - 1) : 0;
+            !has_data       ? 0
+            : is_long_frame ? static_cast<std::uint8_t>(
+                                  dlc_from_payload_len(can_data_length) - kCanFdLongDlcBase)
+                            : static_cast<std::uint8_t>(can_data_length - 1);
 
         const bool has_timestamp = view.timestamp_us.has_value();
 
         if (view.is_extended_can_id) {
             auto header = CanHeaderExtended::Ref(cursor);
             cursor += sizeof(CanHeaderExtended);
+            header.set<CanHeaderExtended::IsLongFrame>(is_long_frame);
             header.set<CanHeaderExtended::IsExtendedCanId>(true);
             header.set<CanHeaderExtended::IsRemoteTransmission>(view.is_remote_transmission);
             header.set<CanHeaderExtended::HasTimestamp>(has_timestamp);
@@ -62,6 +71,7 @@ public:
         } else {
             auto header = CanHeaderStandard::Ref(cursor);
             cursor += sizeof(CanHeaderStandard);
+            header.set<CanHeaderStandard::IsLongFrame>(is_long_frame);
             header.set<CanHeaderStandard::IsExtendedCanId>(false);
             header.set<CanHeaderStandard::IsRemoteTransmission>(view.is_remote_transmission);
             header.set<CanHeaderStandard::HasTimestamp>(has_timestamp);
@@ -500,8 +510,14 @@ private:
     }
 
     static std::size_t required_can_size(FieldId field_id, const data::CanDataView& view) noexcept {
+        // A remote frame carries no data; this also rules out the reserved
+        // IsLongFrame + remote combination, which needs data to be long.
         libhcs_VERIFY_LIKELY(!view.is_remote_transmission || view.can_data.empty(), 0);
-        libhcs_VERIFY_LIKELY(view.can_data.size() <= 8, 0);
+        libhcs_VERIFY_LIKELY(view.can_data.size() <= kCanMaxPayload, 0);
+        // Long payloads must be exact CAN-FD table entries: a length that is
+        // not on the table (9-11, 13-15, ...) has no wire DLC to encode it.
+        if (view.can_data.size() > kCanClassicMaxPayload)
+            libhcs_VERIFY_LIKELY(dlc_from_payload_len(view.can_data.size()) != kDlcInvalid, 0);
         if (view.is_extended_can_id)
             libhcs_VERIFY_LIKELY(view.can_id <= 0x1FFFFFFF, 0);
         else

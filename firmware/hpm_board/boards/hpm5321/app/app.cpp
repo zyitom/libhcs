@@ -75,7 +75,9 @@ namespace {
 
 // LED 依据: 常绿必须表示"帧正在被转发", 故跟随 CAN/UART 驱动所串行进入的
 // 会话。
-bool host_session_established() { return usb::vendor->session_established(); }
+bool host_session_established() {
+    return usb::vendor->session_established() || dmtool::session_established();
+}
 
 } // namespace
 

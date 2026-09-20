@@ -25,6 +25,8 @@
 #include <pthread.h>
 #include <sched.h>
 
+#include <libhcs/protocol/usb_identity.hpp>
+
 #include "core/src/protocol/constant.hpp"
 #include "core/src/utility/assert.hpp"
 #include "host/src/logging/logging.hpp"
@@ -85,7 +87,7 @@ public:
                 libusb_close(control_device_handle_);
                 control_device_handle_ = nullptr;
             }
-            libusb_release_interface(libusb_device_handle_, kTargetInterface);
+            libusb_release_interface(libusb_device_handle_, data_interface());
             libusb_close(libusb_device_handle_);
             libusb_exit(libusb_context_);
             if (control_context_ != nullptr) {
@@ -204,7 +206,7 @@ public:
         // exactly when both run. Every call in the guard is a no-op without a
         // handle, and libusb_exit() below needs only the context.
         if (libusb_device_handle_ != nullptr) {
-            libusb_release_interface(libusb_device_handle_, kTargetInterface);
+            libusb_release_interface(libusb_device_handle_, data_interface());
 
             // libusb_close() reliably cancels all pending transfers and invokes their callbacks,
             // avoiding race conditions present in other cancellation methods
@@ -349,8 +351,8 @@ public:
             throw std::logic_error{"Receive function can only be called once"};
 
         receive_callback_ = std::move(callback);
-        receive_endpoint_ = kInEndpoint;
-        init_receive_transfers(kInEndpoint);
+        receive_endpoint_ = data_pipe_.in_endpoint;
+        init_receive_transfers(data_pipe_.in_endpoint);
     }
 
     // EP0 vendor request, synchronous. libusb runs this through its own
@@ -459,7 +461,7 @@ public:
             link_recovery_attempts_.fetch_add(1, std::memory_order::relaxed) + 1;
         bool acted = false;
 
-        for (const unsigned char endpoint : {kInEndpoint, kOutEndpoint}) {
+        for (const unsigned char endpoint : {data_pipe_.in_endpoint, data_pipe_.out_endpoint}) {
             const int ret = libusb_clear_halt(libusb_device_handle_, endpoint);
             if (ret == 0) {
                 acted = true;
@@ -582,7 +584,7 @@ private:
 
         destroy_free_transmit_transfers();
         free_dev_mem_slabs(); // needs the handle, so before the close below
-        libusb_release_interface(libusb_device_handle_, kTargetInterface);
+        libusb_release_interface(libusb_device_handle_, data_interface());
         libusb_close(libusb_device_handle_);
         libusb_device_handle_ = nullptr;
         {
@@ -608,7 +610,7 @@ private:
         if (!select_main_handle(filter))
             return false;
 
-        if (const int ret = libusb_claim_interface(libusb_device_handle_, kTargetInterface);
+        if (const int ret = libusb_claim_interface(libusb_device_handle_, data_interface());
             ret != 0) [[unlikely]] {
             // Throttled like the scan failure above it: a board that stays away
             // fails this on every retry, four times a second, for as long as the
@@ -621,10 +623,10 @@ private:
                     logger_.warn(
                         "Reconnect: interface {} is claimed by someone else (BUSY, x{}); only one "
                         "session per board is possible",
-                        kTargetInterface, count);
+                        data_interface(), count);
                 else
                     logger_.warn(
-                        "Reconnect: failed to claim interface {}: {} ({}) (x{})", kTargetInterface,
+                        "Reconnect: failed to claim interface {}: {} ({}) (x{})", data_interface(),
                         ret, helper::libusb_errname(ret), count);
             }
             libusb_close(libusb_device_handle_);
@@ -684,9 +686,9 @@ private:
         // failed completions, which is what drives fault() today.
     }
 
-    // Parks up to `bound` waiting for any a511 board to enumerate again. A
-    // wait woken by the OTHER board's arrival simply falls through to a
-    // failing select and the caller's next attempt.
+    // Parks up to `bound` waiting for any board of this vendor ID to enumerate
+    // again. A wait woken by the OTHER board's arrival simply falls through to
+    // a failing select and the caller's next attempt.
     bool wait_for_board_arrival(std::chrono::milliseconds bound) {
         const uint64_t seen = board_arrivals_.load(std::memory_order::relaxed);
         std::unique_lock guard{board_arrived_mutex_};
@@ -851,7 +853,22 @@ private:
         utility::FinalAction close_device_handle{
             [this]() noexcept { libusb_close(libusb_device_handle_); }};
 
-        if (const int ret = libusb_claim_interface(libusb_device_handle_, kTargetInterface);
+        // Where the pipe lives follows from the identity the scanner matched,
+        // so it is settled before the first claim.
+        {
+            libusb_device_descriptor descriptor{};
+            if (const int ret = libusb_get_device_descriptor(
+                    libusb_get_device(libusb_device_handle_), &descriptor);
+                ret != 0) [[unlikely]]
+                throw std::runtime_error(
+                    std::format(
+                        "Failed to read the device descriptor: {} ({})", ret,
+                        helper::libusb_errname(ret)));
+            data_pipe_ = core::protocol::usb_identity::data_pipe_for(
+                descriptor.idVendor, descriptor.idProduct);
+        }
+
+        if (const int ret = libusb_claim_interface(libusb_device_handle_, data_interface());
             ret != 0) [[unlikely]] {
             // BUSY is the kernel's own exclusivity guard: one interface, one
             // claim, so a second Handler instance or process racing for the
@@ -865,17 +882,17 @@ private:
                         "Handler instance or another process). Only one session per board is "
                         "possible; close the other user of the board matching filter '{}' and "
                         "retry.",
-                        kTargetInterface,
+                        data_interface(),
                         serial_filter.empty() ? std::string_view{"any serial"} : serial_filter));
             if (ret == LIBUSB_ERROR_ACCESS)
                 throw std::runtime_error(
                     std::format(
                         "Permission denied on interface {} ({}): this user cannot claim the "
                         "board. Check the udev rules for the device node.",
-                        kTargetInterface, helper::libusb_errname(ret)));
+                        data_interface(), helper::libusb_errname(ret)));
             throw std::runtime_error(
                 std::format(
-                    "Failed to claim interface {}: {} ({})", kTargetInterface, ret,
+                    "Failed to claim interface {}: {} ({})", data_interface(), ret,
                     helper::libusb_errname(ret)));
         }
 
@@ -978,7 +995,7 @@ private:
                 auto* transfer = wrapper->transfer_;
 
                 libusb_fill_bulk_transfer(
-                    transfer, libusb_device_handle_, kOutEndpoint, wrapper->buffer_, 0,
+                    transfer, libusb_device_handle_, data_pipe_.out_endpoint, wrapper->buffer_, 0,
                     [](libusb_transfer* transfer) {
                         auto* wrapper = static_cast<TransferWrapper*>(transfer->user_data);
                         wrapper->self_.usb_transmit_complete_callback(wrapper);
@@ -1316,7 +1333,7 @@ private:
                 logger_.error(
                     "Transmit endpoint 0x{:02x} halted (STALL x{}); packets are being dropped "
                     "until the link is recovered",
-                    kOutEndpoint, count);
+                    data_pipe_.out_endpoint, count);
             return;
         }
 
@@ -1527,10 +1544,10 @@ private:
         // right after a failed reconnect is exactly when this histogram is
         // worth printing, so skip the annotation instead of crashing the
         // teardown.
-        const int mps =
-            libusb_device_handle_ == nullptr
-                ? LIBUSB_ERROR_OTHER
-                : libusb_get_max_packet_size(libusb_get_device(libusb_device_handle_), kInEndpoint);
+        const int mps = libusb_device_handle_ == nullptr
+                          ? LIBUSB_ERROR_OTHER
+                          : libusb_get_max_packet_size(
+                                libusb_get_device(libusb_device_handle_), data_pipe_.in_endpoint);
         print_to_stderr(
             "[rx-histogram] {} transfers, {} bytes, mean {:.1f} B/transfer\n", total, bytes,
             static_cast<double>(bytes) / static_cast<double>(total));
@@ -1665,10 +1682,18 @@ private:
         active_transfers_.fetch_sub(1, std::memory_order::relaxed);
     }
 
-    static constexpr int kTargetInterface = 0x00;
+    // Interface and endpoints of the libhcs pipe on the opened device, decided
+    // by the identity it enumerated with: the HPM5321 answers under DMTool's
+    // VID:PID and keeps its pipe on interface 3 / 0x04 / 0x84, out of the way
+    // of DMTool's hard-coded endpoints (core/include/libhcs/protocol/
+    // usb_identity.hpp). Set once in usb_init() before the first claim;
+    // reconnects re-open the same board, so it never changes afterwards.
+    core::protocol::usb_identity::DataPipe data_pipe_ =
+        core::protocol::usb_identity::kDefaultDataPipe;
 
-    static constexpr unsigned char kOutEndpoint = 0x01;
-    static constexpr unsigned char kInEndpoint = 0x81;
+    // As int: it is what libusb takes, and it keeps std::format from printing
+    // the uint8_t as a character in the diagnostics below.
+    [[nodiscard]] int data_interface() const { return data_pipe_.interface_number; }
 
     // How long the transmit pool may sit exhausted with no buffer coming back
     // before wait_for_free_transmit_transfer() calls the OUT endpoint stalled.
@@ -1718,8 +1743,8 @@ private:
     // which closes and re-opens the control handle underneath them.
     std::mutex control_mutex_;
 
-    // Hotplug watch: ARRIVED notifications (one per a511 enumeration, vendor
-    // filtered) are what the reconnect path parks on instead of polling;
+    // Hotplug watch: ARRIVED notifications (one per enumeration under this
+    // board's vendor ID) are what the reconnect path parks on instead of polling;
     // LEFT is counted by the same callback and deliberately ignored.
     libusb_hotplug_callback_handle hotplug_callback_handle_{};
     bool hotplug_registered_ = false;

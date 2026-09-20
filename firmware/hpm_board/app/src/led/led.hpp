@@ -120,7 +120,11 @@ public:
                 break;
             }
             case CanFault::kBusOff: led_on = true; break; // 常亮
-            case CanFault::kNone: led_on = false; break;
+            case CanFault::kNone:
+                // DMTool 会话中该通道被选为采集通道: 常亮指示"哪路在用"。
+                // 故障灯语优先 -- 采集期间无应答/接线故障照常闪, 不被常亮吞掉。
+                led_on = channel_active_[i].load(std::memory_order::relaxed);
+                break;
             }
             board::kCanIndicatorPins[i].set_active(led_on);
         }
@@ -128,6 +132,14 @@ public:
 
     void set_host_connected(bool connected) {
         host_connected_.store(connected, std::memory_order::relaxed);
+    }
+
+    // DMTool 会话的通道选择指示: 通道被选为采集通道时对应指示灯常亮(无故障时)。
+    // 由 dmtool 的启停采集命令在主循环调用; 故障灯语优先于常亮(见 update)。
+    void set_channel_active(uint8_t can_index, bool active) {
+        if (can_index >= kCanIndicatorCount)
+            return;
+        channel_active_[can_index].store(active, std::memory_order::relaxed);
     }
 
     // CAN 总线故障灯码记录: 由 CAN ISR 以控制器下标(0 起)和当前故障调用。
@@ -155,6 +167,7 @@ private:
     static constexpr uint16_t kCanFaultTimeoutTicks = 5000; // 1 kHz tick 下的 5 s
     std::array<std::atomic<uint16_t>, kCanIndicatorCount> can_fault_timeout_{};
     std::array<std::atomic<CanFault>, kCanIndicatorCount> can_fault_{};
+    std::array<std::atomic<bool>, kCanIndicatorCount> channel_active_{};
 
     std::atomic<uint16_t> uplink_full_reset_counter_{0};
     std::atomic<uint16_t> downlink_full_reset_counter_{0};

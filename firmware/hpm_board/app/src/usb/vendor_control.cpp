@@ -13,6 +13,7 @@
 #include "firmware/hpm_board/app/src/can/can.hpp"
 #include "firmware/hpm_board/app/src/diag/latency.hpp"
 #include "firmware/hpm_board/app/src/uart/uart.hpp"
+#include "firmware/hpm_board/app/src/usb/usb_descriptors.hpp"
 #include "firmware/hpm_board/app/src/usb/vendor.hpp"
 
 // EP0 配置通道 -- libhcs/protocol/vendor_control.hpp 的板端一半。
@@ -73,6 +74,9 @@ vc::InterfacePayload interface_payload() {
     payload.version = vc::kVersion;
     payload.can_count = static_cast<uint8_t>(can::can_count());
     payload.uart_count = static_cast<uint8_t>(uart::kUartCount);
+    // MCAN 的 RX 元素与 TX 缓冲都配成 64 字节, 长帧双向承载
+    // (can.cpp: read_uplink / handle_downlink)。
+    payload.caps = vc::kCapCanFdLongFrames;
     for (std::size_t i = 0; i < can::can_count(); ++i) {
         if (libhcs::firmware::board::can_port(i).mode == libhcs::firmware::board::CanMode::kCanFd)
             payload.can_fd_mask |= static_cast<uint8_t>(1U << i);
@@ -119,6 +123,24 @@ Payload staged() {
 
 bool handle_setup(uint8_t rhport, const tusb_control_request_t* request) {
     const auto index = request->wIndex;
+
+    // Windows WCID (MS OS 2.0): BOS 平台能力广告了 kMsOsVendorCode; 该码的
+    // vendor IN 请求且 wIndex 0x0007 = GET_MS_OS_20_DESCRIPTOR (Microsoft 规范
+    // 固定值)。集合直接从 flash 常量应答 -- 它有 848 字节, g_control_buffer 只有
+    // 64, 不能走 reply() 的拷贝路径; EP0 IN 传输对 buffer 只读, 与 usbd.c 应答
+    // 配置描述符(同样在 flash)一致。wLength 要求精确等于集合总长: Windows 按
+    // BOS 里广告的 wDescriptorSetLength 请求, 别的长度说明对端在说别的版本。
+    // 与 libhcs 的 0x40..0x47 不冲突(此码 0x21)。
+    if (request->bmRequestType == vc::kRequestTypeIn
+        && request->bRequest == libhcs::firmware::usb::UsbDescriptors::kMsOsVendorCode) {
+        if (index != 0x0007
+            || request->wLength != libhcs::firmware::usb::UsbDescriptors::kMsOs20SetLength)
+            return false;
+        return tud_control_xfer(
+            rhport, request,
+            const_cast<uint8_t*>(libhcs::firmware::usb::UsbDescriptors::get_ms_os_20_set()),
+            libhcs::firmware::usb::UsbDescriptors::kMsOs20SetLength);
+    }
 
     switch (static_cast<vc::Request>(request->bRequest)) {
     case vc::Request::kGetInterface: {

@@ -12,6 +12,7 @@
 
 #include "board_app.hpp"
 #include "core/src/utility/assert.hpp"
+#include "firmware/hpm_board/app/src/dmtool/dm_adapter.hpp"
 #include "firmware/hpm_board/app/src/link/host_session.hpp"
 #include "firmware/hpm_board/app/src/usb/usb_descriptors.hpp"
 #include "firmware/hpm_board/app/src/utility/lazy.hpp"
@@ -59,7 +60,10 @@ public:
     void session_deactivated_callback() override { ep0_handshake_done_ = false; }
 
     bool try_transmit() {
-        const auto* batch = next_batch();
+        // 没有 libhcs 会话的主循环轮次交给 DMTool 仿真: 两种主机互斥使用, 这个
+        // 回调只在 next_batch() 本来就有的"会话未建立"分支里执行 -- 会话在时一条
+        // 指令也不多(见 dmtool/dm_adapter.hpp)。
+        const auto* batch = next_batch([] { dmtool::poll(); });
         if (!batch)
             return false;
 
@@ -105,6 +109,9 @@ protected:
         transmitted_size_ = 0;
         // CAN 管道的批缓冲池是独立的, HostSession 自身的 reset 够不到这里: 残留
         // 批次会被发进新会话, 对着错误的流解码。
+
+        // libhcs 优先: DMTool 仿真与 CDC 串口桥就此让位(见 dmtool/dm_adapter.hpp)。
+        dmtool::on_libhcs_session();
     }
 
 private:

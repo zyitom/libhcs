@@ -200,17 +200,25 @@ public:
         // frame on the wire in its compiled bus mode (CAN-FD on all three mc02
         // buses) and reports that mode over EP0 -- read can1_is_fd() and
         // friends instead of assuming. There is no per-frame flag to set.
+        //
+        // Long payloads stay refused until the mc02 firmware widens its RX
+        // FIFO elements to 64 bytes (its TX path is already FD-capable; an
+        // asymmetric capability would let the host send frames the board can
+        // never receive back).
         PacketBuilder& can1_transmit(const libhcs::data::CanDataView& data) {
+            hcs::reject_long_payload(data.can_data, "CAN1");
             if (!builder_.write_can(data::DataId::kCan1, data)) [[unlikely]]
                 throw std::invalid_argument{"CAN1 transmission failed: Invalid CAN data"};
             return *this;
         }
         PacketBuilder& can2_transmit(const libhcs::data::CanDataView& data) {
+            hcs::reject_long_payload(data.can_data, "CAN2");
             if (!builder_.write_can(data::DataId::kCan2, data)) [[unlikely]]
                 throw std::invalid_argument{"CAN2 transmission failed: Invalid CAN data"};
             return *this;
         }
         PacketBuilder& can3_transmit(const libhcs::data::CanDataView& data) {
+            hcs::reject_long_payload(data.can_data, "CAN3");
             if (!builder_.write_can(data::DataId::kCan3, data)) [[unlikely]]
                 throw std::invalid_argument{"CAN3 transmission failed: Invalid CAN data"};
             return *this;

@@ -13,17 +13,20 @@
 #include <libhcs/board/hcs_config.hpp>
 #include <libhcs/data/datas.hpp>
 #include <libhcs/protocol/handler.hpp>
+#include <libhcs/protocol/usb_identity.hpp>
 #include <libhcs/spec/hpm5321/can.hpp>
 #include <libhcs/spec/hpm5321/uart.hpp>
 
 namespace libhcs::board {
 
 // Board interface for the HPM5321 boards. ONE class for BOTH PCBs -- the
-// single-CAN one (PID 0x5321) and the dual-CAN one (0x5322) -- because they run
-// one firmware image that tells itself apart from OTP word 25, and because the
-// host learns how many buses are actually present by asking: kGetInterface over
-// EP0 answers before the first session starts, so a compile-time bus count
-// stopped being the only way to know. It has no IMU, no GPIO application
+// single-CAN one (PID 0x6877) and the dual-CAN one (0x6632) -- because they
+// run one firmware image that tells itself apart from OTP word 25, and because
+// the host learns how many buses are actually present by asking: kGetInterface
+// over EP0 answers before the first session starts, so a compile-time bus count
+// stopped being the only way to know. The ids are DM USB2FDCAN ones so that
+// DMTool accepts the board too (libhcs/protocol/usb_identity.hpp); the DFU
+// bootloader still reports 0xA511:0x5321 / 0x5322. It has no IMU, no GPIO application
 // channels and no DBUS, so those callbacks are intentionally absent.
 //
 // What the two PCBs still differ in is the port count, and that is checked at
@@ -122,8 +125,8 @@ public:
         const AdvancedOptions& options = {}, const Configuration& configuration = {})
         : configuration_(configuration)
         , handler_(
-              0xA511, kProductIds, serial_filter, options, callback,
-              [this](host::protocol::Handler& handler) {
+              core::protocol::usb_identity::kDmtoolVendorId, kProductIds, serial_filter, options,
+              callback, [this](host::protocol::Handler& handler) {
                   interface_.store(hcs::apply(handler, configuration_), std::memory_order_release);
               }) {}
 
@@ -144,10 +147,18 @@ public:
         // no firmware will ever read.
         PacketBuilder& can_transmit(hcs::CanPort port, const libhcs::data::CanDataView& data) {
             const auto index = static_cast<std::size_t>(port);
-            if (index < 1 || index > can_count_) [[unlikely]]
+            if (index < 1 || index > interface_.can_count) [[unlikely]]
                 throw std::out_of_range{std::format(
-                    "Hpm5321: CAN port out of range (this board has CAN1..CAN{})", can_count_)};
+                    "Hpm5321: CAN port out of range (this board has CAN1..CAN{})",
+                    interface_.can_count)};
             static constexpr data::DataId kIds[]{data::DataId::kCan1, data::DataId::kCan2};
+            // A long payload has a wire encoding only on an FD bus of a board
+            // that serves long frames; refused here rather than serialized
+            // into a record the firmware would have to drop.
+            if (data.can_data.size() > 8 && !interface_.can_long_frames(index - 1)) [[unlikely]]
+                throw std::invalid_argument{
+                    "CAN transmission failed: payloads over 8 bytes need a CAN-FD bus on a "
+                    "board advertising kCapCanFdLongFrames"};
             if (!builder_.write_can(kIds[index - 1], data)) [[unlikely]]
                 throw std::invalid_argument{"CAN transmission failed: Invalid CAN data"};
             return *this;
@@ -160,12 +171,12 @@ public:
         }
 
     private:
-        PacketBuilder(host::protocol::Handler& handler, std::size_t can_count) noexcept
+        PacketBuilder(host::protocol::Handler& handler, hcs::Interface interface) noexcept
             : builder_(handler.start_transmit())
-            , can_count_(can_count) {}
+            , interface_(interface) {}
 
         host::protocol::Handler::PacketBuilder builder_;
-        std::size_t can_count_;
+        hcs::Interface interface_;
     };
     // Whether this board's link is up, re-establishing, or gone for good.
     // kFaulted means the device disappeared: the transport refuses traffic and
@@ -175,7 +186,7 @@ public:
     }
 
     PacketBuilder start_transmit() noexcept {
-        return PacketBuilder{handler_, interface_.load(std::memory_order_relaxed).can_count};
+        return PacketBuilder{handler_, interface_.load(std::memory_order_relaxed)};
     }
 
     // Runtime reconfiguration, over EP0 rather than in the data stream. Unlike
@@ -261,7 +272,9 @@ private:
     // Both PCBs, in the order the scanner should prefer to report them. The
     // firmware picks its own product ID from OTP, so which one answers is a
     // property of the hardware, not of this call.
-    static constexpr uint16_t kProductIdsStorage[]{0x5321, 0x5322};
+    static constexpr uint16_t kProductIdsStorage[]{
+        core::protocol::usb_identity::kHpm5321SingleCanProductId,
+        core::protocol::usb_identity::kHpm5321DualCanProductId};
     static constexpr std::span<const uint16_t> kProductIds{kProductIdsStorage};
 
     static inline Callback default_callback_{};

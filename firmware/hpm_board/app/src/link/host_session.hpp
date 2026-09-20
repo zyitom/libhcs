@@ -1,5 +1,6 @@
 #pragma once
 
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -81,11 +82,17 @@ protected:
     // 下一个待发的)。会话未建立或无待发时返回 nullptr。批量在 finish_batch()
     // 之前一直是"当前"的, 部分传输 (USB 分包) 与整批重试 (环背压) 都能从断点
     // 继续。
-    const InterruptSafeBuffer::Batch* next_batch() {
+    //
+    // without_session 只在会话未建立的那条分支里调用: 给与 libhcs 互斥的主机
+    // (DMTool 仿真)一个主循环槽位, 会话在时它不占一条指令。
+    template <std::invocable WithoutSession>
+    const InterruptSafeBuffer::Batch* next_batch(WithoutSession&& without_session) {
         refresh_session_state();
 
-        if (!session_established_)
+        if (!session_established_) {
+            without_session();
             return nullptr;
+        }
 
         if (!transmitting_batch_)
             transmitting_batch_ = transmit_buffer_.pop_batch();

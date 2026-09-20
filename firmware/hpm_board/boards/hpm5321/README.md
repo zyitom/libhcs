@@ -110,7 +110,7 @@ USB 全程在线。本机接线下 4 MHz 连不上，1 MHz 时好时坏，100 kH
 | 板名 | `HCS_Slave_HPM5321`（`BOARD_NAME`） |
 | 实际器件 | HPM5321IEG1（QFN48），单 RV32 核 |
 | SDK SoC 模型 | HPM5361（SDK 当前兼容模型） |
-| USB PID | `0x5321`（VID `0xA511`） |
+| USB ID | 应用 `0x34B7:0x6877`（DMTool 兼容，见 [../../DMTOOL_PROTOCOL.md](../../DMTOOL_PROTOCOL.md)）；bootloader `0xA511:0x5321` / `0x5322` |
 | USB 速度 | High speed（480 Mbps） |
 | Flash | 1 MiB XPI NOR，app 位于共享 DFU bootloader 之后 |
 
@@ -120,8 +120,9 @@ USB 全程在线。本机接线下 4 MHz 连不上，1 MHz 时好时坏，100 kH
 vendor 类设备，会话握手（kStart nonce + keepalive 租约）由共享的 `link::HostSession`
 处理。
 
-主机看到的 PID 取决于**芯片在哪块板上**，不取决于编译：单 CAN 版报 `0x5321`，双 CAN-FD
-版报 `0x5322`。host SDK、udev 规则、`dfu-util -d` 都按这两个 PID 匹配。
+应用两块板同一个 USB 身份 `0x34B7:0x6877`（借用达妙 USB2FDCAN 的，DMTool 可直接打开），
+host SDK 靠产品串认板、靠 EP0 报告的 CAN 路数区分两块板。bootloader 报的 PID 才取决于
+**芯片在哪块板上**：单 CAN 版 `0x5321`，双 CAN-FD 版 `0x5322`，`dfu-util -d` 的后半段按它填。
 
 **单 CAN 版：**
 
@@ -192,9 +193,9 @@ cmake --build firmware/hpm_board/build
 上已经有共享的 HCS DFU bootloader**；首次烧 bootloader 需要调试器）：
 
 ```bash
-# 单 CAN 版
-dfu-util -d 0xa511:0x5321 -a 0 -D firmware/hpm_board/build/app/output/hpm_board_app_hpm5321.dfu
-# 双 CAN-FD 版：同一个 .dfu，只有 -d 的 PID 不同
+# 应用在跑：先按应用身份 detach，再接任一块板的 bootloader（两块板同一个 .dfu）
+dfu-util -d 0x34b7:0x6877,0xa511:* -a 0 -D firmware/hpm_board/build/app/output/hpm_board_app_hpm5321.dfu
+# 已在 bootloader 里：单 CAN 版 0x5321，双 CAN-FD 版 0x5322
 dfu-util -d 0xa511:0x5322 -a 0 -D firmware/hpm_board/build/app/output/hpm_board_app_hpm5321.dfu
 ```
 

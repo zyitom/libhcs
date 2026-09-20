@@ -3,7 +3,7 @@
 > **文档类型**：现行规范（板级）
 > **适用范围**：`firmware/hpm_board/`，HPMicro HPM6E8Y / HPM5321（Andes RISC-V）
 > **状态**：现行有效
-> **相关文档**：[仓库根 AGENTS.md](../../AGENTS.md) · [PITFALLS.md](PITFALLS.md)（选型与踩坑实录） · [USB_OPTIMIZATION_LOG.md](USB_OPTIMIZATION_LOG.md)（USB 调优实录） · [BUILD_ENVIRONMENT.md](BUILD_ENVIRONMENT.md)（完整环境搭建） · [SOF_TIMEBASE.md](SOF_TIMEBASE.md) · [CONTROL_TIMING.md](CONTROL_TIMING.md)
+> **相关文档**：[仓库根 AGENTS.md](../../AGENTS.md) · [PITFALLS.md](PITFALLS.md)（选型与踩坑实录） · [USB_OPTIMIZATION_LOG.md](USB_OPTIMIZATION_LOG.md)（USB 调优实录） · [BUILD_ENVIRONMENT.md](BUILD_ENVIRONMENT.md)（完整环境搭建） · [SOF_TIMEBASE.md](SOF_TIMEBASE.md) · [CONTROL_TIMING.md](CONTROL_TIMING.md) · [DMTOOL_PROTOCOL.md](DMTOOL_PROTOCOL.md)（DMTool 兼容）
 
 > 本目录专属指南，叠加在仓库根 `AGENTS.md` 之上。完整编译环境（依赖清单、工具链下载、
 > 烧录）见 `BUILD_ENVIRONMENT.md`；实测过程与踩坑见 `PITFALLS.md` 与
@@ -53,9 +53,15 @@ sudo ./host-tuning.sh --pmqos  # 另开一个终端，测量期间持住（1 kHz
 
 ## 烧录
 
-App 走 USB DFU：`./tools/flash.sh hpm5321`（默认 release；末尾加 `debug`）。
-手工 `dfu-util` 见本文「构建」一节。`flash-ecat.sh` / `flash-ecat-swap.sh`
-两个脚本随 EtherCAT 桥一并移出仓库（见归档）。
+App 走 USB DFU：`./tools/flash.sh hpm5321`（默认 release；末尾加 `debug`）。HPM5321 应用
+在跑时身份是 `0x34b7:0x6877`、进 bootloader 后才是 `0xa511:0x5321/0x5322`，脚本会自动拼出
+`-d 0x34b7:0x6877,0xa511:*`；手工 `dfu-util` 同样要写两段，见本文「构建」一节。
+`flash-ecat.sh` / `flash-ecat-swap.sh` 两个脚本随 EtherCAT 桥一并移出仓库（见归档）。
+
+Windows 免驱：应用内置 MS OS 2.0 WCID 描述符（usb_descriptors.hpp，接口
+DM×3 + libhcs + DFU Runtime 声明 CompatibleID `WINUSB`，CDC 不参与），Windows
+8.1+ 首次插入即自动绑定 WinUSB，无需 Zadig/INF [推断，Windows 真机待核验；BOS/描述符集应答已于 2026-09-21
+在 Linux 侧 libusb 全链路实测]。
 
 ## CAN 采样点：钉死 87.5%，不要动 [实测 2026-08-03]
 
@@ -88,10 +94,10 @@ init 和 `abort_transmit()` 之后采样，遥测只读快照；`uart_set_baudra
 
 ## EP0 配置通道
 
-**结论先行：每帧的、周期性的、要和数据定序的 → EP1 bulk。构造期问一次的、失败必须让
-主机看见的 → EP0。** 协议定义在 `core/include/libhcs/protocol/vendor_control.hpp`
-（主机与固件共用），板端实现在 `app/src/usb/vendor_control.cpp`，主机端封装在
-`host/include/libhcs/board/hcs_config.hpp`。
+**结论先行：每帧的、周期性的、要和数据定序的 → bulk 数据管道（HPM5321 上是
+`0x04` / `0x84`，见「DMTool 兼容」）。构造期问一次的、失败必须让主机看见的 → EP0。**
+协议定义在 `core/include/libhcs/protocol/vendor_control.hpp`（主机与固件共用），板端实现
+在 `app/src/usb/vendor_control.cpp`，主机端封装在 `host/include/libhcs/board/hcs_config.hpp`。
 
 | bRequest | 方向 | wIndex | 载荷 | 语义 |
 |---|---|---|---|---|
@@ -180,11 +186,40 @@ tripwire 那项是**真回归修复，不是上游老毛病**：HPM SDK 自带�
 把 qhd 指针交出去——`USBCMD_SETUP_TRIPWIRE`（`ci_hs_type.h`，HPM 上是 `USBCMD` bit 13
 [RM]）在该文件里定义了却没人用。删掉它，背靠背 SETUP 会让 usbd 拿到撕裂的 8 字节。
 
+## DMTool 兼容（HPM5321 应用）
+
+HPM5321 应用同时是一块达妙 USB2FDCAN 适配器：HCS 不跑时可以直接用 DMTool 2.1.6.7 打开
+本板收发 CAN、看时间戳、经 CDC 串口读写板上 UART。协议、实现取舍、对 libhcs 的逐指令核对
+见 [DMTOOL_PROTOCOL.md](DMTOOL_PROTOCOL.md)。代码在 `app/src/dmtool/`。
+
+- **USB 身份**：应用枚举为 `0x34B7:0x6877`（DMTool 只认它编译进去的 VID:PID 表）；libhcs
+  主机靠产品串 `HCS Agent v<版本>` 认板，两块 PCB 靠 EP0 `can_count` 区分。DFU bootloader
+  不变，仍是 `0xA511:0x5321/0x5322`。常量只有一份：
+  `core/include/libhcs/protocol/usb_identity.hpp`，主机与固件共用。
+- **端点**：接口 0-2、端点 `0x01-0x03` / `0x81-0x83` 归 DMTool（写死在其二进制里）；libhcs
+  管道在接口 3、`0x04` / `0x84`；CDC 在接口 4-5；DFU runtime 在接口 6。
+- **libhcs 优先**：libhcs 会话一建立，DMTool 采集与 CDC 桥全部关闭、队列清空
+  （`dmtool::on_libhcs_session()`）；两者按约定不同时用。
+- **热路径不为 DMTool 付代价**：CAN / UART RX ISR 的 libhcs 分支必须与没有 DMTool 时逐条
+  相同，无会话分支只许调用 FLASH 里的冷函数。改 `can.cpp`、`uart.hpp`、`vendor.cpp`、
+  `app.cpp` 里的接入点后，对照同版本号的旧镜像比一遍反汇编（方法与基线见
+  DMTOOL_PROTOCOL.md 第 5 节）。
+- **只转发**：SETUP_BUARD 只核对不重配（与 `kSetCanConfig` 同一立场），设备端重复发送与
+  自增、自测、固件升级、写 SN 一律回失败。在 DMTool 里选 CANFD、仲裁 1M、数据 5M。
+- **CDC 串口**只在按板上 UART 实际波特率（默认 921600）打开时接通，不会去改 UART 波特率。
+- **udev**：`a511` 规则管不到新身份，需另加（同时让 ModemManager 不探测 CDC 口）：
+
+  ```text
+  SUBSYSTEM=="usb", ATTR{idVendor}=="34b7", ATTR{idProduct}=="6877", MODE="0666", TAG+="uaccess"
+  SUBSYSTEM=="tty", ATTRS{idVendor}=="34b7", ATTRS{idProduct}=="6877", ENV{ID_MM_DEVICE_IGNORE}="1"
+  ```
+
 ## 主机侧板类：一块芯片一个类 [2026-09-05]
 
-`host/include/libhcs/board/hpm5321.hpp` 里的 `Hpm5321` **同时服务两块 PCB**（单 CAN
-`0x5321` 与双 CAN `0x5322`），**类名不编码总线数**——它是运行期事实，来自 EP0
-`kGetInterface` 的 `can_count`（与固件读 OTP 第 25 字判板型是同一个事实来源）。
+`host/include/libhcs/board/hpm5321.hpp` 里的 `Hpm5321` **同时服务两块 PCB**（单 CAN 与
+双 CAN，应用的 USB 身份相同，见「DMTool 兼容」），**类名不编码总线数**——它是运行期
+事实，来自 EP0 `kGetInterface` 的 `can_count`（与固件读 OTP 第 25 字判板型是同一个事实
+来源）。
 三条实现约定：
 
 1. **描述符表现在是"镜像的容量"，不是"某块板的配置"**。`spec::hpm5321`
@@ -250,8 +285,9 @@ cmake --preset debug -S firmware/hpm_board
 cmake --build firmware/hpm_board/build       # target: hpm_board_app / hpm_board_bootloader
 # 两块 HPM5321 板（单 CAN / 双 CAN-FD）共用 -DBOARD=hpm5321 这一个镜像，上电自己判板型
 cmake --preset release -S firmware/hpm_board -B <build> -DBOARD=hpm5321
-# 烧录：同一个 .dfu，只有 -d 的 PID 按板子填（单 CAN 5321 / 双 CAN-FD 5322）
-# dfu-util -d 0xa511:0x5322 -a 0 -D <build>/app/output/hpm_board_app_hpm5321.dfu
+# 烧录：同一个 .dfu。应用在跑时先按 0x34b7:0x6877 detach, 再接 bootloader 的
+# 0xa511:0x5321（单 CAN）或 0x5322（双 CAN-FD）；已在 bootloader 里时只写后一段
+# dfu-util -d 0x34b7:0x6877,0xa511:* -a 0 -D <build>/app/output/hpm_board_app_hpm5321.dfu
 ```
 - preset：`debug` / `debug-outside` / `release`（注意本板 `CMAKE_BUILD_TYPE` 用小写 `debug`/`release`）。
 - 构建需 Python 3 + `PyYAML`、`jinja2`（HPM SDK 代码生成用）。

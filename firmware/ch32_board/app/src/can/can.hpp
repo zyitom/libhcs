@@ -76,6 +76,12 @@ public:
     [[nodiscard]] data::DataId data_id() const { return data_id_; }
 
     void handle_downlink(const data::CanDataView& data) {
+        // This board never advertises kCapCanFdLongFrames (its controller is
+        // classic-only), so the host SDK refuses long payloads upstream; the
+        // guard keeps a peer bug from overflowing the 8-byte CanTxMsg on a
+        // debugless build.
+        if (data.can_data.size() > 8)
+            return;
         CanTxMsg msg = {};
         if (data.is_extended_can_id) {
             msg.IDE = CAN_Id_Extended;
@@ -86,7 +92,6 @@ public:
         }
         msg.RTR = data.is_remote_transmission ? CAN_RTR_Remote : CAN_RTR_Data;
 
-        core::utility::assert_debug(data.can_data.size() <= 8);
         msg.DLC = static_cast<uint8_t>(data.can_data.size());
         if (!data.can_data.empty())
             std::memcpy(msg.Data, data.can_data.data(), data.can_data.size());

@@ -61,19 +61,19 @@ extern "C" {
 #endif
 
 //------------- 类驱动 -------------//
-// 只有主 vendor 接口一对 bulk 端点。曾为 CAN 单开一对(2026-08-07 加,
-// 2026-09-05 移除): 空闲 IN 端点被主机持续轮询, 包率损失四分之一, 超过它消除的
-// 队头阻塞, 详见 usb_descriptors.hpp。也刻意不用 TinyUSB 0.21 的 interrupt 端点
-// 对 -- interrupt 端点每 bInterval 才被轮询一次, 高速下会把上行量化到 125 us
-// 微帧, 而 bulk 保持连续轮询, 只是不再共享队列。
+// libhcs 仍是唯一的 vendor 类实例(实例 0), 让到接口 3 / 0x04 / 0x84
+// (libhcs/protocol/usb_identity.hpp)。DMTool 仿真的接口 0-2(端点 0x01-0x03 /
+// 0x81-0x83, 由 DMTool 写死)由 dmtool 的应用类驱动承接(usbd_app_driver_get_cb),
+// 不占 vendor 实例: libhcs 的 bulk 回调与发送路径因此与没有 DMTool 时逐条相同。
+// CDC = 板上 UART 的 USB 串口桥。多出的端点对 libhcs 零成本: bulk 端点只在主机
+// 挂着传输时才被调度, 见 usb_descriptors.hpp。也刻意不用 TinyUSB 0.21 的
+// interrupt 端点对做数据 -- interrupt 端点每 bInterval 才被轮询一次, 高速下会把
+// 上行量化到 125 us 微帧。
 
-#define CFG_TUD_CDC  0
-#define CFG_TUD_MSC  0
-#define CFG_TUD_HID  0
-#define CFG_TUD_MIDI 0
-// 一个 vendor 接口: 主 bulk 管道。2026-08-07 曾在此为 CAN 加第二个接口、经 EP0
-// 的 kSetEndpointMode(0x46, 已废弃)运行时启用, 因空闲 IN 轮询的代价于 2026-09-05
-// 移除, 见 usb_descriptors.hpp。
+#define CFG_TUD_CDC         1
+#define CFG_TUD_MSC         0
+#define CFG_TUD_HID         0
+#define CFG_TUD_MIDI        0
 #define CFG_TUD_VENDOR      1
 #define CFG_TUD_DFU_RUNTIME 1
 #define CFG_TUD_DFU         0
@@ -84,6 +84,11 @@ extern "C" {
 // https://docs.tinyusb.org/en/latest/reference/usb_concepts.html#class-driver-types
 #define CFG_TUD_VENDOR_RX_BUFSIZE 0
 #define CFG_TUD_VENDOR_TX_BUFSIZE 0
+
+// CDC 串口桥: FIFO 与端点缓冲都按高速 bulk 包长 512 取。
+#define CFG_TUD_CDC_RX_BUFSIZE 512
+#define CFG_TUD_CDC_TX_BUFSIZE 512
+#define CFG_TUD_CDC_EP_BUFSIZE 512
 
 #ifdef __cplusplus
 }

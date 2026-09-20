@@ -157,8 +157,9 @@ cmake --build firmware/hpm_board/build
 > 不影响命令行;把 `hpm6e8y` 加进该列表纯属可读性优化。
 
 > **HPM5321 只有一个 BOARD 值要记:`hpm5321`。** 它出的单个镜像同时服务单 CAN 版和
-> 双 CAN-FD 版两块板,上电时读 OTP 第 25 个字判断跑在哪块上,并据此报 `0x5321` 或
-> `0x5322`——所以 `dfu-util -d` 的 PID 按板子填,和合并前一样。`.dfu` 容器后缀里的
+> 双 CAN-FD 版两块板,上电时读 OTP 第 25 个字判断跑在哪块上,bootloader 据此报 `0x5321` 或
+> `0x5322`;应用则统一以 `0x34b7:0x6877` 枚举(DMTool 兼容,见 [AGENTS.md](AGENTS.md)
+> 「DMTool 兼容」)。所以应用在跑时 `dfu-util -d` 写成 `0x34b7:0x6877,0xa511:*`。`.dfu` 容器后缀里的
 > PID 是通配 `0xFFFF`,同一个文件对两个 PID 都能过校验。原理、实测数据、以及"读到
 > 未知值就拒绝启动"的行为见 [boards/hpm5321/README.md](boards/hpm5321/README.md)。
 > HPM5321 两块 PCB 共用 `-DBOARD=hpm5321` 这一份镜像；OTP 第 25 字决定 CAN/LED/PID。

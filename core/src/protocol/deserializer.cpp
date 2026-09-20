@@ -6,11 +6,27 @@
 #include <span>
 
 #include "core/include/libhcs/data/datas.hpp"
+#include "core/include/libhcs/protocol/can_dlc.hpp"
 #include "core/src/coroutine/lifo.hpp"
 #include "core/src/protocol/protocol.hpp"
 #include "core/src/utility/assert.hpp"
 
 namespace libhcs::core::protocol {
+
+namespace {
+// The 3-bit DataLengthCode field to payload bytes, keyed on IsLongFrame
+// (semantics in core/src/protocol/protocol.hpp). Returns 0 for the reserved
+// long-form code 7; the caller turns a zero-length data frame into a parse
+// failure so a reserved encoding can never deliver a frame that was never
+// sent on any bus.
+uint8_t resolve_can_length(uint8_t code, bool is_long_frame) {
+    if (!is_long_frame)
+        return static_cast<uint8_t>(code + 1);
+    if (code > 6) [[unlikely]]
+        return 0;
+    return static_cast<uint8_t>(payload_length(static_cast<uint8_t>(code + kCanFdLongDlcBase)));
+}
+} // namespace
 
 coroutine::LifoTask<void> Deserializer::process_stream() {
     while (true) {
@@ -70,6 +86,7 @@ coroutine::LifoTask<void> Deserializer::process_stream() {
 coroutine::LifoTask<bool> Deserializer::process_can_field(FieldId field_id) {
     data::CanDataView data_view;
     uint8_t can_data_length = 0;
+    bool is_long_frame = false;
     bool has_timestamp = false;
     {
         const auto* header_bytes = co_await peek_bytes(sizeof(CanHeader));
@@ -80,6 +97,11 @@ coroutine::LifoTask<bool> Deserializer::process_can_field(FieldId field_id) {
         data_view.is_extended_can_id = header.get<CanHeader::IsExtendedCanId>();
         data_view.is_remote_transmission = header.get<CanHeader::IsRemoteTransmission>();
         can_data_length = static_cast<uint8_t>(header.get<CanHeader::HasCanData>());
+        is_long_frame = header.get<CanHeader::IsLongFrame>();
+        // Reserved combination: ISO CAN-FD has no remote frames, so no peer
+        // can ever have encoded IsLongFrame on one.
+        if (is_long_frame && data_view.is_remote_transmission) [[unlikely]]
+            co_return false;
     }
 
     if (data_view.is_extended_can_id) {
@@ -89,7 +111,10 @@ coroutine::LifoTask<bool> Deserializer::process_can_field(FieldId field_id) {
         auto header = CanHeaderExtended::CRef{header_ext_bytes};
 
         data_view.can_id = header.get<CanHeaderExtended::CanId>();
-        can_data_length = can_data_length ? header.get<CanHeaderExtended::DataLengthCode>() + 1 : 0;
+        can_data_length =
+            can_data_length
+                ? resolve_can_length(header.get<CanHeaderExtended::DataLengthCode>(), is_long_frame)
+                : 0;
         has_timestamp = header.get<CanHeaderExtended::HasTimestamp>();
     } else {
         const auto* header_std_bytes = co_await peek_bytes(sizeof(CanHeaderStandard));
@@ -98,9 +123,17 @@ coroutine::LifoTask<bool> Deserializer::process_can_field(FieldId field_id) {
         auto header = CanHeaderStandard::CRef{header_std_bytes};
 
         data_view.can_id = header.get<CanHeaderStandard::CanId>();
-        can_data_length = can_data_length ? header.get<CanHeaderStandard::DataLengthCode>() + 1 : 0;
+        can_data_length =
+            can_data_length
+                ? resolve_can_length(header.get<CanHeaderStandard::DataLengthCode>(), is_long_frame)
+                : 0;
         has_timestamp = header.get<CanHeaderStandard::HasTimestamp>();
     }
+    // resolve_can_length returns 0 for a reserved encoding; the record is
+    // structurally undecodable, so the stream goes to discard mode rather
+    // than delivering a frame that was never sent.
+    if (can_data_length == 0 && !data_view.is_remote_transmission)
+        co_return false;
     consume_peeked();
 
     // A later peek may reuse the pending cache, so keep the payload and its

@@ -18,6 +18,7 @@
 #include "core/src/protocol/serializer.hpp"
 #include "core/src/utility/assert.hpp"
 #include "core/src/utility/immovable.hpp"
+#include "firmware/hpm_board/app/src/dmtool/dm_adapter.hpp"
 #include "firmware/hpm_board/app/src/led/led.hpp"
 #include "firmware/hpm_board/app/src/link/uplink.hpp"
 #include "firmware/hpm_board/app/src/uart/rx_buffer.hpp"
@@ -247,8 +248,13 @@ private:
 
     void handle_uplink(
         std::span<const std::byte> payload, std::span<const std::byte> payload2, bool is_idle) {
-        if (!link::uplink_enabled())
+        if (!link::uplink_enabled()) {
+            // 没有 libhcs 会话: 交给 CDC 串口桥(桥没接通时它什么也不做)。冷函数调用
+            // 而非内联判断, 上面 libhcs 分支的代码与没有 CDC 桥时一样。
+            dmtool::uart_rx_without_session(
+                payload.data(), payload.size(), payload2.data(), payload2.size());
             return;
+        }
 
         auto& serializer = link::uplink_serializer();
         core::utility::assert_debug(

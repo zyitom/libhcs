@@ -3,10 +3,13 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <iterator>
 
+#include "core/include/libhcs/protocol/can_dlc.hpp"
 #include "core/src/utility/assert.hpp"
 #include "firmware/hpm_board/app/src/diag/can_diag.hpp"
 #include "firmware/hpm_board/app/src/diag/latency.hpp"
+#include "firmware/hpm_board/app/src/dmtool/dm_adapter.hpp"
 
 // CAN 转发热路径在此以 out-of-line 方式定义于 ILM (.fast) 段, 而非内联在
 // can.hpp。ILM 零等待、永不 I-cache miss, 从而把 FLASH-XIP 取指抖动从最坏
@@ -24,7 +27,7 @@
 namespace libhcs::firmware::can {
 
 ATTR_PLACE_AT(".fast")
-void Can::handle_downlink(const data::CanDataView& data) {
+void Can::handle_downlink(const data::CanDataView& data, uint8_t dlc_override) {
     mcan_tx_frame_t frame{};
     if (data.is_extended_can_id) {
         frame.use_ext_id = true;
@@ -43,8 +46,23 @@ void Can::handle_downlink(const data::CanDataView& data) {
     frame.bitrate_switch = send_fd;
     frame.rtr = data.is_remote_transmission;
 
-    core::utility::assert_debug(data.can_data.size() <= 8);
-    frame.dlc = data.can_data.size();
+    // DLC: <=8 字节按字节数直写; 长帧(负载 12-64 字节)经 DLC 表取线上码
+    // (9-15) -- 4 位字段: 字节数 16 直写会截断成 0, 线上 DLC 0, 接收方全丢。
+    // DMTool 路径由调用方传线上 DLC; libhcs 下行长帧在此推导, 但先验证总线
+    // 仍是 FD: 会话建立后 DMTool 可把总线切回经典, 主机侧的门禁与总线的
+    // 实际模式之间存在竞态窗口, 经典模式没有长帧的表达, 丢弃而非直写。
+    core::utility::assert_debug(data.can_data.size() <= 64);
+    if (dlc_override != 0U) {
+        frame.dlc = dlc_override;
+    } else if (data.can_data.size() > 8) {
+        // 9-11 等不在 DLC 表内的长度没有线上表达, 同样丢弃。
+        const uint8_t wire_dlc = core::protocol::dlc_from_payload_len(data.can_data.size());
+        if (!send_fd || wire_dlc == core::protocol::kDlcInvalid)
+            return;
+        frame.dlc = wire_dlc;
+    } else {
+        frame.dlc = static_cast<uint8_t>(data.can_data.size());
+    }
     if (!data.can_data.empty())
         std::memcpy(frame.data_8, data.can_data.data(), data.can_data.size());
 
@@ -65,8 +83,8 @@ void Can::handle_downlink(const data::CanDataView& data) {
         return;
     }
 
-    // 压缩进队列元素: T0/T1 加至多 8 个数据字节。mcan_tx_frame_t 开头的字正是
-    // T0/T1, 可直接拷贝; 下方 static_assert 钉住这一布局假设。
+    // 压缩进队列元素: T0/T1 加至多 64 个数据字节 (DMTool 长帧引入)。mcan_tx_frame_t
+    // 开头的字正是 T0/T1, 可直接拷贝; 下方 static_assert 钉住这一布局假设。
     static_assert(offsetof(mcan_tx_frame_t, data_8) == 8);
     QueuedFrame queued;
     std::memcpy(queued.header, &frame, sizeof(queued.header));
@@ -117,7 +135,7 @@ void Can::drain_pending_transmits_slow() {
 bool Can::transmit_queues_empty() { return max_transmit_queue_depth() == 0; }
 
 ATTR_PLACE_AT(".fast")
-bool Can::read_uplink(data::CanDataView& data, uint8_t storage[8], bool& valid) {
+bool Can::read_uplink(data::CanDataView& data, uint8_t storage[64], bool& valid) {
     valid = false;
     data = {};
     mcan_rx_message_t rx;
@@ -128,14 +146,16 @@ bool Can::read_uplink(data::CanDataView& data, uint8_t storage[8], bool& valid) 
     // 合法到来 -- 必须在此归一化, 不能信任下游 (serializer 会拒绝超出契约的
     // view, 而该拒绝不能变成针对外部输入的 assert):
     //   - 远程帧没有数据字段; 其 DLC 编码的是请求长度, 线协议无法表达, 按空
-    //     负载转发。
+    //     负载转发。(ISO CAN-FD 没有远程帧, FD 长帧 + 远程的组合在硬件上就
+    //     不存在, 线协议同样定为保留。)
     //   - 经典帧可带 DLC 9-15, CAN 规范要求按 8 字节处理。
-    //   - DLC > 8 的 FD 帧有 12-64 字节数据, 而 RX 元素数据字段只有 8 字节,
-    //     硬件已截断存储, 线协议上限也是 8 字节 -- 转发等于交付被悄悄破坏的
-    //     数据。丢帧 (但继续排空)。
-    if (rx.canfd_frame && rx.dlc > 8) [[unlikely]]
-        return true;
-    const size_t data_length = rx.rtr ? 0 : std::min<size_t>(rx.dlc, 8);
+    //   - FD 帧 DLC 0-15 全部经 DLC 表直映 (短帧值与经典一致, 长帧 12-64
+    //     字节): RX 元素数据字段已配成 64 字节 (rxfifos[0].data_field_size),
+    //     负载完整, 记录流用 IsLongFrame 编码承载。
+    const size_t data_length = rx.rtr ? 0
+                             : rx.canfd_frame
+                                 ? std::min<size_t>(core::protocol::payload_length(rx.dlc), 64)
+                                 : std::min<size_t>(rx.dlc, 8);
 
     data.is_extended_can_id = rx.use_ext_id;
     data.is_remote_transmission = rx.rtr;
@@ -186,7 +206,7 @@ void Can::serialize_uplink(
 ATTR_PLACE_AT(".fast")
 bool Can::handle_uplink(core::protocol::FieldId field_id, core::protocol::Serializer& serializer) {
     data::CanDataView data;
-    uint8_t storage[8];
+    uint8_t storage[64];
     bool valid = false;
     if (!read_uplink(data, storage, valid))
         return false;
@@ -201,6 +221,296 @@ bool Can::handle_uplink(core::protocol::FieldId field_id, core::protocol::Serial
     }
 
     return true;
+}
+
+// 不进 .fast: 没有 libhcs 会话时才走到, ILM 留给 libhcs 热路径。
+void Can::drain_without_session() {
+    if (dmtool::capture_enabled(can_index())) {
+        while (handle_dm_uplink()) {}
+        return;
+    }
+    mcan_rx_message_t rx;
+    while (mcan_read_rxfifo(can_base_, 0, &rx) == status_success) {}
+}
+
+bool Can::handle_dm_uplink() {
+    mcan_rx_message_t rx;
+    if (mcan_read_rxfifo(can_base_, 0, &rx) != status_success)
+        return false;
+
+    // rx.dlc 就是线上 DLC 码(0-15, 元素 R1 原样)。FD 长帧(DLC 9-15)元素已扩
+    // 到 64 字节, 负载完整; 经典帧的 DLC 9-15 按规范只有 8 字节有效, 记录按 8
+    // 交付(DMTool 按记录 DLC 读负载, 归一避免多读垃圾)。记录负载 =
+    // payload_length(DLC) 字节, 数据不足部分由编码端补 0。
+    uint8_t wire_dlc = static_cast<uint8_t>(rx.dlc);
+    if (!rx.canfd_frame && wire_dlc > 8U)
+        wire_dlc = 8U;
+
+    const dmtool::protocol::CanFrameFlags flags{
+        .extended = rx.use_ext_id != 0,
+        .remote = rx.rtr != 0,
+        .fd = rx.canfd_frame != 0,
+        .bitrate_switch = rx.bitrate_switch != 0,
+    };
+    dmtool::CanFrameEvent event{
+        .id = rx.use_ext_id ? rx.ext_id : rx.std_id,
+        .dlc = wire_dlc,
+        .flags = flags,
+    };
+    if (rx.rtr == 0)
+        std::memcpy(
+            event.data.data(), rx.data_8,
+            std::min<size_t>(dmtool::protocol::payload_length(wire_dlc), event.data.size()));
+
+    mcan_timestamp_value_t ts_value;
+    if (mcan_get_timestamp_from_received_message(can_base_, &rx, &ts_value) == status_success
+        && ts_value.is_64bit) {
+        event.timestamp_sec = static_cast<uint32_t>(ts_value.ts_64bit >> 32);
+        event.timestamp_ns = static_cast<uint32_t>(ts_value.ts_64bit);
+    }
+
+    dmtool::push_can_rx(can_index(), event);
+    ++forwarded_frames_;
+    return true;
+}
+
+// DMTool SETUP_BUARD 的运行时重配(声明见 can.hpp)。
+//
+// 用低级位时序路径(use_lowlevel_timing_setting)直接写命令给定的 TQ 参数, 而非
+// 折算成波特率再交给 SDK 求解器 -- DMTool 的 seg1/seg2/分频就是 TQ 语义, 照抄
+// 才能保证 DMTool 界面上显示的采样点与板子实际一致; 求解器永远收敛到自己的
+// 采样点窗口(见构造函数 87.5% 的注释), 会悄悄改写用户的选择。
+//
+// FD/经典切换: DMTool 界面的 CAN2.0/FDCAN 开关随命令的 fd 字节到来, 对 FD
+// 控制器关掉 enable_canfd 即经典模式; canfd_ 运行时标志随之更新, 发送帧类型
+// (handle_downlink)与 GET_BAUDRATE 的应答(is_fd)自动跟随。
+//
+// 数据段 TDC: SDK 的自动 TDCO 公式(DTSEG1+1 个 mtq)只在数据段分频为 1 时落在
+// 采样点上(TDCO 以 CAN 时钟周期计, 见构造函数注释), 分频为 2 的预设(5M/4M/
+// 2.5M/2M)必须显式给 ssp_offset = 分频 × (seg1+1)。分频 > 2 时 SDK 拒绝 TDC
+// (收发器环路延迟在半个位时间内尚可自检), 关掉并接受。
+//
+// 不进 .fast: 只在 DMTool 配置按钮时运行, ILM 留给转发热路径。
+bool Can::reconfigure_timing(bool fd, PhaseTiming nominal, PhaseTiming data) {
+    // 改速窗口内不得有在途发送(与 handle_downlink 同线程, 此检查充分)。
+    if (transmit_buffer_.readable() != 0)
+        return false;
+
+    mcan_config_t config;
+    mcan_get_default_config(can_base_, &config);
+    config.mode = mcan_mode_normal;
+    config.enable_canfd = fd;
+
+    mcan_bit_timing_param_t nominal_param{
+        .prescaler = static_cast<uint16_t>(nominal.prescaler),
+        .num_seg1 = static_cast<uint16_t>(nominal.seg1),
+        .num_seg2 = static_cast<uint16_t>(nominal.seg2),
+        .num_sjw = static_cast<uint8_t>(nominal.sjw),
+        .enable_tdc = false,
+    };
+    mcan_bit_timing_param_t data_param{
+        .prescaler = static_cast<uint16_t>(data.prescaler),
+        .num_seg1 = static_cast<uint16_t>(data.seg1),
+        .num_seg2 = static_cast<uint16_t>(data.seg2),
+        .num_sjw = static_cast<uint8_t>(data.sjw),
+        .enable_tdc = false,
+    };
+
+    if (fd) {
+        // 数据段分频 ≤ 2 才允许 TDC(SDK 约束)。TDCO 必须落在收发器环路延迟之后
+        // (本板实测: SDK 自动值 seg1+1 = 14 mtq = 175 ns 可用, 更早的采样会读到
+        // 还没回来的位 -> bit error -> 帧被丢), 所以:
+        //   分频 1: ssp_offset = 0, 走 SDK 自动公式(seg1+1, 即实测可用的那套);
+        //   分频 2: 显式给 TDCO = 分频 x (seg1 + 1 + seg2/2) -- 数据位中点之后,
+        //           5M 预设(2,5,2)下 = 14 mtq, 与分频 1 的实测可用值相同。
+        if (data.prescaler == 1U) {
+            data_param.enable_tdc = true;
+            config.enable_tdc = true;
+        } else if (data.prescaler == 2U) {
+            const uint32_t ssp = data.prescaler * (data.seg1 + 1U + data.seg2 / 2U);
+            data_param.enable_tdc = true;
+            config.enable_tdc = true;
+            config.tdc_config.ssp_offset = static_cast<uint8_t>(ssp);
+            config.tdc_config.filter_window_length = static_cast<uint8_t>(ssp);
+        }
+        config.canfd_timing = data_param;
+        config.can_timing = nominal_param;
+    } else {
+        // 经典模式: 只有标称相位有意义, 数据相位参数硬件不使用。
+        config.can_timing = nominal_param;
+    }
+    config.use_lowlevel_timing_setting = true;
+
+    // 时间戳单元与同步过滤器: 与构造函数逐字相同 -- 时间戳是 DMTool 数据帧
+    // 的一部分, 重配后必须继续打戳。
+    config.use_timestamping_unit = true;
+    config.tsu_config.enable_tsu = true;
+    config.tsu_config.enable_64bit_timestamp = true;
+    config.tsu_config.use_ext_timebase = true;
+    config.tsu_config.ext_timebase_src = MCAN_TSU_EXT_TIMEBASE_SRC_TBSEL_0;
+    config.tsu_config.tbsel_option = MCAN_TSU_TBSEL_PTPC0;
+    config.tsu_config.capture_on_sof = true;
+    config.tsu_config.prescaler = 1;
+    config.timestamp_cfg.counter_prescaler = 1;
+    config.timestamp_cfg.timestamp_selection = MCAN_TIMESTAMP_SEL_EXT_TS_VAL_USED;
+    mcan_filter_elem_t std_sync_filter{};
+    std_sync_filter.filter_type = MCAN_FILTER_TYPE_CLASSIC_FILTER;
+    std_sync_filter.filter_config = MCAN_FILTER_ELEM_CFG_STORE_IN_RX_FIFO0_IF_MATCH;
+    std_sync_filter.can_id_type = MCAN_CAN_ID_TYPE_STANDARD;
+    std_sync_filter.sync_message = 1U;
+    std_sync_filter.filter_id = 0U;
+    std_sync_filter.filter_mask = 0U;
+    mcan_filter_elem_t ext_sync_filter = std_sync_filter;
+    ext_sync_filter.can_id_type = MCAN_CAN_ID_TYPE_EXTENDED;
+    config.all_filters_config.std_id_filter_list.filter_elem_list = &std_sync_filter;
+    config.all_filters_config.std_id_filter_list.mcan_filter_elem_count = 1;
+    config.all_filters_config.ext_id_filter_list.filter_elem_list = &ext_sync_filter;
+    config.all_filters_config.ext_id_filter_list.mcan_filter_elem_count = 1;
+    config.ram_config.enable_rxbuf = false;
+    config.ram_config.rxbuf_elem_count = 0U;
+    // rxfifos[1] 同样是经典预设残留(32 元素 x 8B = 64 词), 不关则总预算
+    // 679 词超出 640 -- RX FIFO 尾部溢出写进相邻控制器的区域, 接收静默失效。
+    config.ram_config.rxfifos[1].enable = false;
+    config.ram_config.rxfifos[1].elem_count = 0U;
+    config.ram_config.std_filter_elem_count = 16U;
+    config.ram_config.ext_filter_elem_count = 16U;
+    config.ram_config.rxfifos[0].elem_count = 8U;
+    config.ram_config.rxfifos[0].data_field_size = MCAN_DATA_FIELD_SIZE_64BYTES;
+    config.ram_config.txbuf_dedicated_txbuf_elem_count = 0;
+    config.ram_config.txbuf_fifo_or_queue_elem_count = 8U;
+    config.ram_config.txbuf_data_field_size = MCAN_DATA_FIELD_SIZE_64BYTES;
+    config.ram_config.txfifo_or_txqueue_mode = MCAN_TXBUF_OPERATION_MODE_FIFO;
+    config.disable_auto_retransmission = true;
+
+    mcan_deinit(can_base_);
+    const mcan_msg_buf_attr_t attr = board::can_message_ram(can_index_);
+    (void)mcan_set_msg_buf_attr(can_base_, &attr);
+
+    bool applied = mcan_init(can_base_, &config, can_clock_mhz_ * 1'000'000U) == status_success;
+    if (!applied) [[unlikely]] {
+        // 参数被 SDK 判为非法: 用编译期时序救回端口, 让总线上其他节点保持可用。
+        mcan_deinit(can_base_);
+        (void)mcan_set_msg_buf_attr(can_base_, &attr);
+
+        mcan_config_t restore;
+        mcan_get_default_config(can_base_, &restore);
+        restore.baudrate = kArbitrationBaudrate;
+        restore.mode = mcan_mode_normal;
+        restore.enable_canfd = canfd_;
+        if (canfd_) {
+            restore.baudrate_fd = kCanFdDataBaudrate;
+            restore.enable_tdc = true;
+        }
+        restore.can20_samplepoint_min = kNominalSamplePointPerMille;
+        restore.can20_samplepoint_max = kNominalSamplePointPerMille;
+        restore.canfd_samplepoint_min = kDataSamplePointPerMille;
+        restore.canfd_samplepoint_max = kDataSamplePointPerMille;
+        restore.ram_config.enable_rxbuf = false;
+        restore.ram_config.rxbuf_elem_count = 0U;
+        restore.ram_config.rxfifos[1].enable = false;
+        restore.ram_config.rxfifos[1].elem_count = 0U;
+        restore.ram_config.std_filter_elem_count = 1U;
+        restore.ram_config.ext_filter_elem_count = 1U;
+        restore.ram_config.rxfifos[0].elem_count = 20U;
+        restore.ram_config.rxfifos[0].data_field_size = MCAN_DATA_FIELD_SIZE_64BYTES;
+        restore.ram_config.txbuf_dedicated_txbuf_elem_count = 0;
+        restore.ram_config.txbuf_fifo_or_queue_elem_count = 14U;
+        restore.ram_config.txbuf_data_field_size = MCAN_DATA_FIELD_SIZE_64BYTES;
+        restore.ram_config.txfifo_or_txqueue_mode = MCAN_TXBUF_OPERATION_MODE_FIFO;
+        restore.disable_auto_retransmission = true;
+        restore.use_timestamping_unit = true;
+        restore.tsu_config.enable_tsu = true;
+        restore.tsu_config.enable_64bit_timestamp = true;
+        restore.tsu_config.use_ext_timebase = true;
+        restore.tsu_config.ext_timebase_src = MCAN_TSU_EXT_TIMEBASE_SRC_TBSEL_0;
+        restore.tsu_config.tbsel_option = MCAN_TSU_TBSEL_PTPC0;
+        restore.tsu_config.capture_on_sof = true;
+        restore.tsu_config.prescaler = 1;
+        restore.timestamp_cfg.counter_prescaler = 1;
+        restore.timestamp_cfg.timestamp_selection = MCAN_TIMESTAMP_SEL_EXT_TS_VAL_USED;
+        mcan_filter_elem_t std_restore = std_sync_filter;
+        restore.all_filters_config.std_id_filter_list.filter_elem_list = &std_restore;
+        restore.all_filters_config.std_id_filter_list.mcan_filter_elem_count = 1;
+        mcan_filter_elem_t ext_restore = ext_sync_filter;
+        restore.all_filters_config.ext_id_filter_list.filter_elem_list = &ext_restore;
+        restore.all_filters_config.ext_id_filter_list.mcan_filter_elem_count = 1;
+        (void)mcan_init(can_base_, &restore, can_clock_mhz_ * 1'000'000U);
+        return false;
+    }
+
+    canfd_ = fd;
+    mcan_enable_interrupts(can_base_, kEnabledInterrupts);
+    return true;
+}
+
+// 恢复编译期位时序与端口 FD 模式(声明见 can.hpp)。配置序列与构造函数一致,
+// 仅是运行时再次执行; 消息 RAM 属性与 PTPC 时基不受 mcan_deinit 影响, 重下发
+// 是幂等的。
+bool Can::restore_default_timing() {
+    if (transmit_buffer_.readable() != 0)
+        return false;
+
+    mcan_config_t config;
+    mcan_get_default_config(can_base_, &config);
+    config.baudrate = kArbitrationBaudrate;
+    config.mode = mcan_mode_normal;
+    config.enable_canfd = port_fd_;
+    if (port_fd_) {
+        config.baudrate_fd = kCanFdDataBaudrate;
+        config.enable_tdc = true;
+    }
+    config.can20_samplepoint_min = kNominalSamplePointPerMille;
+    config.can20_samplepoint_max = kNominalSamplePointPerMille;
+    config.canfd_samplepoint_min = kDataSamplePointPerMille;
+    config.canfd_samplepoint_max = kDataSamplePointPerMille;
+    config.ram_config.enable_rxbuf = false;
+    config.ram_config.rxbuf_elem_count = 0U;
+    // rxfifos[1] 同样是经典预设残留(32 元素 x 8B = 64 词), 不关则总预算
+    // 679 词超出 640 -- RX FIFO 尾部溢出写进相邻控制器的区域, 接收静默失效。
+    config.ram_config.rxfifos[1].enable = false;
+    config.ram_config.rxfifos[1].elem_count = 0U;
+    config.ram_config.std_filter_elem_count = 16U;
+    config.ram_config.ext_filter_elem_count = 16U;
+    config.ram_config.rxfifos[0].elem_count = 8U;
+    config.ram_config.rxfifos[0].data_field_size = MCAN_DATA_FIELD_SIZE_64BYTES;
+    config.ram_config.txbuf_dedicated_txbuf_elem_count = 0;
+    config.ram_config.txbuf_fifo_or_queue_elem_count = 8U;
+    config.ram_config.txbuf_data_field_size = MCAN_DATA_FIELD_SIZE_64BYTES;
+    config.ram_config.txfifo_or_txqueue_mode = MCAN_TXBUF_OPERATION_MODE_FIFO;
+    config.disable_auto_retransmission = true;
+    config.use_timestamping_unit = true;
+    config.tsu_config.enable_tsu = true;
+    config.tsu_config.enable_64bit_timestamp = true;
+    config.tsu_config.use_ext_timebase = true;
+    config.tsu_config.ext_timebase_src = MCAN_TSU_EXT_TIMEBASE_SRC_TBSEL_0;
+    config.tsu_config.tbsel_option = MCAN_TSU_TBSEL_PTPC0;
+    config.tsu_config.capture_on_sof = true;
+    config.tsu_config.prescaler = 1;
+    config.timestamp_cfg.counter_prescaler = 1;
+    config.timestamp_cfg.timestamp_selection = MCAN_TIMESTAMP_SEL_EXT_TS_VAL_USED;
+    mcan_filter_elem_t std_sync_filter{};
+    std_sync_filter.filter_type = MCAN_FILTER_TYPE_CLASSIC_FILTER;
+    std_sync_filter.filter_config = MCAN_FILTER_ELEM_CFG_STORE_IN_RX_FIFO0_IF_MATCH;
+    std_sync_filter.can_id_type = MCAN_CAN_ID_TYPE_STANDARD;
+    std_sync_filter.sync_message = 1U;
+    std_sync_filter.filter_id = 0U;
+    std_sync_filter.filter_mask = 0U;
+    mcan_filter_elem_t ext_sync_filter = std_sync_filter;
+    ext_sync_filter.can_id_type = MCAN_CAN_ID_TYPE_EXTENDED;
+    config.all_filters_config.std_id_filter_list.filter_elem_list = &std_sync_filter;
+    config.all_filters_config.std_id_filter_list.mcan_filter_elem_count = 1;
+    config.all_filters_config.ext_id_filter_list.filter_elem_list = &ext_sync_filter;
+    config.all_filters_config.ext_id_filter_list.mcan_filter_elem_count = 1;
+
+    mcan_deinit(can_base_);
+    const mcan_msg_buf_attr_t attr = board::can_message_ram(can_index_);
+    (void)mcan_set_msg_buf_attr(can_base_, &attr);
+    const bool applied =
+        mcan_init(can_base_, &config, can_clock_mhz_ * 1'000'000U) == status_success;
+    if (applied) [[likely]]
+        canfd_ = port_fd_;
+    mcan_enable_interrupts(can_base_, kEnabledInterrupts);
+    return applied;
 }
 
 ATTR_PLACE_AT(".fast")
@@ -294,8 +604,9 @@ void Can::handle_interrupt_flags(uint32_t flags) {
             auto& serializer = link::uplink_serializer();
             while (handle_uplink(data_id_, serializer)) {}
         } else {
-            mcan_rx_message_t rx;
-            while (mcan_read_rxfifo(can_base_, 0, &rx) == status_success) {}
+            // 没有 libhcs 会话: 交给 DMTool 或丢弃。整段放在 .fast 之外的单独函数
+            // 里, 本函数的 libhcs 分支因此与没有 DMTool 支持时逐条指令相同。
+            drain_without_session();
         }
     }
 

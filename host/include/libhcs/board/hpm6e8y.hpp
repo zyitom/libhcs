@@ -143,6 +143,15 @@ public:
             case hcs::CanPort::kCan3: id = data::DataId::kCan3; break;
             default: throw std::out_of_range{"Hpm6e8y: CAN port out of range (CAN0..CAN3)"};
             }
+            // CanPort values are the EP0 wire indices on this board. A long
+            // payload has a wire encoding only on an FD bus of a board that
+            // serves long frames; refused here rather than serialized into a
+            // record the firmware would have to drop.
+            if (data.can_data.size() > 8 && !interface_.can_long_frames(std::to_underlying(port)))
+                [[unlikely]]
+                throw std::invalid_argument{
+                    "CAN transmission failed: payloads over 8 bytes need a CAN-FD bus on a "
+                    "board advertising kCapCanFdLongFrames"};
             if (!builder_.write_can(id, data)) [[unlikely]]
                 throw std::invalid_argument{"CAN transmission failed: Invalid CAN data"};
             return *this;
@@ -155,10 +164,12 @@ public:
         }
 
     private:
-        explicit PacketBuilder(host::protocol::Handler& handler) noexcept
-            : builder_(handler.start_transmit()) {}
+        PacketBuilder(host::protocol::Handler& handler, hcs::Interface interface) noexcept
+            : builder_(handler.start_transmit())
+            , interface_(interface) {}
 
         host::protocol::Handler::PacketBuilder builder_;
+        hcs::Interface interface_;
     };
     // Whether this board's link is up, re-establishing, or gone for good.
     // kFaulted means the device disappeared: the transport refuses traffic and
@@ -167,7 +178,9 @@ public:
         return handler_.link_state();
     }
 
-    PacketBuilder start_transmit() noexcept { return PacketBuilder{handler_}; }
+    PacketBuilder start_transmit() noexcept {
+        return PacketBuilder{handler_, interface_.load(std::memory_order_relaxed)};
+    }
 
     // Runtime reconfiguration, over EP0 rather than in the data stream. Unlike
     // the retired in-band config field these are synchronous and verified: the

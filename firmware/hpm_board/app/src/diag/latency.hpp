@@ -59,6 +59,10 @@ inline uint32_t now() { return static_cast<uint32_t>(hpm_csr_get_core_mcycle());
 
 inline void open_downlink() { downlink_opened_at = now(); }
 
+// 不经 libhcs bulk OUT 到来的帧(DMTool 仿真的 CAN 发送)交给 CAN 驱动前调用:
+// 否则 close_downlink() 会拿上一个 libhcs 包的打开时刻结算, 记下一个陈旧的样本。
+inline void abandon_downlink() { downlink_opened_at = 0; }
+
 inline void close_downlink() {
     if (downlink_opened_at == 0)
         return;

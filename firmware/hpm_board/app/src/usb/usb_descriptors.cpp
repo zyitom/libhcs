@@ -25,6 +25,12 @@ uint16_t const* tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
     return usb_descriptors->get_string_descriptor(index, langid);
 }
 
+// BOS 描述符
+// Windows 8.1+ 读它发现 MS OS 2.0 WCID 平台能力, 再用 vendor code 拉描述符集
+// (拦截点在 vendor_control.cpp 的 handle_setup)。集合内容与动机见
+// usb_descriptors.hpp 的 WCID 一节; Linux 主机不请求, 数据面零开销。
+uint8_t const* tud_descriptor_bos_cb(void) { return UsbDescriptors::get_bos_descriptor(); }
+
 } // extern "C"
 
 } // namespace libhcs::firmware::usb

@@ -66,6 +66,7 @@ public:
         , can_base_(reinterpret_cast<MCAN_Type*>(port.base))
         , irq_num_(port.irq_num)
         , canfd_(port.mode == CanMode::kCanFd)
+        , port_fd_(port.mode == CanMode::kCanFd)
         , can_index_(board_can_index) {
 
         // 只允许初始化 PCB 实际存在的端口。单路 hpm5321 的第二个槽位引脚是 LED
@@ -79,6 +80,8 @@ public:
         core::utility::assert_always(status == status_success);
 
         const uint32_t can_source_clock_freq = board::init_can(can_base_);
+        if (can_source_clock_freq % 1'000'000U == 0)
+            can_clock_mhz_ = static_cast<uint16_t>(can_source_clock_freq / 1'000'000U);
 
         mcan_config_t config;
         mcan_get_default_config(can_base_, &config);
@@ -133,10 +136,23 @@ public:
         config.can20_samplepoint_max = kNominalSamplePointPerMille;
         config.canfd_samplepoint_min = kDataSamplePointPerMille;
         config.canfd_samplepoint_max = kDataSamplePointPerMille;
-        // 即使 CAN-FD 也保持默认 8 字节元素: 本总线帧的数据从不超过 8 字节,
-        // RAM 占用与经典 CAN 相同。
+        // 元素扩到 64 字节: DMTool 仿真要收发 DLC 9-15 的 FD 长帧(12-64 字节)。
+        // 64B 元素 18 词/个, 640 词消息 RAM 内: RX FIFO0 20 个(360 词) + TX FIFO
+        // 14 个(252 词) + 过滤器 3 词 = 615 <= 640。RX 深度 32->20(硬件侧),
+        // 突发吸收的差额由软件发送队列(64)与 DM 接收队列(32)承接。
+        config.ram_config.enable_rxbuf = false;
+        config.ram_config.rxbuf_elem_count = 0U;
+        // rxfifos[1] 是经典预设残留(32 元素): 不关则构造函数 RAM 总量 742 词
+        // 超 640, mcan_init 静默失败, 两路控制器全部死掉。
+        config.ram_config.rxfifos[1].enable = false;
+        config.ram_config.rxfifos[1].elem_count = 0U;
+        config.ram_config.std_filter_elem_count = 16U;
+        config.ram_config.ext_filter_elem_count = 16U;
+        config.ram_config.rxfifos[0].elem_count = 8U;
+        config.ram_config.rxfifos[0].data_field_size = MCAN_DATA_FIELD_SIZE_64BYTES;
+        config.ram_config.txbuf_data_field_size = MCAN_DATA_FIELD_SIZE_64BYTES;
         config.ram_config.txbuf_dedicated_txbuf_elem_count = 0;
-        config.ram_config.txbuf_fifo_or_queue_elem_count = MCAN_TXBUF_SIZE_CAN_DEFAULT;
+        config.ram_config.txbuf_fifo_or_queue_elem_count = 8U;
         config.ram_config.txfifo_or_txqueue_mode = MCAN_TXBUF_OPERATION_MODE_FIFO;
         config.disable_auto_retransmission = true;
 
@@ -251,9 +267,51 @@ public:
     // 转发延迟中的 FLASH-XIP 取指抖动。理由及为何不内联在类内见 can.cpp。
     // handle_uplink 至多从 RX FIFO0 读一帧并返回是否消费了帧, ISR 据此循环
     // 排空 FIFO。
-    void handle_downlink(const data::CanDataView& data);
+    // dlc_override: DMTool 长帧的线上 DLC(9-15, 负载 12-64 字节); 0 = 按负载
+    // 长度推导(libhcs 短帧按字节数, 长帧经 DLC 表, 仅限 FD 总线)。
+    void handle_downlink(const data::CanDataView& data, uint8_t dlc_override = 0);
     bool handle_uplink(core::protocol::FieldId field_id, core::protocol::Serializer& serializer);
     void irq_handler();
+
+    // 实际写进控制器的位时序, 从 NBTP/DBTP 读回(寄存器字段 +1 即 tq 数与分频
+    // 系数)。DMTool 的读波特率命令用它回报硬件事实, 而不是回显请求值。
+    struct PhaseTiming {
+        uint32_t prescaler, seg1, seg2, sjw; // seg1 = 传播段 + 相位段 1
+    };
+    struct BitTiming {
+        uint32_t clock_hz; // 0 表示未知
+        PhaseTiming nominal;
+        PhaseTiming data;  // 仅 FD 端口有意义
+    };
+    [[nodiscard]] BitTiming bit_timing() const {
+        const uint32_t nbtp = can_base_->NBTP;
+        const uint32_t dbtp = can_base_->DBTP;
+        const PhaseTiming nominal{
+            .prescaler = MCAN_NBTP_NBRP_GET(nbtp) + 1U,
+            .seg1 = MCAN_NBTP_NTSEG1_GET(nbtp) + 1U,
+            .seg2 = MCAN_NBTP_NTSEG2_GET(nbtp) + 1U,
+            .sjw = MCAN_NBTP_NSJW_GET(nbtp) + 1U,
+        };
+        const PhaseTiming data{
+            .prescaler = MCAN_DBTP_DBRP_GET(dbtp) + 1U,
+            .seg1 = MCAN_DBTP_DTSEG1_GET(dbtp) + 1U,
+            .seg2 = MCAN_DBTP_DTSEG2_GET(dbtp) + 1U,
+            .sjw = MCAN_DBTP_DSJW_GET(dbtp) + 1U,
+        };
+        return {.clock_hz = can_clock_mhz_ * 1'000'000U, .nominal = nominal, .data = data};
+    }
+
+    [[nodiscard]] bool is_fd() const { return canfd_; }
+
+    // DMTool SETUP_BUARD 的运行时重配(实现见 can.cpp): 按命令给定的 TQ 参数
+    // (分频/seg1/seg2/sjw, 与 mcan_bit_timing_param_t 同语义)直接写低级位时序,
+    // 并切换 FD/经典模式。请求非法或硬件拒绝时端口保持原配置并返回 false。
+    bool reconfigure_timing(bool fd, PhaseTiming nominal, PhaseTiming data);
+
+    // 恢复编译期位时序(SDK 求解器解, 87.5% 采样点)与端口原始 FD 模式。libhcs
+    // 会话建立时调用: DMTool 会话可能把总线改成了别的速率, libhcs 期望的
+    // 总线参数由本函数还原。
+    bool restore_default_timing();
 
     // 主循环看门狗, 处理 PLIC 已接受却从未送达的中断请求。健康路径仅两次寄存器
     // 读; 修复的故障及实测依据见 can.cpp。
@@ -315,12 +373,18 @@ private:
     // kCan0..kCan3, 5321 用 kCan1..kCan2, 减去 kCan1 得不到板内序号。
     std::size_t can_index() const { return can_index_; }
 
-    // 读出并归一化一帧 RX FIFO。返回 `true` 表示消费了一个元素; `valid` 区分
-    // 可表示的帧与被 8 字节 RX 元素截断存储的 FD 负载。
-    bool read_uplink(data::CanDataView& out, uint8_t storage[8], bool& valid);
+    // 读出并归一化一帧 RX FIFO。返回 `true` 表示消费了一个元素; `valid` 恒为
+    // 归一化成功(FD 长帧 12-64 字节完整承载, 经典 DLC 9-15 钳到 8)。
+    bool read_uplink(data::CanDataView& out, uint8_t storage[64], bool& valid);
     static void serialize_uplink(
         core::protocol::FieldId field_id, const data::CanDataView& data,
         core::protocol::Serializer& serializer);
+
+    // libhcs 会话不在时 ISR 的排空路径: DMTool 在采集本路就经 handle_dm_uplink
+    // 交给它, 否则丢弃(can.cpp)。与 read_uplink 刻意分开写: 那条是 libhcs 热路径,
+    // 不为 DMTool 多带一个分支或参数。
+    [[gnu::cold, gnu::noinline]] void drain_without_session();
+    bool handle_dm_uplink();
 
     // 把 MCAN Last Error Code (仲裁相位或数据相位) 归类为指示 LED 状态 --
     // 即 CAN 控制器电气上真正能支撑的粒度:
@@ -350,7 +414,16 @@ private:
     const data::DataId data_id_;
     MCAN_Type* can_base_;
     const uint32_t irq_num_;
-    const bool canfd_;
+    // DMTool 仿真(SETUP_BUARD)在运行时切换本控制器的 FD/经典模式, 因此不再
+    // 是编译期常量; 初值仍来自端口表, libhcs 路径的行为不变。仅主循环写
+    // (handle_downlink / reconfigure_timing 同线程), ISR 不读。
+    bool canfd_;
+    // 端口表的原始 FD 模式, restore_default_timing() 的还原目标。
+    const bool port_fd_;
+    // board::init_can() 配出的位时序源时钟, 以 MHz 计(非整 MHz 记 0), 只供
+    // bit_timing() 回报。刻意放进 canfd_ 之后的对齐空洞: Can 的尺寸与各成员偏移
+    // 不变, ISR 与主循环里对 can_array 的寻址逐条指令保持原样。
+    uint16_t can_clock_mhz_ = 0;
     const std::size_t can_index_;
 
     // poll() 用的中断记账。irq_count_ 仅 ISR 写、仅主循环读, 普通 32 位计数
@@ -376,9 +449,9 @@ private:
     // 深度 -- 正是突发测量曾欠缺的。
     struct QueuedFrame {
         uint32_t header[2]; // mcan_tx_frame_t 的 T0/T1 字
-        uint8_t data[8];
+        uint8_t data[64];   // DMTool 长帧: DLC 9-15 -> 12-64 字节
     };
-    static_assert(sizeof(QueuedFrame) == 16);
+    static_assert(sizeof(QueuedFrame) == 72);
 
     utility::RingBuffer<QueuedFrame, kTransmitQueueSize> transmit_buffer_;
 };

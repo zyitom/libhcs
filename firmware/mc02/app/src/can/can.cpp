@@ -51,6 +51,10 @@ libhcs_ITCM void Can::push_to_hardware(const TransmitMailboxData& mailbox_data) 
 }
 
 libhcs_ITCM void Can::handle_downlink(const data::CanDataView& data) {
+    // 本板不广告 kCapCanFdLongFrames(RX FIFO 元素仍为 8 字节, 主机 SDK 侧也已
+    // 拒绝长负载), 该守卫防止对端 bug 在无 debug 构建上溢出 8 字节 TX 元素。
+    if (data.can_data.size() > 8)
+        return;
     TransmitMailboxData mailbox{};
 
     if (data.is_extended_can_id) {
@@ -60,7 +64,6 @@ libhcs_ITCM void Can::handle_downlink(const data::CanDataView& data) {
     }
     mailbox.identifier |= data.is_remote_transmission ? FDCAN_REMOTE_FRAME : FDCAN_DATA_FRAME;
 
-    core::utility::assert_debug(data.can_data.size() <= 8);
     const auto dlc = static_cast<uint32_t>(data.can_data.size());
 
     // 帧类型属于总线而非单帧。曾按主机头部位逐帧选择, 该位已废弃, 模式现由

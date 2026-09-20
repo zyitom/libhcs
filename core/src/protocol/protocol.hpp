@@ -26,30 +26,55 @@ struct CanHeaderLayout {
     // HasTimestamp has been moved to CanHeaderStandardLayout / CanHeaderExtendedLayout.
     // Bit 3 is reserved.
     //
-    // Bit 4 was IsFdCan, retired 2026-09-12. The frame type is a property of the
-    // BUS, not of an individual frame: the firmware fixes it in its port table at
-    // init and the host reads it over the EP0 configuration channel
+    // Bit 4 is IsLongFrame (since 2026-09-20): the payload is one of the CAN-FD
+    // long lengths (12-64 bytes) and the DataLengthCode field below holds
+    // wireDLC - 9 instead of bytes-1. It reuses the slot of IsFdCan, retired
+    // 2026-09-12: classic-vs-FD stays a property of the BUS, fixed by the
+    // firmware's port table and read over the EP0 configuration channel
     // (kGetInterface.can_fd_mask / kGetCanConfig -- see
-    // libhcs/protocol/vendor_control.hpp). Neither end writes or reads the bit
-    // any more; it stays reserved, and a receiver must ignore it.
-    using IsFdCan = BitfieldMember<4, 1>;
+    // libhcs/protocol/vendor_control.hpp). IsLongFrame says nothing about the
+    // frame type -- short frames encode identically on classic and FD buses --
+    // it only switches how the 3-bit length field decodes, which the per-bus
+    // model has no room to express. Peers agree on the encoding through the
+    // EP0 wire-layout fingerprint plus kCapCanFdLongFrames; a peer that never
+    // negotiated it neither sends nor receives long frames, so the retired
+    // bit's old rule (a receiver may ignore bit 4) is gone -- ignoring it now
+    // misreads the length field. Invalid encoding, reserved on both
+    // directions: IsLongFrame with IsRemoteTransmission (ISO CAN-FD has no
+    // remote frames), and a long-form DataLengthCode of 7.
+    using IsLongFrame = BitfieldMember<4, 1>;
     using IsExtendedCanId = BitfieldMember<5, 1>;
     using IsRemoteTransmission = BitfieldMember<6, 1>;
     using HasCanData = BitfieldMember<7, 1>;
 };
 
+// DataLengthCode semantics, both layouts, keyed on IsLongFrame:
+//   short (IsLongFrame = 0): payload bytes - 1, 0-7 == 1-8 bytes;
+//   long  (IsLongFrame = 1): wire DLC - 9, 0-6 == DLC 9-15 == 12-64 bytes via
+//          the table in libhcs/protocol/can_dlc.hpp; 7 is reserved.
+// Short frames on classic and FD buses encode identically, so a receiver that
+// does not track the bus mode decodes them correctly either way; per-frame
+// FDF/BRS fidelity is deliberately not carried here (the DMTool record
+// stream, firmware/hpm_board/DMTOOL_PROTOCOL.md, reports it for analysis).
 struct CanHeaderStandardLayout {
     using CanId = BitfieldMember<8, 11>;
     // HasTimestamp sits in the 2-bit gap [19:21) between CanId and
     // DataLengthCode -- avoiding overlap with DataLengthCode bit 1.
     using HasTimestamp = BitfieldMember<19, 1>;
+    // Bit 20 is the last free bit of the standard header. Reserved -- spent
+    // now so a future per-frame flag (BRS, ESI) does not reshuffle the layout
+    // again; a receiver must ignore it.
     using DataLengthCode = BitfieldMember<21, 3>;
 };
 
 struct CanHeaderExtendedLayout {
     using CanId = BitfieldMember<8, 29>;
+    // Long frames use the same DataLengthCode encoding as the standard header
+    // (one decoder, one table) rather than the 7 free bits below: those stay
+    // reserved so the extended header never grows a second length encoding.
     using DataLengthCode = BitfieldMember<8 + 29, 3>;
     using HasTimestamp = BitfieldMember<40, 1>;
+    // Bits 41-47 are free. Reserved; a receiver must ignore them.
 };
 
 struct UartHeaderLayout {

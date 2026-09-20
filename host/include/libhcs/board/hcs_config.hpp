@@ -5,10 +5,13 @@
 #include <cstdint>
 #include <format>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
+#include <libhcs/data/datas.hpp>
 #include <libhcs/protocol/handler.hpp>
 #include <libhcs/protocol/vendor_control.hpp>
 
@@ -48,9 +51,23 @@ struct Interface {
     // kSetCanConfig (see CanCapabilities::kCapCanModeSettable). False turns
     // every can_fd() entry below into a pure assertion.
     bool can_mode_settable = false;
+    // Whether the board carries CAN-FD long frames (12-64 byte payloads) on
+    // FD buses (see CanCapabilities::kCapCanFdLongFrames). The board classes
+    // gate can_transmit() on this plus can_fd(bus): a long frame to a bus
+    // that is not running FD has no on-wire encoding either.
+    bool can_fd_long_frames = false;
+    // Explicit padding, NOT an afterthought: the atomic<Interface> below must
+    // stay is_always_lock_free, and on x86-64 that means 1/2/4/8 bytes -- a
+    // 5-byte Interface would cross the boundary and put an implicit lock on
+    // every transmit path.
+    std::array<uint8_t, 3> reserved = {};
 
     [[nodiscard]] bool can_fd(std::size_t bus) const {
         return bus < can_count && ((can_fd_mask >> bus) & 1U) != 0U;
+    }
+
+    [[nodiscard]] bool can_long_frames(std::size_t bus) const {
+        return can_fd_long_frames && can_fd(bus);
     }
 };
 
@@ -96,7 +113,22 @@ inline Interface read_interface(host::protocol::Handler& handler) {
         .uart_count = payload.uart_count,
         .can_fd_mask = payload.can_fd_mask,
         .can_mode_settable = (payload.caps & vc::kCapCanModeSettable) != 0U,
+        .can_fd_long_frames = (payload.caps & vc::kCapCanFdLongFrames) != 0U,
     };
+}
+
+// Gate for boards that cannot carry a CAN-FD long payload at all: bxCAN-class
+// controllers (c_board, ch32_board), or boards whose firmware has not widened
+// its RX elements yet (mc02). The core serializer WOULD encode the frame, so
+// the board classes must call this before write_can() -- the firmware side has
+// only an 8-byte TX element, and a long record arriving there would overflow
+// it on a debugless build.
+inline void reject_long_payload(std::span<const std::byte> payload, std::string_view port) {
+    if (payload.size() > 8)
+        throw std::invalid_argument{std::format(
+            "{} transmission failed: payloads over 8 bytes need a board advertising "
+            "kCapCanFdLongFrames on a CAN-FD bus",
+            port)};
 }
 
 // Reads back what the port is REALLY running, reconstructed on the board from

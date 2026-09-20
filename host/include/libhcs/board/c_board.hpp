@@ -5,6 +5,7 @@
 #include <string_view>
 
 #include <libhcs/board/common.hpp>
+#include <libhcs/board/hcs_config.hpp>
 #include <libhcs/data/datas.hpp>
 #include <libhcs/protocol/handler.hpp>
 #include <libhcs/spec/c_board/can.hpp>
@@ -145,11 +146,13 @@ public:
 
     public:
         PacketBuilder& can1_transmit(const libhcs::data::CanDataView& data) {
+            hcs::reject_long_payload(data.can_data, "CAN1");
             if (!builder_.write_can(data::DataId::kCan1, data)) [[unlikely]]
                 throw std::invalid_argument{"CAN1 transmission failed: Invalid CAN data"};
             return *this;
         }
         PacketBuilder& can2_transmit(const libhcs::data::CanDataView& data) {
+            hcs::reject_long_payload(data.can_data, "CAN2");
             if (!builder_.write_can(data::DataId::kCan2, data)) [[unlikely]]
                 throw std::invalid_argument{"CAN2 transmission failed: Invalid CAN data"};
             return *this;

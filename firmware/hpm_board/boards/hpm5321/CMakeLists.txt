@@ -2,12 +2,12 @@ sdk_inc(.)
 sdk_src(board.c)
 
 # This board directory serves BOTH HPM5321 PCBs -- single-CAN and dual-CAN --
-# from one image, so its USB PID is not a build-time constant. The
-# firmware reports 0x5321 or 0x5322 at run time from the OTP board identity (see
-# common/board_identity.hpp and app/src/usb/usb_descriptors.hpp). The definition
-# below is only the fallback baked into the descriptor constant and the value the
-# bootloader reports on a board it recognizes; it is NOT what a merged app
-# enumerates as.
+# from one image. The DFU bootloader reports 0x5321 or 0x5322 at run time from
+# the OTP board identity (common/board_identity.hpp,
+# bootloader/src/usb/usb_descriptors.hpp); the definition below is its fallback.
+# The application does not use it at all: it enumerates as 0x34B7:0x6877, the
+# DM USB2FDCAN identity DMTool accepts (core/include/libhcs/protocol/
+# usb_identity.hpp), and both PCBs tell themselves apart over EP0 instead.
 set_property(GLOBAL PROPERTY libhcs_USB_PID 0x5321)
 sdk_compile_definitions(libhcs_USB_PID=0x5321)
 

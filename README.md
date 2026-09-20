@@ -197,15 +197,17 @@ App 镜像 `*.dfu` 已带好镜像哈希与 DFU 后缀。下面是脚本做的�
 | c_board    | STM32F407VG  | `0xF407` | `HCS DFU Bootloader`      |
 | mc02       | STM32H723VG  | `0x0723` | `HCS DFU Bootloader`      |
 | ch32_board | WCH CH32H417 | `0xD403` | `HCS Bootloader v<版本号>` |
-| hpm_board HPM5321 单 CAN 版 | HPM5321 | `0x5321` | `HCS Agent v<版本号>` |
-| hpm_board HPM5321 双 CAN-FD 版 | HPM5321 | `0x5322` | 同上 |
+| hpm_board HPM5321 单 CAN 版 | HPM5321 | `0x6877`（VID `0x34B7`，见下）；bootloader `0x5321` | `HCS Agent v<版本号>` |
+| hpm_board HPM5321 双 CAN-FD 版 | HPM5321 | `0x6877`（VID `0x34B7`，见下）；bootloader `0x5322` | 同上 |
 | hpm_board `hpm6e8y` | HPM6E8Y | `0x6E84` | 同上 |
 
-VID 均为 `0xA511`。
+VID 除 HPM5321 应用外均为 `0xA511`。
 
-> **两块 HPM5321 板的 PID 由硬件决定，不由 `BOARD` 决定。** `-DBOARD=hpm5321` 出的单个
-> 镜像同时服务这两块板：上电读 OTP 第 25 个字判断板型，据此报 `0x5321` 或 `0x5322` 并选
-> 对应的 CAN/LED 引脚表。所以这两行不再对应两个 `BOARD` 值。原理与已知局限见
+> **HPM5321 应用借用达妙 USB2FDCAN 的身份 `0x34B7:0x6877`**，好让达妙上位机 DMTool 直接
+> 打开本板；host SDK 靠产品串认板，两块板靠 EP0 报告的 CAN 路数区分。DFU bootloader 仍是
+> `0xA511`，PID 由硬件决定：上电读 OTP 第 25 个字判断板型，报 `0x5321` 或 `0x5322`，
+> `-DBOARD=hpm5321` 出的单个镜像同时服务两块板。见
+> [firmware/hpm_board/AGENTS.md](firmware/hpm_board/AGENTS.md)「DMTool 兼容」与
 > [firmware/hpm_board/boards/hpm5321/README.md](firmware/hpm_board/boards/hpm5321/README.md)。
 
 > **`hpm_board` 烧录前必须核对板级变体。** `BOARD` 的默认值是 `hpm5321`。
@@ -242,4 +244,5 @@ cmake --preset debug -S firmware/ch32_board && cmake --build firmware/ch32_board
 | `ch32_board`（CH32H417） | [firmware/ch32_board/AGENTS.md](firmware/ch32_board/AGENTS.md) | [README.md](firmware/ch32_board/README.md) · [PITFALLS.md](firmware/ch32_board/PITFALLS.md)（上板前必读） · [PROGRESS.md](firmware/ch32_board/PROGRESS.md) |
 | `hpm_board`（HPM6E8Y/5321） | [firmware/hpm_board/AGENTS.md](firmware/hpm_board/AGENTS.md) | [BUILD_ENVIRONMENT.md](firmware/hpm_board/BUILD_ENVIRONMENT.md) · [PITFALLS.md](firmware/hpm_board/PITFALLS.md)（选型与踩坑） · [USB_OPTIMIZATION_LOG.md](firmware/hpm_board/USB_OPTIMIZATION_LOG.md)（USB 调优） |
 
-完整文档清单见上表与各板 `AGENTS.md` 的「相关文档」一节。
+完整文档清单见上表与各板 `AGENTS.md` 的「相关文档」一节。线协议（CAN 记录流
+位布局、DLC 表、能力协商、bxCAN 部署约束）见 [core/PROTOCOL.md](core/PROTOCOL.md)。

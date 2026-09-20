@@ -36,6 +36,11 @@ public:
     // type is a property of the bus, and this board's buses are classic by
     // construction -- the CBoard host class offers no way to ask for FD.
     void handle_downlink(const data::CanDataView& data) {
+        // The host SDK refuses long payloads at can_transmit() (this board
+        // never advertises kCapCanFdLongFrames); a peer bug must not overflow
+        // the 8-byte mailbox on a debugless build, so drop instead of assert.
+        if (data.can_data.size() > 8)
+            return;
         auto construct = [&data](std::byte* storage) noexcept {
             auto& mailbox = *new (storage) TransmitMailboxData{};
 
@@ -45,7 +50,6 @@ public:
                  | (data.is_extended_can_id ? CAN_ID_EXT : CAN_ID_STD)
                  | (data.is_remote_transmission ? CAN_RTR_REMOTE : CAN_RTR_DATA) | CAN_TI0R_TXRQ);
 
-            core::utility::assert_debug(data.can_data.size() <= 8);
             mailbox.data_length_and_timestamp = data.can_data.size();
             if (!data.can_data.empty())
                 std::memcpy(mailbox.data, data.can_data.data(), data.can_data.size());

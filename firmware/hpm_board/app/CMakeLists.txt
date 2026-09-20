@@ -145,6 +145,7 @@ sdk_app_inc("${libhcs_PROJECT_ROOT}")
 include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/current_tinyusb.cmake")
 libhcs_add_current_tinyusb(
     src/class/vendor/vendor_device.c
+    src/class/cdc/cdc_device.c
     src/class/dfu/dfu_rt_device.c
 )
 

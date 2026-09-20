@@ -45,6 +45,13 @@ namespace libhcs::core::protocol::vendor_control {
 //   kGetInterface and refused cleanly -- exactly what the fingerprint
 //   continues to do, without the manual step.
 //
+//   v2 -> v3 (2026-09-20, automatic): CanCapabilities gained
+//   kCapCanFdLongFrames, and the CAN record header's retired IsFdCan bit was
+//   repurposed as IsLongFrame (core/src/protocol/protocol.hpp). The data
+//   stream itself is what changed; the fingerprint moves because a peer that
+//   cannot parse long frames must not be handed them, and refusing at
+//   kGetInterface is the mechanism both directions already share.
+//
 // The fingerprint itself lives at the bottom of this file, after every payload
 // it folds over.
 
@@ -115,6 +122,16 @@ enum CanCapabilities : uint8_t {
     // frames at all (measured 0/50 from an FD peer), so mode application is
     // not offered there.
     kCapCanModeSettable = 1U << 0,
+    // The board carries CAN-FD long frames (payloads 12-64 bytes) in BOTH
+    // directions on an FD bus: its RX elements and TX buffers are sized for
+    // 64 bytes, read_uplink forwards them instead of dropping, and the record
+    // stream speaks the IsLongFrame encoding (core/src/protocol/protocol.hpp).
+    // A board that clears this bit also rejects long frames downlink -- the
+    // host SDK enforces the same gate on its side, so neither end has to
+    // guess. Boards whose CAN controller cannot receive FD frames at all
+    // (c_board: bxCAN) clear it trivially; mc02 clears it until its RX FIFO
+    // elements are widened to match its already FD-capable TX path.
+    kCapCanFdLongFrames = 1U << 1,
 };
 
 enum class CanMode : uint8_t {
@@ -367,6 +384,7 @@ constexpr uint16_t layout_fingerprint() {
     fold(static_cast<uint32_t>(CanMode::kCanFd));
     fold(kCanConfigApply);
     fold(kCapCanModeSettable);
+    fold(kCapCanFdLongFrames);
     fold(kUartConfigApply);
     fold(static_cast<uint32_t>(UartWordLength::kUartWordLength7));
     fold(static_cast<uint32_t>(UartWordLength::kUartWordLength8));
