@@ -7,6 +7,7 @@
 #include <common/tusb_types.h>
 #include <device/usbd.h>
 #include <hpm_clock_drv.h>
+#include <hpm_common.h>
 #include <hpm_interrupt.h>
 #include <hpm_mchtmr_drv.h>
 #include <hpm_soc.h>
@@ -75,6 +76,13 @@ void hcs_usb0_isr(void) {
 
 // size 必须与 TinyUSB 0.21 的声明同为 uint32_t: 两份 extern "C" 声明类型不一致时 GCC 不报,
 // 但调用方按 uint32_t 传参。
+//
+// 放 ILM: 下行每个包都从这里进入 deserializer, 它的被调方 (deserializer 协程、
+// memcpy、分发回调、Can::handle_downlink) 全部在 ILM, 自成闭环, 不是
+// USB_OPTIMIZATION_LOG.md 3.2 那种"入口进 ILM、被调方散在 flash"的倒退形态。留在
+// flash 时它的行会不会在两帧之间被挤出 I-cache 取决于无关代码的布局
+// (同文件第 14 节)。
+ATTR_PLACE_AT(".fast")
 void tud_vendor_rx_cb(uint8_t itf, const uint8_t* buffer, uint32_t size) {
     const bool finished = size < g_packet_size;
     const auto payload_size =

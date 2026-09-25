@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <array>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <optional>
 #include <utility>
 
 #include <hpm_clock_drv.h>
@@ -33,6 +35,16 @@ namespace libhcs::firmware::can {
 
 using board::CanMode;
 using board::CanPort;
+
+// 下行帧的装配策略(见 Can::submit_downlink)。端口模式始终是上限 -- 经典模式的端口
+// 发不出 FD -- 策略只回答这一帧想要什么: 要不要 FD / BRS, 以及线上 DLC 是由调用方
+// 给定(explicit_dlc 有值)还是按负载长度推导(std::nullopt)。
+template <typename Policy>
+concept DownlinkFramePolicy = requires(const Policy& policy) {
+    { policy.wants_fd() } -> std::same_as<bool>;
+    { policy.wants_bitrate_switch() } -> std::same_as<bool>;
+    { policy.explicit_dlc() } -> std::same_as<std::optional<uint8_t>>;
+};
 
 class Can : private core::utility::Immovable {
 public:
@@ -136,24 +148,7 @@ public:
         config.can20_samplepoint_max = kNominalSamplePointPerMille;
         config.canfd_samplepoint_min = kDataSamplePointPerMille;
         config.canfd_samplepoint_max = kDataSamplePointPerMille;
-        // 元素扩到 64 字节: DMTool 仿真要收发 DLC 9-15 的 FD 长帧(12-64 字节)。
-        // 64B 元素 18 词/个, 640 词消息 RAM 内: RX FIFO0 20 个(360 词) + TX FIFO
-        // 14 个(252 词) + 过滤器 3 词 = 615 <= 640。RX 深度 32->20(硬件侧),
-        // 突发吸收的差额由软件发送队列(64)与 DM 接收队列(32)承接。
-        config.ram_config.enable_rxbuf = false;
-        config.ram_config.rxbuf_elem_count = 0U;
-        // rxfifos[1] 是经典预设残留(32 元素): 不关则构造函数 RAM 总量 742 词
-        // 超 640, mcan_init 静默失败, 两路控制器全部死掉。
-        config.ram_config.rxfifos[1].enable = false;
-        config.ram_config.rxfifos[1].elem_count = 0U;
-        config.ram_config.std_filter_elem_count = 16U;
-        config.ram_config.ext_filter_elem_count = 16U;
-        config.ram_config.rxfifos[0].elem_count = 8U;
-        config.ram_config.rxfifos[0].data_field_size = MCAN_DATA_FIELD_SIZE_64BYTES;
-        config.ram_config.txbuf_data_field_size = MCAN_DATA_FIELD_SIZE_64BYTES;
-        config.ram_config.txbuf_dedicated_txbuf_elem_count = 0;
-        config.ram_config.txbuf_fifo_or_queue_elem_count = 8U;
-        config.ram_config.txfifo_or_txqueue_mode = MCAN_TXBUF_OPERATION_MODE_FIFO;
+        apply_message_ram_layout(config);
         config.disable_auto_retransmission = true;
 
         // 经时间戳单元 (TSU) 取 64 位硬件时间戳。本 SoC 的 MCAN 没有可用的内部
@@ -267,9 +262,28 @@ public:
     // 转发延迟中的 FLASH-XIP 取指抖动。理由及为何不内联在类内见 can.cpp。
     // handle_uplink 至多从 RX FIFO0 读一帧并返回是否消费了帧, ISR 据此循环
     // 排空 FIFO。
-    // dlc_override: DMTool 长帧的线上 DLC(9-15, 负载 12-64 字节); 0 = 按负载
-    // 长度推导(libhcs 短帧按字节数, 长帧经 DLC 表, 仅限 FD 总线)。
-    void handle_downlink(const data::CanDataView& data, uint8_t dlc_override = 0);
+    // libhcs 下行: 帧型跟端口, 线上 DLC 按负载长度推导(短帧按字节数, 长帧经
+    // DLC 编解码, 仅限 FD 总线)。返回 false = TX 队列满被丢(调用方自行取舍)。
+    bool handle_downlink(const data::CanDataView& data);
+
+    // DMTool 仿真路径的一帧下行请求: 帧型与线上 DLC 都按主机逐帧给出(真适配器
+    // 界面上的 FD / BRS 勾选就是逐帧的; 长帧 DLC 9-15 直传)。本身即一个
+    // DownlinkFramePolicy。
+    struct RequestedFrame {
+        uint8_t wire_dlc;
+        bool fd;
+        bool bitrate_switch;
+
+        [[nodiscard]] constexpr bool wants_fd() const { return fd; }
+        [[nodiscard]] constexpr bool wants_bitrate_switch() const { return bitrate_switch; }
+        [[nodiscard]] constexpr std::optional<uint8_t> explicit_dlc() const { return wire_dlc; }
+    };
+
+    // DMTool 仿真路径的下行(FLASH, 非热路径)。端口能力仍是上限: 经典模式下
+    // 请求 FD 会降级成经典帧, BRS 只在实际发 FD 帧时才置位。
+    // 返回 false = TX 队列满(DMTool 适配器据此对 USB OUT 施加背压, 帧不丢)。
+    bool handle_downlink_as(const data::CanDataView& data, RequestedFrame frame);
+
     bool handle_uplink(core::protocol::FieldId field_id, core::protocol::Serializer& serializer);
     void irq_handler();
 
@@ -355,6 +369,76 @@ public:
     void handle_interrupt_flags(uint32_t flags);
 
 private:
+    // ---- 消息 RAM 布局 ----
+    //
+    // SDK 的默认布局是经典 CAN 预设(8 字节元素、各 32 项), 本板全部重排: 元素
+    // 扩到 64 字节(DMTool 仿真要收发 DLC 9-15 的长帧), 深度按下面的常量。
+    // **超出控制器的 640 词 mcan_init 会静默失败, 两路控制器一起死** -- 所以
+    // 预算在本文件编译期核对, 而不是靠上板才发现。
+    //
+    // 深度的取法: RX 16 让 ISR 迟到一会儿也不丢帧(1 Mbit 经典帧下约 1.8 ms 的
+    // 余量), TX 12 是硬件侧的突发吸收, 再往上由软件发送队列(kTransmitQueueSize
+    // = 64)承接。过滤器 16+16 是 sync 滤波器用的余量。
+    static constexpr uint32_t kStdFilterCount = 16;
+    static constexpr uint32_t kExtFilterCount = 16;
+    static constexpr uint32_t kRxFifoElemCount = 16;
+    static constexpr uint32_t kTxFifoElemCount = 12;
+
+    // 元素字节数与 SDK 的 mcan_config_ram() 同公式: 数据域 + 8 字节头。
+    static constexpr uint32_t kMsgRamElemBytes = 64U + MCAN_MESSAGE_HEADER_SIZE_IN_BYTES;
+    static constexpr uint32_t kMsgRamBytes =
+        (kStdFilterCount * MCAN_FILTER_ELEM_STD_ID_SIZE)
+        + (kExtFilterCount * MCAN_FILTER_ELEM_EXT_ID_SIZE)
+        + ((kRxFifoElemCount + kTxFifoElemCount) * kMsgRamElemBytes)
+        + (kTxFifoElemCount * MCAN_TXEVT_ELEM_SIZE);
+    static_assert(kMsgRamBytes <= MCAN_MSG_BUF_SIZE_IN_WORDS * sizeof(uint32_t));
+
+    // 三处配置(构造、DMTool 重配 reconfigure_timing、还原 restore_default_timing)
+    // 共用同一份布局: 它们必须一致, 否则一次 DMTool 会话之后 libhcs 跑的就是另一
+    // 套深度。自动重传不在其中 -- 那一项三处各有立场, 见各自现场。
+    static void apply_message_ram_layout(mcan_config_t& config) noexcept {
+        config.ram_config.enable_rxbuf = false;
+        config.ram_config.rxbuf_elem_count = 0U;
+        // rxfifos[1] 与 rxbuf 都是经典预设残留, 不关则总量超 640 词。
+        config.ram_config.rxfifos[1].enable = false;
+        config.ram_config.rxfifos[1].elem_count = 0U;
+        config.ram_config.std_filter_elem_count = kStdFilterCount;
+        config.ram_config.ext_filter_elem_count = kExtFilterCount;
+        config.ram_config.rxfifos[0].elem_count = kRxFifoElemCount;
+        config.ram_config.rxfifos[0].data_field_size = MCAN_DATA_FIELD_SIZE_64BYTES;
+        config.ram_config.txbuf_data_field_size = MCAN_DATA_FIELD_SIZE_64BYTES;
+        config.ram_config.txbuf_dedicated_txbuf_elem_count = 0;
+        config.ram_config.txbuf_fifo_or_queue_elem_count = kTxFifoElemCount;
+        config.ram_config.txfifo_or_txqueue_mode = MCAN_TXBUF_OPERATION_MODE_FIFO;
+        // TX event FIFO 本驱动不读(发送完成不产生工作, TX 中断也没开), 但 SDK
+        // 的默认值是经典预设的 32 项, 白占 256 字节。跟着 TX FIFO 走即可。
+        config.ram_config.tx_evt_fifo_elem_count = kTxFifoElemCount;
+        config.ram_config.tx_evt_fifo_watermark = 1U;
+    }
+
+    // libhcs 的下行策略: 三个答案全是编译期常量。实例化后这些判断不留下任何
+    // 指令 -- 尤其 explicit_dlc() 恒为空, "调用方给定 DLC"那条分支与它要占的
+    // 寄存器在 libhcs 路径上根本不存在(曾经是一个运行时参数, 每帧多一次判断,
+    // 还要为它多存取一个 callee-saved 寄存器)。
+    struct PortFrame {
+        static constexpr bool wants_fd() { return true; }
+        static constexpr bool wants_bitrate_switch() { return true; }
+        static constexpr std::optional<uint8_t> explicit_dlc() { return std::nullopt; }
+    };
+    static_assert(DownlinkFramePolicy<PortFrame>);
+    static_assert(DownlinkFramePolicy<RequestedFrame>);
+
+    // 两个下行入口共用的帧装配与入队逻辑 (定义在 can.cpp, 两处调用点各内联
+    // 一份): libhcs 的 handle_downlink 那份留在 ILM, DMTool 的
+    // handle_downlink_as 那份随入口留在 FLASH。强制内联, 因此不产生独立符号,
+    // 也就不会与 .fast 里的普通函数发生段类型冲突。
+    //
+    // 帧型走模板策略而不是运行时参数: 端口策略的答案是编译期常量, 分支被消掉,
+    // canfd_ 的读取也留在原位(布尔参数会迫使它提前读进 callee-saved 寄存器)。
+    template <DownlinkFramePolicy Policy>
+    [[gnu::always_inline]] inline bool
+        submit_downlink(const data::CanDataView& data, Policy policy);
+
     // try_transmit() 的 out-of-line 函数体, 位于 .fast (can.cpp)。发现队列已空
     // 后清掉本控制器在 transmit_pending_mask_ 中的位。
     void drain_transmit_queue();

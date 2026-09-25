@@ -5,7 +5,6 @@
 # include <cstddef>
 
 # include "firmware/hpm_board/app/src/sync/pulse.hpp"
-# include "firmware/hpm_board/app/src/sync/timebase.hpp"
 # include "firmware/hpm_board/app/src/timer/timer.hpp"
 # include "firmware/hpm_board/app/src/utility/interrupt_lock.hpp"
 
@@ -187,7 +186,7 @@ void note_sof(std::uint32_t frindex, std::uint32_t now_quarter_us) {
         const auto distance = static_cast<std::int64_t>(counter - fit_reference_microframe);
         const std::int64_t predicted_q16 =
             (static_cast<std::int64_t>(fit_reference_time) << 16U)
-            + distance * static_cast<std::int64_t>(fit_ticks_per_microframe_q16);
+            + (distance * static_cast<std::int64_t>(fit_ticks_per_microframe_q16));
         const std::int64_t actual_q16 = static_cast<std::int64_t>(now_extended(now_quarter_us))
                                      << 16U;
         const std::int64_t residual_q16 = predicted_q16 - actual_q16;
@@ -256,10 +255,10 @@ void poll(std::uint32_t tick_ms) {
 
     // 斜率偏离标称值几个百分点就不是晶振偏差, 而是窗口损坏; 拒收它, 坏拟合
     // 就根本不会被发布。
-    constexpr std::int64_t kNominalQ16 = static_cast<std::int64_t>(kNominalTicksPerMicroframe)
+    constexpr std::int64_t nominal_q16 = static_cast<std::int64_t>(kNominalTicksPerMicroframe)
                                       << 16U;
-    if (per_microframe_q16 < kNominalQ16 - kNominalQ16 / 32
-        || per_microframe_q16 > kNominalQ16 + kNominalQ16 / 32)
+    if (per_microframe_q16 < nominal_q16 - (nominal_q16 / 32)
+        || per_microframe_q16 > nominal_q16 + (nominal_q16 / 32))
         return;
 
     // 环形缓冲只存定时器低 32 位。把最老样本的全值挂接到当前时间上重建:
@@ -272,7 +271,7 @@ void poll(std::uint32_t tick_ms) {
     // 参考点锚在窗口前缘才能让外推臂最短。
     const std::int64_t mean_y_q16 = (sum_y << 16U) / count;
     const std::int64_t offset_q16 =
-        mean_y_q16 + (slope_q16 * static_cast<std::int64_t>(count - 1U)) / 2;
+        mean_y_q16 + ((slope_q16 * static_cast<std::int64_t>(count - 1U)) / 2);
 
     const utility::InterruptLockGuard guard;
     fit_reference_microframe =

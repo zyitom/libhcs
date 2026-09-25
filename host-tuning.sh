@@ -105,6 +105,7 @@ USB_VENDOR_ID="a511"   # every libhcs board; the product id differs per board
 # identity so DMTool accepts it (core/include/libhcs/protocol/usb_identity.hpp).
 # Genuine DM adapters share that id; the product string tells ours apart. The
 # HPM5321 DFU bootloader stays on a511.
+# 6877 = 单 CAN 应用身份, 6632 = 双 CAN-FD 应用身份; 产品串区分自家板子。
 HPM5321_APP_ID="34b7:6877"
 CHECK_ONLY=0
 PMQOS_ONLY=0
@@ -340,7 +341,8 @@ for d in /sys/bus/usb/devices/*/; do
     PID="$(cat "$d/idProduct" 2>/dev/null || echo '?')"
     PRODUCT="$(cat "$d/product" 2>/dev/null || echo '')"
     if [[ "$VID" != "$USB_VENDOR_ID" ]]; then
-        [[ "$VID:$PID" == "$HPM5321_APP_ID" && "$PRODUCT" == "HCS Agent"* ]] || continue
+        # 34b7 下的应用身份按产品串认(HCS Agent*), PID 随变体增长(6877/6632/...)。
+        [[ "$VID" == "34b7" && "$PRODUCT" == "HCS Agent"* ]] || continue
     fi
     FOUND_BOARD=1
     BUS="$(cat "$d/busnum" 2>/dev/null || echo '?')"

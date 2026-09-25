@@ -234,11 +234,12 @@ private: // 配置描述符
         kItfNumDmData = std::to_underlying(DmInterface::kData),
         kItfNumDmCommand = std::to_underlying(DmInterface::kCommand),
         kItfNumDmCan = std::to_underlying(DmInterface::kCan),
-        kItfNumLibhcs,
-        kItfNumCdc, // CDC 控制接口, 数据接口紧随其后(TUD_CDC_DESCRIPTOR 的约定)
-        kItfNumCdcData,
-        kItfNumDfuRuntime,
-        kItfNumTotal,
+        kItfNumLibhcs = std::to_underlying(DmInterface::kCan) + 1,
+        kItfNumCdc = std::to_underlying(DmInterface::kCan)
+                   + 2, // CDC 控制接口, 数据接口紧随其后(TUD_CDC_DESCRIPTOR 的约定)
+        kItfNumCdcData = std::to_underlying(DmInterface::kCan) + 3,
+        kItfNumDfuRuntime = std::to_underlying(DmInterface::kCan) + 4,
+        kItfNumTotal = std::to_underlying(DmInterface::kCan) + 5,
     };
     static_assert(kItfNumLibhcs == kLibhcsPipe.interface_number);
     static_assert(kItfNumLibhcs == kDmInterfaceCount);
@@ -258,8 +259,8 @@ private: // 配置描述符
     static constexpr size_t kVendorShapedInterfaceCount = kDmInterfaceCount + CFG_TUD_VENDOR;
 
     static constexpr size_t kConfigTotalLen =
-        TUD_CONFIG_DESC_LEN + kVendorShapedInterfaceCount * TUD_VENDOR_DESC_LEN
-        + CFG_TUD_CDC * TUD_CDC_DESC_LEN + CFG_TUD_DFU_RUNTIME * TUD_DFU_RT_DESC_LEN;
+        TUD_CONFIG_DESC_LEN + (kVendorShapedInterfaceCount * TUD_VENDOR_DESC_LEN)
+        + (CFG_TUD_CDC * TUD_CDC_DESC_LEN) + (CFG_TUD_DFU_RUNTIME * TUD_DFU_RT_DESC_LEN);
 
     // 多出来的端点不给 libhcs 数据面添成本: bulk 端点只在主机挂着传输时才被主机
     // 控制器调度, DMTool 不跑它那三对就一次事务都没有(2026-08-07 那次分端点吃掉
@@ -271,12 +272,12 @@ private: // 配置描述符
     // 约 4 s)。
     static constexpr uint8_t kCdcNotifyInterval = 16;
     static constexpr size_t kCdcNotifyIntervalOffset =
-        TUD_CONFIG_DESC_LEN + kVendorShapedInterfaceCount * TUD_VENDOR_DESC_LEN
+        TUD_CONFIG_DESC_LEN + (kVendorShapedInterfaceCount * TUD_VENDOR_DESC_LEN)
         + (8 + 9 + 5 + 5 + 4 + 5) + 6;
 
     // 类内的 lambda 而非成员函数: 成员函数体要到类完整后才可用, 而这两个常量
     // 正是在类体里初始化的。
-    static constexpr auto make_configuration_descriptor = [](uint16_t bulk_size) consteval {
+    static constexpr auto kMakeConfigurationDescriptor = [](uint16_t bulk_size) consteval {
         // 先落 C 数组: 长度由初始化列表推出, 可以与 kConfigTotalLen 对账(std::array
         // 的花括号初始化少给元素只会静默补零)。
         const uint8_t bytes[] = {
@@ -306,8 +307,8 @@ private: // 配置描述符
         return descriptor;
     };
 
-    static constexpr auto kConfigurationDescriptorFs = make_configuration_descriptor(64);
-    static constexpr auto kConfigurationDescriptorHs = make_configuration_descriptor(512);
+    static constexpr auto kConfigurationDescriptorFs = kMakeConfigurationDescriptor(64);
+    static constexpr auto kConfigurationDescriptorHs = kMakeConfigurationDescriptor(512);
 
     // 改的确实是通知端点的 bInterval: TinyUSB 宏的字节布局一变, 编译期即失败。
     static_assert(
@@ -335,22 +336,22 @@ public: // Windows WCID (MS OS 2.0): 免驱 WinUSB 绑定
 
     // MS OS 2.0 描述符集, 字节布局按 "Microsoft OS 2.0 descriptors" 规范手搓
     // (TinyUSB 只给了 BOS 侧的宏, 集合本身自备)。每层 wLength 均含自身。
-    static constexpr auto make_ms_os_20_set = []() consteval {
-        constexpr std::string_view kGuid = "{4E1F6C1A-8B3D-4E7A-9C5B-2F0D1A3B4C5E}";
-        constexpr std::string_view kPropertyName = "DeviceInterfaceGUIDs";
+    static constexpr auto kMakeMsOs20Set = []() consteval {
+        constexpr std::string_view guid = "{4E1F6C1A-8B3D-4E7A-9C5B-2F0D1A3B4C5E}";
+        constexpr std::string_view property_name = "DeviceInterfaceGUIDs";
         // REG_MULTI_SZ: 名与值各为 UTF-16LE 文本加两个 NUL 字符收尾。
-        constexpr std::size_t kNameBytes = (kPropertyName.size() + 2) * 2;
-        constexpr std::size_t kDataBytes = (kGuid.size() + 2) * 2;
-        constexpr std::size_t kRegistryPropertyLength = 8 + kNameBytes + 2 + kDataBytes;
+        constexpr std::size_t name_bytes = (property_name.size() + 2) * 2;
+        constexpr std::size_t data_bytes = (guid.size() + 2) * 2;
+        constexpr std::size_t registry_property_length = 8 + name_bytes + 2 + data_bytes;
         // 头 4 + CompatibleID 8 + SubCompatibleID 8 (MS OS 2.0 是 20 字节; 24 是
         // 1.0 的布局)。
-        constexpr std::size_t kCompatibleIdLength = 20;
-        constexpr std::size_t kFunctionSubsetLength =
-            8 + kCompatibleIdLength + kRegistryPropertyLength;
-        constexpr std::size_t kConfigSubsetLength = 8 + 5 * kFunctionSubsetLength;
-        constexpr std::size_t kTotalLength = 10 + kConfigSubsetLength;
+        constexpr std::size_t compatible_id_length = 20;
+        constexpr std::size_t function_subset_length =
+            8 + compatible_id_length + registry_property_length;
+        constexpr std::size_t config_subset_length = 8 + (5 * function_subset_length);
+        constexpr std::size_t total_length = 10 + config_subset_length;
 
-        std::array<uint8_t, kTotalLength> out{};
+        std::array<uint8_t, total_length> out{};
         std::size_t p = 0;
         const auto le16 = [&out, &p](uint16_t value) {
             out[p++] = static_cast<uint8_t>(value);
@@ -374,14 +375,14 @@ public: // Windows WCID (MS OS 2.0): 免驱 WinUSB 绑定
         le16(0x0000); // MS_OS_20_SET_HEADER_DESCRIPTOR
         le16(0x0000);
         le16(0x0603); // dwWindowsVersion 低/高半字
-        le16(static_cast<uint16_t>(kTotalLength));
+        le16(static_cast<uint16_t>(total_length));
 
         // 配置子集头(配置 0)。
         le16(8);
         le16(0x0001); // MS_OS_20_SUBSET_HEADER_CONFIGURATION
         out[p++] = 0;
         out[p++] = 0;
-        le16(static_cast<uint16_t>(kConfigSubsetLength));
+        le16(static_cast<uint16_t>(config_subset_length));
 
         for (const uint8_t interface :
              {kItfNumDmData, kItfNumDmCommand, kItfNumDmCan, kItfNumLibhcs, kItfNumDfuRuntime}) {
@@ -390,10 +391,10 @@ public: // Windows WCID (MS OS 2.0): 免驱 WinUSB 绑定
             le16(0x0002); // MS_OS_20_SUBSET_HEADER_FUNCTION
             out[p++] = interface;
             out[p++] = 0;
-            le16(static_cast<uint16_t>(kFunctionSubsetLength));
+            le16(static_cast<uint16_t>(function_subset_length));
 
             // CompatibleID "WINUSB": 收件箱 WinUSB 据此绑定该接口。
-            le16(static_cast<uint16_t>(kCompatibleIdLength));
+            le16(static_cast<uint16_t>(compatible_id_length));
             le16(0x0003); // MS_OS_20_FEATURE_COMPATBLE_ID
             for (const char c : std::string_view{"WINUSB"})
                 out[p++] = static_cast<uint8_t>(c);
@@ -403,18 +404,18 @@ public: // Windows WCID (MS OS 2.0): 免驱 WinUSB 绑定
             // DeviceInterfaceGUIDs 注册属性(REG_MULTI_SZ)。WinUSB 绑定后设备接口
             // 以此 GUID 暴露; 按 VID:PID 打开的软件(libusb/DMTool/dfu-util)不读
             // 它, SetupDi 枚举需要。五接口共用一个类 GUID。
-            le16(static_cast<uint16_t>(kRegistryPropertyLength));
+            le16(static_cast<uint16_t>(registry_property_length));
             le16(0x0004); // MS_OS_20_FEATURE_REG_PROPERTY
             le16(0x0007); // REG_MULTI_SZ
-            le16(static_cast<uint16_t>(kNameBytes));
-            utf16(kPropertyName);
-            le16(static_cast<uint16_t>(kDataBytes));
-            utf16(kGuid);
+            le16(static_cast<uint16_t>(name_bytes));
+            utf16(property_name);
+            le16(static_cast<uint16_t>(data_bytes));
+            utf16(guid);
         }
 
         return out;
     };
-    static constexpr auto kMsOs20DescriptorSet = make_ms_os_20_set();
+    static constexpr auto kMsOs20DescriptorSet = kMakeMsOs20Set();
 
     // 布局校验: 按规范的层级结构走一遍 wLength 链 -- 集头 10 字节, 配置子集头
     // 8 字节, 其后 5 个功能子集按各自 wLength 前进(配置子集的 wTotalLength 覆盖
@@ -422,9 +423,9 @@ public: // Windows WCID (MS OS 2.0): 免驱 WinUSB 绑定
     // wLength 写错都是编译错误。
     static constexpr uint16_t kMsOs20SetLength = kMsOs20DescriptorSet.size();
     static constexpr auto kMsOs20Walk = []() consteval {
-        const auto& s = kMsOs20DescriptorSet;
-        const auto rd16 = [&s](std::size_t offset) {
-            return static_cast<uint16_t>(s[offset] | (s[offset + 1] << 8));
+        const auto rd16 = [](std::size_t offset) {
+            return static_cast<uint16_t>(
+                kMsOs20DescriptorSet[offset] | (kMsOs20DescriptorSet[offset + 1] << 8));
         };
         struct Result {
             uint16_t set_end;                         // 走完全部层后的游标, 应等于集合总长
@@ -437,8 +438,8 @@ public: // Windows WCID (MS OS 2.0): 免驱 WinUSB 绑定
         for (std::size_t i = 0; i < 5; ++i)
             q += rd16(q + 6); // function subset wSubsetLength (header offset 6)
         return Result{
-            static_cast<uint16_t>(q + ((q - 10 == config_declared) ? 0 : 1)),
-            static_cast<uint16_t>(q - config_start + 8)};
+            .set_end = static_cast<uint16_t>(q + ((q - 10 == config_declared) ? 0 : 1)),
+            .config_span = static_cast<uint16_t>(q - config_start + 8)};
     }();
     static_assert(kMsOs20Walk.set_end == kMsOs20SetLength);
     static_assert(kMsOs20Walk.config_span == kMsOs20SetLength - 10);

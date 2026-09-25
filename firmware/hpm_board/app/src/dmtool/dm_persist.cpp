@@ -112,7 +112,7 @@ uint16_t crc16_ibm(const uint8_t* data, size_t len) {
 
 // 序列化布局: magic u32 | version u8 | count u8 | pad u16 |
 //             每通道 12B(fd+pad+nominal 4B+data 4B) × 2 | CRC16 u16
-constexpr size_t kPayloadSize = 8U + kChannelCount * 12U;
+constexpr size_t kPayloadSize = 8U + (kChannelCount * 12U);
 
 void serialize(const Config& config, uint8_t* out) {
     std::memset(out, 0, kPayloadSize);
@@ -120,7 +120,7 @@ void serialize(const Config& config, uint8_t* out) {
     out[4] = kVersion;
     out[5] = static_cast<uint8_t>(kChannelCount);
     for (size_t ch = 0; ch < kChannelCount; ch++) {
-        uint8_t* p = out + 8 + ch * 12;
+        uint8_t* p = out + 8 + (ch * 12);
         p[0] = config[ch].fd ? 1U : 0U;
         p[4] = config[ch].nominal_prescaler;
         p[5] = config[ch].nominal_seg1;
@@ -146,7 +146,7 @@ bool deserialize(const uint8_t* in, Config& config) {
     if (crc != crc16_ibm(in, kPayloadSize - 2U))
         return false;
     for (size_t ch = 0; ch < kChannelCount; ch++) {
-        const uint8_t* p = in + 8 + ch * 12;
+        const uint8_t* p = in + 8 + (ch * 12);
         config[ch] = {
             .fd = p[0] != 0,
             .nominal_prescaler = p[4],

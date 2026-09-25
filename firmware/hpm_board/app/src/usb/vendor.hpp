@@ -57,7 +57,11 @@ public:
 
     bool session_allowed() const override { return ep0_handshake_done_; }
 
-    void session_deactivated_callback() override { ep0_handshake_done_ = false; }
+    void session_deactivated_callback() override {
+        ep0_handshake_done_ = false;
+        // libhcs 让出板子: DMTool 端点解除隔离(见 dmtool/dm_adapter.hpp)。
+        dmtool::on_libhcs_session_end();
+    }
 
     bool try_transmit() {
         // 没有 libhcs 会话的主循环轮次交给 DMTool 仿真: 两种主机互斥使用, 这个

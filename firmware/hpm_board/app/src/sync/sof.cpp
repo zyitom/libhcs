@@ -29,16 +29,20 @@ void sof_isr_entry() {
 
     // 用 if constexpr 把关而非交给优化器: 这些是对外设的 volatile 读,
     // 即使消费者是空的 inline 函数, 编译器也必须发射它们。
-    std::uint32_t frame_again = frame;
-    if constexpr (sof_probe::kEnabled)
-        frame_again = usb->FRINDEX & USB_FRINDEX_FRINDEX_MASK;
+    if constexpr (sof_probe::kEnabled) {
+        const std::uint32_t frame_again = usb->FRINDEX & USB_FRINDEX_FRINDEX_MASK;
 
-    // 写一清零, 且只动这一位。
-    usb->USBSTS = USB_USBSTS_SRI_MASK;
+        // 写一清零, 且只动这一位。
+        usb->USBSTS = USB_USBSTS_SRI_MASK;
 
-    timebase::note_sof(frame, now);
-    if constexpr (sof_probe::kEnabled)
+        timebase::note_sof(frame, now);
         sof_probe::note_sof(frame, frame_again, now, status, usb->PORTSC1);
+    } else {
+        // 写一清零, 且只动这一位。
+        usb->USBSTS = USB_USBSTS_SRI_MASK;
+
+        timebase::note_sof(frame, now);
+    }
 }
 
 void sof_init() {

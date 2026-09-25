@@ -206,12 +206,17 @@ public:
     }
 
 private:
+    // 下标在存储之前, 不是随手的顺序。每次入队/出队都要读写下标, 却可能只碰一个
+    // 槽位; RISC-V 的 load/store 立即数偏移只有 12 位(±2 KB), 下标一旦落在大块存储
+    // 之后, 每次访问都要先 lui+add 算地址。CAN 软件发送队列为长帧扩到 64 x 72 B
+    // 之后正是如此: 下行热路径每帧多 4 条指令, 只因为下标被挤到了 4.6 KB 之外。
+    // 放在前面, 下标的偏移只取决于队列在宿主对象里的位置, 与容量、元素大小无关。
+    std::atomic<IndexType> in_{0}, out_{0};
+    static_assert(std::atomic<IndexType>::is_always_lock_free);
+
     struct {
         alignas(T) std::byte data[sizeof(T)];
     } storage_[max_size];
-
-    std::atomic<IndexType> in_{0}, out_{0};
-    static_assert(std::atomic<IndexType>::is_always_lock_free);
 };
 
 } // namespace libhcs::firmware::utility

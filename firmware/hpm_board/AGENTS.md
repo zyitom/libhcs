@@ -84,6 +84,15 @@ config.canfd_samplepoint_min = 875U;   config.canfd_samplepoint_max = 875U;
 成帧与软件路径，见 [USB_OPTIMIZATION_LOG.md](USB_OPTIMIZATION_LOG.md) 与
 [HOST_TUNING.md](../../HOST_TUNING.md)。
 
+## CAN 消息 RAM：只在一处改 [2026-09-21 上板运行正常；burst 过载门槛未测]
+
+四处 `mcan_init` 配置（构造、DMTool 重配 `reconfigure_timing`、其失败救援、libhcs 会话
+还原 `restore_default_timing`）共用 `Can::apply_message_ram_layout()`，深度常量与预算
+`static_assert` 都在 `can.hpp`。**不要在某一处单独改 `ram_config`**：超出每控制器 640 词
+`mcan_init` 静默失败、两路一起死，而四处不一致又会让一次 DMTool 会话之后 libhcs 跑在另一套
+深度上——两种错此前都真实存在过。现行 RX 16 / TX 12 / TX event 12 / 过滤器 16+16 =
+2304/2560 字节。来龙去脉见 [DMTOOL_PROTOCOL.md](DMTOOL_PROTOCOL.md) 6.1 的更正。
+
 ## UART 运行时改波特率：快照，不回读 [实测 2026-08-05]
 
 读 `DLL`/`DLM` **必须在 TX DMA 停稳之后**（DLAB=1 时 `DLL` 与 `THR` 共址，回读动作本身
@@ -171,6 +180,12 @@ init 和 `abort_transmit()` 之后采样，遥测只读快照；`uart_set_baudra
 - **不要把 TinyUSB 热路径放进 ILM**：`TU_ATTR_FAST_FUNC` 加在 `tud_task_ext` 一类
   "入口在热路径、被调方散落在 flash"的函数上是净倒退（包率 +0.11%、主循环 −4.0%）。
   `.fast` 只适合叶子函数或自成闭环的调用子图。机制见 `USB_OPTIMIZATION_LOG.md` 3.2。
+- **每帧热路径不许碰 flash（2026-09-21 起，链接期强制）**：每帧真正执行的代码与只读表——libc 块移动
+  （`memcpy`/`memmove`/`memset`）、4 个 MCAN 叶子函数、自有 4 个收发回调（`tud_vendor_rx_cb`、
+  `can_deserialized_callback`、`uplink_usb.cpp` 两个）、protocol rodata 与 `CSWTCH` 查找表——必须留在 ILM。
+  新增每帧调用要在 `boards/hpm5321/linker/app_flash_uf2.ld` 同步补规则，链接期 `ASSERT` 失配即链接失败。
+  背景：违规时 RTT 由整个镜像的布局决定，任何无关改动都能让 RTT 漂移几 µs；现象、数据与检查方法见
+  `USB_OPTIMIZATION_LOG.md` 第 14 节。
 
 同批落在共享 `firmware/c_board/bsp/tinyusb` 里的改动（**动它之前先读**）：
 
@@ -180,6 +195,8 @@ init 和 `abort_transmit()` 之后采样，遥测只读快照；`uart_set_baudra
 | `CFG_TUD_MEM_DCACHE_ENABLE=0` 时把 `dcd_dcache_*` 编译掉 | `dcd.h` / `usbd.c` | 保留，与下一项合计 +1.24% 包率 |
 | ISR 端点扫描改为只遍历 `ENDPTCOMPLETE` 的置位 | `dcd_ci_hs.c` | 保留，同上（两者缺一都更差） |
 | ~~USB 热路径加 `TU_ATTR_FAST_FUNC` 进 ILM~~ | — | **已撤销**：包率 +0.11%，主循环 −4.0% |
+| 跳过无 sof 驱动的 SOF 遍历（`_usbd_has_sof_driver`） | `usbd.c` | 保留：TIME_SYNC 构建每 125 us 省一次 3 驱动空指针迭代 |
+| CLEAR_FEATURE(HALT) toggle 复位按主机类型门控（MS OS 2.0 探测，6.4 方案②） | `usbd.c` / `usbd.h` | 保留：健康端点的 clear_halt 不再无条件复位设备侧 toggle；Windows 经取 MS OS 2.0 集识别，语义不变 |
 
 tripwire 那项是**真回归修复，不是上游老毛病**：HPM SDK 自带的 `dcd_hpm.c` 实现了
 `set_sutw`/`get_sutw` 重试环，而 0.21 通用的 `dcd_ci_hs.c` 清完 `ENDPTSETUPSTAT` 就直接
@@ -198,15 +215,24 @@ HPM5321 应用同时是一块达妙 USB2FDCAN 适配器：HCS 不跑时可以直
   `core/include/libhcs/protocol/usb_identity.hpp`，主机与固件共用。
 - **端点**：接口 0-2、端点 `0x01-0x03` / `0x81-0x83` 归 DMTool（写死在其二进制里）；libhcs
   管道在接口 3、`0x04` / `0x84`；CDC 在接口 4-5；DFU runtime 在接口 6。
-- **libhcs 优先**：libhcs 会话一建立，DMTool 采集与 CDC 桥全部关闭、队列清空
-  （`dmtool::on_libhcs_session()`）；两者按约定不同时用。
+- **libhcs 优先，握手后 DMTool 零开销**：libhcs 会话一建立，DMTool 采集与 CDC 桥全部
+  关闭、队列清空，**DMTool 的 6 个端点全部 STALL**（`dmtool::on_libhcs_session()`）——
+  否则主机上开着的 DMTool 会让主机控制器持续 NAK 轮询，libhcs RTT 实测右移约 7 µs。会话
+  结束（租约 4 s 到期）时自动解除（`on_libhcs_session_end()`）。两者按约定不同时用：
+  HCS 接管时开着的 DMTool 会报 USB 故障，退出后重新打开。详见
+  [DMTOOL_PROTOCOL.md](DMTOOL_PROTOCOL.md) 第 4 节与 6.4。
 - **热路径不为 DMTool 付代价**：CAN / UART RX ISR 的 libhcs 分支必须与没有 DMTool 时逐条
   相同，无会话分支只许调用 FLASH 里的冷函数。改 `can.cpp`、`uart.hpp`、`vendor.cpp`、
   `app.cpp` 里的接入点后，对照同版本号的旧镜像比一遍反汇编（方法与基线见
   DMTOOL_PROTOCOL.md 第 5 节）。
-- **只转发**：SETUP_BUARD 只核对不重配（与 `kSetCanConfig` 同一立场），设备端重复发送与
-  自增、自测、固件升级、写 SN 一律回失败。在 DMTool 里选 CANFD、仲裁 1M、数据 5M。
-- **CDC 串口**只在按板上 UART 实际波特率（默认 921600）打开时接通，不会去改 UART 波特率。
+- **只转发**：设备端重复发送与自增、自测、适配器自身的固件升级（IAP，命令 0x02/0x03）、
+  写 SN 一律回失败。**但总线参数是 DMTool 说了算**：SETUP_BUARD 按命令重配控制器并切换
+  FD/经典（与 `kSetCanConfig` 的立场不同——那是 libhcs 通道），保存配置（0x10）写 flash，
+  会话首条命令自动套用"保存值或 1M/5M 预设"。帧型按请求逐帧走（端口模式是上限），
+  DMTool 会话期间开自动重传；两者都只影响仿真路径，libhcs 会话建立时
+  `restore_default_timing()` 全部还原。
+- **CDC 串口**：主机设的线路编码（波特率/字长/校验/停止位）会真下发到板上 UART（仅无
+  libhcs 会话时），桥在 DTR + 速率匹配时接通；DMTool 走串口的电机固件升级因此是通的。
 - **udev**：`a511` 规则管不到新身份，需另加（同时让 ModemManager 不探测 CDC 口）：
 
   ```text

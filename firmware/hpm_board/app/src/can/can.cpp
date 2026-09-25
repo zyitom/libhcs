@@ -26,8 +26,8 @@
 
 namespace libhcs::firmware::can {
 
-ATTR_PLACE_AT(".fast")
-void Can::handle_downlink(const data::CanDataView& data, uint8_t dlc_override) {
+template <DownlinkFramePolicy Policy>
+bool Can::submit_downlink(const data::CanDataView& data, Policy policy) {
     mcan_tx_frame_t frame{};
     if (data.is_extended_can_id) {
         frame.use_ext_id = true;
@@ -36,29 +36,25 @@ void Can::handle_downlink(const data::CanDataView& data, uint8_t dlc_override) {
         frame.use_ext_id = false;
         frame.std_id = data.can_id;
     }
-    // 帧类型跟总线走, 不跟帧走。曾按主机头部位逐帧选择; 该位已整体废弃 (见
-    // core/src/protocol/protocol.hpp 的 CanHeaderLayout), 模式即本控制器
-    // 编译期的 CanPort::mode, 主机在构造握手时经 EP0 读回
-    // (libhcs/protocol/vendor_control.hpp)。再读头部位会让主机与板子对线上
-    // 已经定好的帧产生分歧。
-    const bool send_fd = canfd_;
+    // 端口模式是上限: 经典模式下无论请求什么都发经典帧, BRS 只在 FD 帧上有意义。
+    const bool send_fd = canfd_ && policy.wants_fd();
     frame.canfd_frame = send_fd;
-    frame.bitrate_switch = send_fd;
+    frame.bitrate_switch = send_fd && policy.wants_bitrate_switch();
     frame.rtr = data.is_remote_transmission;
 
-    // DLC: <=8 字节按字节数直写; 长帧(负载 12-64 字节)经 DLC 表取线上码
+    // DLC: <=8 字节按字节数直写; 长帧(负载 12-64 字节)经 DLC 编解码取线上码
     // (9-15) -- 4 位字段: 字节数 16 直写会截断成 0, 线上 DLC 0, 接收方全丢。
-    // DMTool 路径由调用方传线上 DLC; libhcs 下行长帧在此推导, 但先验证总线
-    // 仍是 FD: 会话建立后 DMTool 可把总线切回经典, 主机侧的门禁与总线的
-    // 实际模式之间存在竞态窗口, 经典模式没有长帧的表达, 丢弃而非直写。
+    // DMTool 路径由策略给定线上 DLC; libhcs 下行长帧在此推导, 但先验证本帧
+    // 确实以 FD 发出: 会话建立后 DMTool 可把总线切回经典, 主机侧的门禁与总线
+    // 的实际模式之间存在竞态窗口, 经典帧没有长帧的表达, 丢弃而非直写。
     core::utility::assert_debug(data.can_data.size() <= 64);
-    if (dlc_override != 0U) {
-        frame.dlc = dlc_override;
+    if (const auto explicit_dlc = policy.explicit_dlc()) {
+        frame.dlc = *explicit_dlc;
     } else if (data.can_data.size() > 8) {
         // 9-11 等不在 DLC 表内的长度没有线上表达, 同样丢弃。
         const uint8_t wire_dlc = core::protocol::dlc_from_payload_len(data.can_data.size());
         if (!send_fd || wire_dlc == core::protocol::kDlcInvalid)
-            return;
+            return true; // 有意丢弃: 该长度在本端口没有线上表达, 不 hold
         frame.dlc = wire_dlc;
     } else {
         frame.dlc = static_cast<uint8_t>(data.can_data.size());
@@ -80,7 +76,7 @@ void Can::handle_downlink(const data::CanDataView& data, uint8_t dlc_override) {
     if (transmit_buffer_.peek_front() == nullptr
         && mcan_transmit_via_txfifo_nonblocking(can_base_, &frame, nullptr) == status_success) {
         diag::latency::close_downlink();
-        return;
+        return true;
     }
 
     // 压缩进队列元素: T0/T1 加至多 64 个数据字节 (DMTool 长帧引入)。mcan_tx_frame_t
@@ -90,13 +86,39 @@ void Can::handle_downlink(const data::CanDataView& data, uint8_t dlc_override) {
     std::memcpy(queued.header, &frame, sizeof(queued.header));
     std::memcpy(queued.data, frame.data_8, sizeof(queued.data));
 
-    if (!transmit_buffer_.emplace_back(queued)) {
-        led::led->downlink_buffer_full();
-        diag::note_tx_fail(can_index());
-    }
+    // 队列满时返回 false, 由调用方决定丢弃还是施加背压(帧留在 USB 端点等重发)。
+    // LED 与 note_tx_fail 只在真正丢弃的路径上由入口函数点亮。
+    if (!transmit_buffer_.emplace_back(queued))
+        return false;
     // 无论入队是否成功: 被拒绝说明队列已满, 两种情况队列都非空。见
     // Can::drain_pending_transmits()。
     transmit_pending_mask_ |= 1U << can_index();
+    return true;
+}
+
+ATTR_PLACE_AT(".fast")
+bool Can::handle_downlink(const data::CanDataView& data) {
+    // 帧类型跟总线走, 不跟帧走。曾按主机头部位逐帧选择; 该位已整体废弃 (见
+    // core/src/protocol/protocol.hpp 的 CanHeaderLayout), 模式即本控制器
+    // 当前的 FD/经典模式, 主机在构造握手时经 EP0 读回
+    // (libhcs/protocol/vendor_control.hpp)。再读头部位会让主机与板子对线上
+    // 已经定好的帧产生分歧。
+    // libhcs 下行在队列满时丢弃(2026-09-14 决策): 过期控制帧重发不如丢。
+    if (submit_downlink(data, PortFrame{}))
+        return true;
+    led::led->downlink_buffer_full();
+    diag::note_tx_fail(can_index());
+    return false;
+}
+
+// DMTool 仿真路径 (FLASH, 非热路径): 帧型按主机逐帧的请求走, 端口能力是上限。
+// 经典模式的端口上请求 FD 会被降级成经典帧 -- 真适配器也发不出 FD; BRS 只在
+// 实际发 FD 帧时才有意义。达妙电机的 bootloader 是经典 CAN, 升级流程逐帧带的
+// 就是"非 FD", 一律按端口模式发 FD 会让这些帧进不了电机。
+bool Can::handle_downlink_as(const data::CanDataView& data, RequestedFrame frame) {
+    // 队列满时返回 false: DMTool 适配器侧对 0x03 施加背压(不重挂 OUT 端点),
+    // 帧留在 USB 端点等重发, 突发零丢帧(2026-09-22, 电机 IAP 实测)。
+    return submit_downlink(data, frame);
 }
 
 ATTR_PLACE_AT(".fast")
@@ -152,10 +174,10 @@ bool Can::read_uplink(data::CanDataView& data, uint8_t storage[64], bool& valid)
     //   - FD 帧 DLC 0-15 全部经 DLC 表直映 (短帧值与经典一致, 长帧 12-64
     //     字节): RX 元素数据字段已配成 64 字节 (rxfifos[0].data_field_size),
     //     负载完整, 记录流用 IsLongFrame 编码承载。
-    const size_t data_length = rx.rtr ? 0
-                             : rx.canfd_frame
-                                 ? std::min<size_t>(core::protocol::payload_length(rx.dlc), 64)
-                                 : std::min<size_t>(rx.dlc, 8);
+    size_t data_length = 0;
+    if (!rx.rtr)
+        data_length = rx.canfd_frame ? std::min<size_t>(core::protocol::payload_length(rx.dlc), 64)
+                                     : std::min<size_t>(rx.dlc, 8);
 
     data.is_extended_can_id = rx.use_ext_id;
     data.is_remote_transmission = rx.rtr;
@@ -301,7 +323,7 @@ bool Can::reconfigure_timing(bool fd, PhaseTiming nominal, PhaseTiming data) {
     config.mode = mcan_mode_normal;
     config.enable_canfd = fd;
 
-    mcan_bit_timing_param_t nominal_param{
+    const mcan_bit_timing_param_t nominal_param{
         .prescaler = static_cast<uint16_t>(nominal.prescaler),
         .num_seg1 = static_cast<uint16_t>(nominal.seg1),
         .num_seg2 = static_cast<uint16_t>(nominal.seg2),
@@ -366,27 +388,20 @@ bool Can::reconfigure_timing(bool fd, PhaseTiming nominal, PhaseTiming data) {
     config.all_filters_config.std_id_filter_list.mcan_filter_elem_count = 1;
     config.all_filters_config.ext_id_filter_list.filter_elem_list = &ext_sync_filter;
     config.all_filters_config.ext_id_filter_list.mcan_filter_elem_count = 1;
-    config.ram_config.enable_rxbuf = false;
-    config.ram_config.rxbuf_elem_count = 0U;
-    // rxfifos[1] 同样是经典预设残留(32 元素 x 8B = 64 词), 不关则总预算
-    // 679 词超出 640 -- RX FIFO 尾部溢出写进相邻控制器的区域, 接收静默失效。
-    config.ram_config.rxfifos[1].enable = false;
-    config.ram_config.rxfifos[1].elem_count = 0U;
-    config.ram_config.std_filter_elem_count = 16U;
-    config.ram_config.ext_filter_elem_count = 16U;
-    config.ram_config.rxfifos[0].elem_count = 8U;
-    config.ram_config.rxfifos[0].data_field_size = MCAN_DATA_FIELD_SIZE_64BYTES;
-    config.ram_config.txbuf_dedicated_txbuf_elem_count = 0;
-    config.ram_config.txbuf_fifo_or_queue_elem_count = 8U;
-    config.ram_config.txbuf_data_field_size = MCAN_DATA_FIELD_SIZE_64BYTES;
-    config.ram_config.txfifo_or_txqueue_mode = MCAN_TXBUF_OPERATION_MODE_FIFO;
-    config.disable_auto_retransmission = true;
+    apply_message_ram_layout(config);
+    // 本函数只被 DMTool 仿真调用, 这里是全仓库唯一开自动重传的地方。libhcs
+    // 不重传是刻意的(过期的控制指令重发不如丢掉), 但 DMTool 是通用适配器:
+    // 它的电机固件升级一块镜像要连发 1025 帧、全部成功才等到一个 "OK", 丢一帧
+    // 整块作废, 而丢帧对上位机不可见。libhcs 会话建立时 restore_default_timing()
+    // 会连同时序一起把不重传恢复回去。
+    config.disable_auto_retransmission = false;
 
     mcan_deinit(can_base_);
     const mcan_msg_buf_attr_t attr = board::can_message_ram(can_index_);
     (void)mcan_set_msg_buf_attr(can_base_, &attr);
 
-    bool applied = mcan_init(can_base_, &config, can_clock_mhz_ * 1'000'000U) == status_success;
+    const bool applied =
+        mcan_init(can_base_, &config, can_clock_mhz_ * 1'000'000U) == status_success;
     if (!applied) [[unlikely]] {
         // 参数被 SDK 判为非法: 用编译期时序救回端口, 让总线上其他节点保持可用。
         mcan_deinit(can_base_);
@@ -405,18 +420,11 @@ bool Can::reconfigure_timing(bool fd, PhaseTiming nominal, PhaseTiming data) {
         restore.can20_samplepoint_max = kNominalSamplePointPerMille;
         restore.canfd_samplepoint_min = kDataSamplePointPerMille;
         restore.canfd_samplepoint_max = kDataSamplePointPerMille;
-        restore.ram_config.enable_rxbuf = false;
-        restore.ram_config.rxbuf_elem_count = 0U;
-        restore.ram_config.rxfifos[1].enable = false;
-        restore.ram_config.rxfifos[1].elem_count = 0U;
-        restore.ram_config.std_filter_elem_count = 1U;
-        restore.ram_config.ext_filter_elem_count = 1U;
-        restore.ram_config.rxfifos[0].elem_count = 20U;
-        restore.ram_config.rxfifos[0].data_field_size = MCAN_DATA_FIELD_SIZE_64BYTES;
-        restore.ram_config.txbuf_dedicated_txbuf_elem_count = 0;
-        restore.ram_config.txbuf_fifo_or_queue_elem_count = 14U;
-        restore.ram_config.txbuf_data_field_size = MCAN_DATA_FIELD_SIZE_64BYTES;
-        restore.ram_config.txfifo_or_txqueue_mode = MCAN_TXBUF_OPERATION_MODE_FIFO;
+        // 救援路径同样走共用布局: 这里原本是另一套深度(过滤器 1+1/RX 20/TX 14),
+        // 连同 SDK 默认的 32 项 TX event FIFO 合计 2716 字节, 超出控制器的 2560,
+        // mcan_init 会回 status_mcan_ram_out_of_range -- 而返回值在这里是被丢弃的,
+        // 于是"救援"本身把端口救死。
+        apply_message_ram_layout(restore);
         restore.disable_auto_retransmission = true;
         restore.use_timestamping_unit = true;
         restore.tsu_config.enable_tsu = true;
@@ -428,10 +436,10 @@ bool Can::reconfigure_timing(bool fd, PhaseTiming nominal, PhaseTiming data) {
         restore.tsu_config.prescaler = 1;
         restore.timestamp_cfg.counter_prescaler = 1;
         restore.timestamp_cfg.timestamp_selection = MCAN_TIMESTAMP_SEL_EXT_TS_VAL_USED;
-        mcan_filter_elem_t std_restore = std_sync_filter;
+        const mcan_filter_elem_t std_restore = std_sync_filter;
         restore.all_filters_config.std_id_filter_list.filter_elem_list = &std_restore;
         restore.all_filters_config.std_id_filter_list.mcan_filter_elem_count = 1;
-        mcan_filter_elem_t ext_restore = ext_sync_filter;
+        const mcan_filter_elem_t ext_restore = ext_sync_filter;
         restore.all_filters_config.ext_id_filter_list.filter_elem_list = &ext_restore;
         restore.all_filters_config.ext_id_filter_list.mcan_filter_elem_count = 1;
         (void)mcan_init(can_base_, &restore, can_clock_mhz_ * 1'000'000U);
@@ -463,20 +471,7 @@ bool Can::restore_default_timing() {
     config.can20_samplepoint_max = kNominalSamplePointPerMille;
     config.canfd_samplepoint_min = kDataSamplePointPerMille;
     config.canfd_samplepoint_max = kDataSamplePointPerMille;
-    config.ram_config.enable_rxbuf = false;
-    config.ram_config.rxbuf_elem_count = 0U;
-    // rxfifos[1] 同样是经典预设残留(32 元素 x 8B = 64 词), 不关则总预算
-    // 679 词超出 640 -- RX FIFO 尾部溢出写进相邻控制器的区域, 接收静默失效。
-    config.ram_config.rxfifos[1].enable = false;
-    config.ram_config.rxfifos[1].elem_count = 0U;
-    config.ram_config.std_filter_elem_count = 16U;
-    config.ram_config.ext_filter_elem_count = 16U;
-    config.ram_config.rxfifos[0].elem_count = 8U;
-    config.ram_config.rxfifos[0].data_field_size = MCAN_DATA_FIELD_SIZE_64BYTES;
-    config.ram_config.txbuf_dedicated_txbuf_elem_count = 0;
-    config.ram_config.txbuf_fifo_or_queue_elem_count = 8U;
-    config.ram_config.txbuf_data_field_size = MCAN_DATA_FIELD_SIZE_64BYTES;
-    config.ram_config.txfifo_or_txqueue_mode = MCAN_TXBUF_OPERATION_MODE_FIFO;
+    apply_message_ram_layout(config);
     config.disable_auto_retransmission = true;
     config.use_timestamping_unit = true;
     config.tsu_config.enable_tsu = true;

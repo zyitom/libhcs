@@ -51,10 +51,10 @@ constexpr uint8_t kCdcInterface = 0; // 唯一的 CDC 实例
 // 读版本的应答: 产品串加结尾 NUL。DMTool 原样显示它, 并对它 strlen 后找 "boot"
 // 判断设备是否停在 bootloader(CheckIsBoot) -- 所以 NUL 必须随负载发出。
 constexpr auto kVersionPayload = [] {
-    constexpr std::string_view kVersion = usb::UsbDescriptors::product_string();
-    static_assert(kVersion.find("boot") == std::string_view::npos);
-    std::array<uint8_t, kVersion.size() + 1> bytes{};
-    std::ranges::transform(kVersion, bytes.begin(), [](char c) { return static_cast<uint8_t>(c); });
+    constexpr std::string_view version = usb::UsbDescriptors::product_string();
+    static_assert(version.find("boot") == std::string_view::npos);
+    std::array<uint8_t, version.size() + 1> bytes{};
+    std::ranges::transform(version, bytes.begin(), [](char c) { return static_cast<uint8_t>(c); });
     return bytes;
 }();
 
@@ -69,9 +69,9 @@ static_assert(kMaxAckSize < 64);
 // ns, 比真实时间慢; 与 CAN 驱动的微秒换算(board::kCanTimestampNsPerUs)是同一个
 // 修正。64 位除法, 所以在主循环里做。
 constexpr uint64_t to_real_ns(uint32_t sec, uint32_t ns) {
-    constexpr uint64_t kDivisor = board::kCanTimestampNsPerUs;
+    constexpr uint64_t divisor = board::kCanTimestampNsPerUs;
     const uint64_t raw = (uint64_t{sec} * 1'000'000'000U) + ns;
-    return (raw / kDivisor * 1000U) + (raw % kDivisor * 1000U / kDivisor);
+    return (raw / divisor * 1000U) + (raw % divisor * 1000U / divisor);
 }
 static_assert(to_real_ns(0, board::kCanTimestampNsPerUs) == 1000);
 
@@ -93,10 +93,6 @@ can::Can* channel_can(uint8_t channel) {
     if (channel >= kChannelCount || channel >= can::can_count())
         return nullptr;
     return can::can_array[channel].try_get();
-}
-
-uint32_t bitrate_of(const can::Can::PhaseTiming& timing, uint32_t clock_hz) {
-    return clock_hz / timing.prescaler / (1U + timing.seg1 + timing.seg2);
 }
 
 // 控制器位时序折成 DMTool 的字段。DMTool 按 80 MHz 位时钟解释分频, 时钟不同或字段
@@ -215,7 +211,7 @@ public:
     void on_transfer(uint8_t endpoint_address, xfer_result_t result, uint32_t size) {
         if (tu_edpt_dir(endpoint_address) == TUSB_DIR_IN)
             return;
-        for (uint8_t index = 0; index < endpoints_.size(); ++index) {
+        for (std::size_t index = 0; index < endpoints_.size(); ++index) {
             const auto& out = endpoints_[index].out;
             if (out.address != endpoint_address)
                 continue;
@@ -225,6 +221,7 @@ public:
                     std::span{g_endpoint_buffers[index].out}.first(
                         std::min<std::size_t>(size, CFG_TUD_VENDOR_EPSIZE)),
                     size < out.packet_size);
+            // kCan 通道 hold 时不重挂: 帧留在 DMA 缓冲, 队列疏干后由 poll() 续帧。
             arm_out(index);
             return;
         }
@@ -233,12 +230,41 @@ public:
     // 总线复位: 端点随之关闭, 状态作废。
     void on_usb_reset() {
         endpoints_ = {};
+        isolated_ = false;
         reset();
+    }
+
+    // ---- 端点隔离(libhcs 会话期间, 见 dm_adapter.hpp) ----
+
+    void isolate() {
+        isolated_ = true;
+        // STALL 顺带 flush 掉在途传输(dcd_ci_hs 的 dcd_edpt_stall), 之后控制器对
+        // 这些端点的每个令牌都直接回 STALL, 不产生中断与事件。
+        for_each_endpoint([this](uint8_t address) { usbd_edpt_stall(rhport_, address); });
+    }
+
+    void release() {
+        if (!isolated_)
+            return;
+        isolated_ = false;
+        for_each_endpoint([this](uint8_t address) { usbd_edpt_clear_stall(rhport_, address); });
+        for (std::size_t index = 0; index < endpoints_.size(); ++index)
+            arm_out(static_cast<uint8_t>(index));
+    }
+
+    // 主机对本驱动某端点发了 CLEAR_FEATURE(ENDPOINT_HALT); usbd 已经先执行了
+    // usbd_edpt_clear_stall。隔离期间要重新 stall -- DMTool 每条命令前都对 0x02 /
+    // 0x82 做 clear_halt, 不重新 stall 的话, 用户在 DMTool 里点一下按钮就能把命令
+    // 送进来。不在隔离期时什么都不做(clear_halt 与 data toggle 的问题见
+    // DMTOOL_PROTOCOL.md 6.4, 修法待定)。
+    void on_clear_halt(uint8_t address) {
+        if (isolated_ && interface_of(address))
+            usbd_edpt_stall(rhport_, address);
     }
 
     // ---- CDC ----
 
-    void on_cdc_rx() {
+    void on_cdc_rx() const {
         // 桥没开时照样把 FIFO 读空: 没按 UART 波特率打开的串口(ModemManager 之类
         // 的探测)发来的字节不能留着, 更不能上 UART。
         std::array<uint8_t, 64> chunk{};
@@ -374,6 +400,26 @@ private:
             rhport_, in.address, g_endpoint_buffers[index].in, static_cast<uint16_t>(size), false);
     }
 
+    // 端点地址 -> DMTool 接口序号; 不是本驱动的端点返回空。
+    [[nodiscard]] std::optional<uint8_t> interface_of(uint8_t address) const {
+        for (std::size_t index = 0; index < endpoints_.size(); ++index) {
+            const auto& pair = endpoints_[index];
+            if (address != 0 && (pair.in.address == address || pair.out.address == address))
+                return static_cast<uint8_t>(index);
+        }
+        return std::nullopt;
+    }
+
+    template <typename F>
+    void for_each_endpoint(F f) const {
+        for (const auto& pair : endpoints_) {
+            for (const auto& endpoint : {pair.out, pair.in}) {
+                if (endpoint.address != 0)
+                    f(endpoint.address);
+            }
+        }
+    }
+
     void on_out_packet(DmInterface interface, std::span<const uint8_t> packet, bool end) {
         switch (interface) {
         case DmInterface::kCommand:
@@ -382,10 +428,14 @@ private:
             });
             return;
         case DmInterface::kCan: {
-            // 一帧一次传输是 DMTool 的用法, 连续多帧也照样逐帧拆。
+            // 一帧一次传输是 DMTool 的用法, 连续多帧也照样逐帧拆。队列满: 帧丢弃
+            // (2026-09-14 决策)。背压 hold 实测有致命缺陷: 电机 CAN 不应答(擦除
+            // 窗口)时 M_CAN FIFO 被自动重传永久钉死, 队列永不疏干, hold 永不释放,
+            // EP 0x03 整体卡死 -- 除非把队列加深到能装下整个擦除窗口(待测量)。
             auto rest = packet;
             while (const auto request = protocol::parse_transmit_request(rest)) {
-                transmit(*request);
+                if (!transmit(*request))
+                    led::led->downlink_buffer_full(); // 队列满丢弃(2026-09-14 决策)
                 rest = rest.subspan(request->encoded_size);
             }
             return;
@@ -399,72 +449,83 @@ private:
     // ---- 命令 ----
 
     void handle_command(const protocol::CommandParser::Frame& frame) {
+        ensure_session_timing();
         const uint8_t command = frame.command;
         const auto payload = frame.payload;
         switch (static_cast<Command>(command)) {
-        case Command::kReadVersion: return ack(command, AckStatus::kOk, kVersionPayload);
-        case Command::kGetUuid: return ack(command, AckStatus::kOk, read_uuid());
-        case Command::kGetSerial: return reply_serial(command);
-        case Command::kStartCapture: return ack(command, start_capture(payload));
-        case Command::kStopCapture: return ack(command, stop_capture(payload));
-        case Command::kSetupBaudrate: return ack(command, check_baudrate(payload));
-        case Command::kGetBaudrate: return reply_baudrate(command, payload);
+        case Command::kReadVersion: ack(command, AckStatus::kOk, kVersionPayload); return;
+        case Command::kGetUuid: ack(command, AckStatus::kOk, read_uuid()); return;
+        case Command::kGetSerial: reply_serial(command); return;
+        case Command::kStartCapture: ack(command, start_capture(payload)); return;
+        case Command::kStopCapture: ack(command, stop_capture(payload)); return;
+        case Command::kSetupBaudrate: ack(command, check_baudrate(payload)); return;
+        case Command::kGetBaudrate: reply_baudrate(command, payload); return;
 
         // 本板没有可保存、可恢复出厂的参数(总线参数是编译期事实), 现状就是"已保存的
         // 出厂状态"; 应用本就不在 bootloader 里; 设备端从不重复发送, 没有可停的。
-        case Command::kSaveParameters: return ack(command, save_config());
+        case Command::kSaveParameters: ack(command, save_config()); return;
         case Command::kRecoveryFactory:
         case Command::kJumpOutLoader:
-        case Command::kStopPeriodicSend: return ack(command, AckStatus::kOk);
+        case Command::kStopPeriodicSend: ack(command, AckStatus::kOk); return;
 
         // 固件升级、自测、写 SN 一律不做。回失败让 DMTool 报错, 绝不让它以为升级
         // 成功了(IAP 数据包超出解析器负载上限, 同样走到这里)。
         case Command::kIapPacket:
         case Command::kIapEnd:
         case Command::kStartTest:
-        case Command::kWriteSerial: return ack(command, AckStatus::kFailed);
+        case Command::kWriteSerial: ack(command, AckStatus::kFailed); return;
         }
         ack(command, AckStatus::kFailed); // 未知命令
+    }
+
+    // 每次会话把总线摆到 DMTool 认得的时序, 只做一次(preset_applied_ 由
+    // reset() 清除, 即总线复位与 libhcs 让位各算一次新会话)。
+    //
+    // 复位后控制器跑的是 SDK 求解解(分频1/seg1 69/seg2 10), 它不在 DMTool 的
+    // 预设表(can_seg_table / can_fd_seg_table)里 -- "更新配置"按表回查会查不到,
+    // 界面毫无反应。套用预设后读回值与表项逐一对应, 更新/配置/保存的闭环才成立。
+    //
+    // 触发点是会话的第一条命令而不是第一次 START_CAP: DMTool 的打开顺序随版本
+    // 而异(2.1.6.7 打开即 START_CAP, 更早的版本先读版本/读波特率), 连接前先读
+    // 一次波特率同样要读到表里有的值。
+    void ensure_session_timing() {
+        if (preset_applied_ || link::uplink_enabled())
+            return;
+        preset_applied_ = true;
+
+        // 每通道: flash 里有保存配置(0x10 写入, 掉电保持)则优先套用, 否则
+        // 套用 DMTool 的 1M/5M 默认预设(见 dm_persist.hpp / can.hpp)。
+        constexpr can::Can::PhaseTiming default_nominal{
+            .prescaler = 2, .seg1 = 29, .seg2 = 10, .sjw = 2};
+        constexpr can::Can::PhaseTiming default_data{
+            .prescaler = 2, .seg1 = 5, .seg2 = 2, .sjw = 2};
+        for (std::size_t i = 0; i < can::can_count(); ++i) {
+            auto* can = can::can_array[i].try_get();
+            if (can == nullptr) [[unlikely]]
+                continue;
+            if (!saved_config_) {
+                (void)can->reconfigure_timing(true, default_nominal, default_data);
+                continue;
+            }
+            const auto& st = (*saved_config_)[i];
+            const can::Can::PhaseTiming nominal{
+                .prescaler = st.nominal_prescaler,
+                .seg1 = st.nominal_seg1,
+                .seg2 = st.nominal_seg2,
+                .sjw = st.nominal_sjw};
+            const can::Can::PhaseTiming data{
+                .prescaler = st.data_prescaler,
+                .seg1 = st.data_seg1,
+                .seg2 = st.data_seg2,
+                .sjw = st.data_sjw};
+            (void)can->reconfigure_timing(st.fd, nominal, data);
+        }
     }
 
     AckStatus start_capture(std::span<const uint8_t> payload) {
         // libhcs 会话期间不接 DMTool: libhcs 优先(见 dm_adapter.hpp)。
         if (payload.size() != 1 || channel_can(payload[0]) == nullptr || link::uplink_enabled())
             return AckStatus::kFailed;
-        // 每次会话首次采集前套用 DMTool 的 1M/5M 预设时序: 复位后控制器跑的是
-        // SDK 求解解(分频1/seg1 69/seg2 10), 它不在 DMTool 的任何预设表里 --
-        // "更新配置"按表回查会查不到, 界面毫无反应。套用预设后读回值与表项
-        // 逐一对应, 更新/配置/保存的闭环才成立。
-        if (!preset_applied_) {
-            // 每通道: flash 里有保存配置(0x10 写入, 掉电保持)则优先套用, 否则
-            // 套用 DMTool 的 1M/5M 默认预设(见 dm_persist.hpp / can.hpp)。
-            const can::Can::PhaseTiming default_nominal{
-                .prescaler = 2, .seg1 = 29, .seg2 = 10, .sjw = 2};
-            const can::Can::PhaseTiming default_data{
-                .prescaler = 2, .seg1 = 5, .seg2 = 2, .sjw = 2};
-            for (std::size_t i = 0; i < can::can_count(); ++i) {
-                auto* can = can::can_array[i].try_get();
-                if (can == nullptr) [[unlikely]]
-                    continue;
-                if (saved_config_) {
-                    const auto& st = (*saved_config_)[i];
-                    const can::Can::PhaseTiming nominal{
-                        .prescaler = st.nominal_prescaler,
-                        .seg1 = st.nominal_seg1,
-                        .seg2 = st.nominal_seg2,
-                        .sjw = st.nominal_sjw};
-                    const can::Can::PhaseTiming data{
-                        .prescaler = st.data_prescaler,
-                        .seg1 = st.data_seg1,
-                        .seg2 = st.data_seg2,
-                        .sjw = st.data_sjw};
-                    (void)can->reconfigure_timing(st.fd, nominal, data);
-                } else {
-                    (void)can->reconfigure_timing(true, default_nominal, default_data);
-                }
-            }
-            preset_applied_ = true;
-        }
         const uint8_t channel = payload[0];
         (void)rx_queues_[channel].clear(); // 采集关着时生产者不入队, 清的只是旧帧
         capture_mask_ = static_cast<uint8_t>(capture_mask_ | (1U << channel));
@@ -544,19 +605,21 @@ private:
     // 速率, 其余拒绝。参数范围(段数上下限、数据段分频上限)交给 SDK 的低级校验,
     // 拒绝时 reconfigure_timing 恢复编译期配置, 端口保持原样。经典模式(fd=0)
     // 对 FD 控制器是合法请求 -- DMTool 的 CAN2.0/FDCAN 开关随命令到来。
-    AckStatus check_baudrate(std::span<const uint8_t> payload) {
+    static AckStatus check_baudrate(std::span<const uint8_t> payload) {
         const auto config = protocol::BaudrateConfig::decode(payload);
-        can::Can* can = config ? channel_can(config->channel) : nullptr;
+        if (!config.has_value())
+            return AckStatus::kFailed;
+        can::Can* can = channel_can(config->channel);
         if (can == nullptr)
             return AckStatus::kFailed;
 
-        constexpr uint32_t kDmClockHz = protocol::BaudrateConfig::kClockHz;
+        constexpr uint32_t dm_clock_hz = protocol::BaudrateConfig::kClockHz;
         const uint32_t board_clock = can->bit_timing().clock_hz;
         if (board_clock == 0)
             return AckStatus::kFailed;
 
         const auto scale_prescaler = [&](uint32_t dm_prescaler) -> std::optional<uint32_t> {
-            const uint64_t scaled = static_cast<uint64_t>(dm_prescaler) * kDmClockHz;
+            const uint64_t scaled = static_cast<uint64_t>(dm_prescaler) * dm_clock_hz;
             if (dm_prescaler == 0 || scaled % board_clock != 0)
                 return std::nullopt;
             return static_cast<uint32_t>(scaled / board_clock);
@@ -595,15 +658,19 @@ private:
     // 读波特率回硬件事实: 控制器里实际的位时序, 而不是最近一次设置的请求值。
     void reply_baudrate(uint8_t command, std::span<const uint8_t> payload) {
         const can::Can* can = payload.size() == 1 ? channel_can(payload[0]) : nullptr;
-        if (can == nullptr)
-            return ack(command, AckStatus::kFailed);
+        if (can == nullptr) {
+            ack(command, AckStatus::kFailed);
+            return;
+        }
 
         const auto timing = can->bit_timing();
         const auto nominal = to_dm_timing(timing.nominal, timing.clock_hz);
         const auto data = can->is_fd() ? to_dm_timing(timing.data, timing.clock_hz)
                                        : std::optional{protocol::PhaseTiming{}};
-        if (!nominal || !data)
-            return ack(command, AckStatus::kFailed);
+        if (!nominal || !data) {
+            ack(command, AckStatus::kFailed);
+            return;
+        }
 
         const protocol::BaudrateConfig config{
             .channel = payload[0],
@@ -662,37 +729,46 @@ private:
 
     // ---- CAN 发送 ----
 
-    // 只转发: 帧类型跟总线走(与 libhcs 下行同一规则, Can::handle_downlink), FD
-    // 端口一律发 FD + BRS, 请求里的 FD/BRS 位只是 DMTool 界面上的选择; 设备端重复
-    // 发送(发送次数 > 1)与 ID/数据自增不实现, 每个请求只发一次。回显报的是实际上
-    // 线的帧型, 发不出去的帧回显为发送失败。
-    void transmit(const protocol::TransmitRequest& request) {
+    // 只转发: 帧型按请求逐帧走(端口模式是上限, 见 Can::handle_downlink_as) --
+    // 界面上勾的 FD/BRS 就是这一帧的帧型, 达妙电机 bootloader 那种"经典帧"的
+    // 请求因此不会被当成 FD 发出去。设备端重复发送(发送次数 > 1)与 ID/数据自增
+    // 不实现, 每个请求只发一次。回显报的是实际上线的帧型, 发不出去的帧回显为
+    // 发送失败。
+    bool transmit(const protocol::TransmitRequest& request) {
         can::Can* can = channel_can(request.channel);
         const bool id_valid = request.flags.extended || request.id <= 0x7FFU;
         const bool delivered = can != nullptr && id_valid && request.payload.size() <= 64
                             && !link::uplink_enabled(); // libhcs 会话期间 DMTool 不上总线
 
+        // 实际上线的帧型: 经典端口发不出 FD, BRS 只在 FD 帧上有意义。
+        const bool fd = can != nullptr && can->is_fd() && request.flags.fd;
+        const bool bitrate_switch = fd && request.flags.bitrate_switch;
+
+        bool delivered_ok = true;
         if (delivered) {
             diag::latency::abandon_downlink(); // 不是 libhcs 包, 不进它的延迟拆解
-            can->handle_downlink(
+            delivered_ok = can->handle_downlink_as(
                 {
                     .can_id = request.id,
                     .can_data = std::as_bytes(request.payload),
                     .is_extended_can_id = request.flags.extended,
                     .is_remote_transmission = request.flags.remote,
                 },
-                request.dlc); // 长帧: 线上 DLC(9-15)直传, 短帧按负载长度
+                {
+                    .wire_dlc = request.dlc, // 长帧 DLC 9-15 直传
+                    .fd = request.flags.fd,
+                    .bitrate_switch = request.flags.bitrate_switch,
+                });
         }
 
         // DMTool 表格里的发送行只来自 0x83 回显, 采集本路时才回。
         if (request.channel >= kChannelCount || ((capture_mask_ >> request.channel) & 1U) == 0)
-            return;
-        const bool fd = can != nullptr ? can->is_fd() : request.flags.fd;
+            return true; // 回显未开: 无记录可发
         const protocol::CanFrameFlags flags{
             .extended = request.flags.extended,
             .remote = request.flags.remote,
             .fd = fd,
-            .bitrate_switch = fd,
+            .bitrate_switch = bitrate_switch,
         };
         const auto [sec, ns] = ptpc_now();
         CanFrameEvent frame{
@@ -706,6 +782,7 @@ private:
         std::ranges::copy(request.payload.first(copied), frame.data.begin());
         (void)echo_queue_.push_back(
             {.frame = frame, .channel = request.channel, .delivered = delivered});
+        return delivered_ok;
     }
 
     // ---- 记录流 ----
@@ -722,23 +799,24 @@ private:
             return;
         const auto index = std::to_underlying(interface);
         const std::size_t limit = endpoints_[index].in.packet_size - 1U;
-        const std::size_t used = encoder(std::span{g_endpoint_buffers[index].in}.first(limit));
+        const std::size_t used =
+            std::forward<Encoder>(encoder)(std::span{g_endpoint_buffers[index].in}.first(limit));
         if (used != 0)
             send_in(interface, used);
     }
 
     // 从 queue 头部取事件编码进 out[used..], 放不下的留在队列里。
-    template <typename Event, std::size_t kDepth, typename ToRecord>
+    template <typename Event, std::size_t depth, typename ToRecord>
     static std::size_t encode_from(
-        utility::RingBuffer<Event, kDepth>& queue, std::span<uint8_t> out, std::size_t used,
-        ToRecord&& to_record) {
+        utility::RingBuffer<Event, depth>& queue, std::span<uint8_t> out, std::size_t used,
+        ToRecord to_record) {
         while (const Event* event = queue.peek_front()) {
             const std::size_t written =
                 protocol::encode_record(to_record(*event), out.subspan(used));
             if (written == 0)
                 break;
             used += written;
-            (void)queue.pop_front([](Event&&) noexcept {});
+            (void)queue.pop_front([](const Event&) noexcept {});
         }
         return used;
     }
@@ -767,7 +845,7 @@ private:
                 break;
             std::size_t count = 0;
             (void)uart_to_cdc_.pop_front_n(
-                [&chunk, &count](std::byte&& byte) noexcept {
+                [&chunk, &count](const std::byte& byte) noexcept {
                     chunk[count++] = std::to_integer<uint8_t>(byte);
                 },
                 std::min<std::size_t>(room, chunk.size()));
@@ -781,7 +859,7 @@ private:
     // ---- 闸 ----
 
     // 把主循环侧的状态发布给 ISR 与主循环闸(dm_adapter.hpp)。
-    void publish() {
+    void publish() const {
         uint8_t service = 0;
         if (capture_mask_ != 0)
             service |= kServiceCapture;
@@ -813,8 +891,13 @@ private:
     bool cdc_dtr_ = false;
     uint32_t cdc_bit_rate_ = 0;
     bool cdc_bridge_ = false;
-    // 本会话是否已套用过 1M/5M 预设时序(见 start_capture)。reset() 清除。
+    // 本会话是否已套用过预设/保存的时序(见 ensure_session_timing)。reset() 清除。
     bool preset_applied_ = false;
+    // libhcs 会话期间端点处于 STALL 隔离(isolate / release)。
+    // ---- 下行背压(2026-09-22, 电机 IAP 突发零丢帧) ----
+    // CAN TX 软件队列满时, 帧留在 EP 0x03 的 DMA 缓冲, 端点不重挂(主机 NAK
+    // 自适应), 队列疏干后从断点续帧。仅 kCan 通道; 命令/心跳即时处理。
+    bool isolated_ = false;
     // 待写的 flash 保存(保存配置 ACK 先回, 写入随后)。
     bool save_pending_ = false;
     persist::Config save_snapshot_{};
@@ -830,7 +913,7 @@ constinit Adapter::Lazy adapter{};
 template <typename F>
 void with_adapter(F&& f) {
     if (auto* instance = adapter.try_get())
-        f(*instance);
+        std::forward<F>(f)(*instance);
 }
 
 // ---- TinyUSB 应用类驱动 ----
@@ -854,11 +937,19 @@ uint16_t driver_open(uint8_t rhport, const tusb_desc_interface_t* interface, uin
 }
 
 // 只会收到转给端点所属驱动的标准请求(CLEAR_FEATURE 等, usbd 不看返回值)与指向
-// 本接口的类请求; 后者本驱动一概不支持。
+// 本接口的类请求; 后者本驱动一概不支持。usbd 对标准端点请求只在 SETUP 阶段调用
+// 一次, 且在它回状态包之前 -- 隔离期间的重新 stall 因此赶在主机下一次传输之前。
 bool driver_control_xfer(uint8_t rhport, uint8_t stage, const tusb_control_request_t* request) {
     (void)rhport;
-    (void)stage;
-    return request->bmRequestType_bit.type == TUSB_REQ_TYPE_STANDARD;
+    if (request->bmRequestType_bit.type != TUSB_REQ_TYPE_STANDARD)
+        return false;
+    if (stage == CONTROL_STAGE_SETUP
+        && request->bmRequestType_bit.recipient == TUSB_REQ_RCPT_ENDPOINT
+        && request->bRequest == TUSB_REQ_CLEAR_FEATURE
+        && request->wValue == TUSB_REQ_FEATURE_EDPT_HALT) {
+        with_adapter([request](Adapter& a) { a.on_clear_halt(tu_u16_low(request->wIndex)); });
+    }
+    return true;
 }
 
 bool driver_xfer(uint8_t rhport, uint8_t endpoint, xfer_result_t result, uint32_t size) {
@@ -907,7 +998,14 @@ void on_libhcs_session() {
         if (auto* can = can::can_array[i].try_get(); can != nullptr)
             (void)can->restore_default_timing();
     }
-    with_adapter([](Adapter& a) { a.reset(); });
+    with_adapter([](Adapter& a) {
+        a.reset();
+        a.isolate();
+    });
+}
+
+void on_libhcs_session_end() {
+    with_adapter([](Adapter& a) { a.release(); });
 }
 
 // TinyUSB 回调, 与 vendor 回调一样从 tud_task() 在主循环运行。

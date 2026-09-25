@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <utility>
 
 #include "core/include/libhcs/protocol/can_dlc.hpp"
 
@@ -105,7 +106,7 @@ public:
     void feed(std::span<const uint8_t> bytes, bool end_of_transfer, OnFrame&& on_frame) {
         for (const uint8_t byte : bytes) {
             if (const auto frame = push(byte))
-                on_frame(*frame);
+                std::forward<OnFrame>(on_frame)(*frame);
         }
         if (end_of_transfer)
             reset();

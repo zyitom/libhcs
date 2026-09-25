@@ -156,6 +156,15 @@ arm-none-eabi-nm firmware/mc02/build/app/mc02_app.elf | grep -c bmi088   # IMU: 
 - UART 错误策略：`CR3.OVRDIS=1`、**`CR3.DDRE=0`**、`CR3.EIE=0`。`DDRE` 是"出错时禁用 DMA"，**置 1 会让一个坏字符永久杀死端口**——细节见 [UART_RING_LOG.md](UART_RING_LOG.md) 第 1 章。
 - 实测吞吐天花板约 **800 KB/s 聚合**（USB Full-Speed 决定），781 KB/s 时零丢失；主循环在满过载下仍有约 10 倍余量。
 
+- **代码级剩余空间判定 [实测综合 2026-09-22]：C++ 层已无可测优化余量，不要重开。**
+  `try_transmit()` 每趟一个 ≤64 B 块的写法不是瓶颈——上一行"满过载 10 倍余量"直接否掉
+  "按 `write_available()` 一次排空"的改型（已试编，语义等价、可构建，因无可见收益回退）。
+  "每帧一次 CAS 预留"的位置归属有误：`written_size_` 的 CAS 在 **c_board** 的
+  `interrupt_safe_buffer.hpp`（不在本板 can.cpp），且同为洪泛才可见，等洪泛复测出数据再议。
+  host 侧 `invoke_receive_callback` 的 std::function 间接调用与 `acquire_transmit_buffer`
+  的 mutex 对照每包 ~10 µs 线上时间是个位数 ns，不做。能改变数字的杠杆都在 C++ 外：
+  应用层批量策略与主机调度。
+
 ## 不要用 HAL_RCCEx_GetPeriphCLKFreq() 取 UART 内核时钟 [实测 2026-08-05]
 
 **结论先行：本版 HAL 的 `HAL_RCCEx_GetPeriphCLKFreq()` 对两个 UART 组都返回 0**

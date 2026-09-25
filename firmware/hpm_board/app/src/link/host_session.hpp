@@ -4,6 +4,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <utility>
+
+#include <hpm_common.h>
 
 #include "core/include/libhcs/data/datas.hpp"
 #include "core/src/protocol/deserializer.hpp"
@@ -90,7 +93,7 @@ protected:
         refresh_session_state();
 
         if (!session_established_) {
-            without_session();
+            std::forward<WithoutSession>(without_session)();
             return nullptr;
         }
 
@@ -154,6 +157,11 @@ private:
         deactivate_session();
     }
 
+    // 放 ILM: 每个下行 CAN 帧经 deserializer 的虚调用到这里, 再进 ILM 里的
+    // Can::handle_downlink。留在 flash 就是 ILM 热路径中间唯一一段 XIP 取指, 其
+    // 代价随布局抽签 (USB_OPTIMIZATION_LOG.md 第 14 节)。board_identity() 的 OTP
+    // 读只在首次调用时发生, 之后是一次 guard 判断。
+    ATTR_PLACE_AT(".fast")
     bool can_deserialized_callback(
         core::protocol::FieldId id, const data::CanDataView& data) override {
         if (!session_established_)
@@ -171,6 +179,7 @@ private:
         return false;
     }
 
+    ATTR_PLACE_AT(".fast")
     bool uart_deserialized_callback(
         core::protocol::FieldId id, const data::UartDataView& data) override {
         if (!session_established_)

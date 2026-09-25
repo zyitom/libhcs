@@ -136,8 +136,14 @@ bool handle_setup(uint8_t rhport, const tusb_control_request_t* request) {
         if (index != 0x0007
             || request->wLength != libhcs::firmware::usb::UsbDescriptors::kMsOs20SetLength)
             return false;
+        // 记录主机类型: 只有 Windows 会取 MS OS 2.0 集, usbd_edpt_clear_stall 据此
+        // 决定 CLEAR_FEATURE(HALT) 是否复位数据 toggle (Linux DMTool 失步的根因)。
+        // 每次枚举 Windows 都会重取, 重复置位无害; 换主机的场景由总线复位清零。
+        usbd_note_ms_os_20_fetch();
+        // TinyUSB 的 tud_control_xfer 只收非 const 缓冲, 描述符本体是 constexpr 表。
         return tud_control_xfer(
             rhport, request,
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
             const_cast<uint8_t*>(libhcs::firmware::usb::UsbDescriptors::get_ms_os_20_set()),
             libhcs::firmware::usb::UsbDescriptors::kMsOs20SetLength);
     }

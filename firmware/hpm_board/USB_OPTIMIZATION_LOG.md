@@ -31,6 +31,7 @@
 - 第 11 节：**EP0 并发请求的代价**——偶发请求免费到什么频率为止
 - 第 12 节：**每包周期的拆解**——turnaround 与 starve、约 13.5 us 的主机侧地板、双峰定价与还剩的杠杆
 - 第 13 节：**UART 撞击 CAN 的尾部延迟**——head-of-line blocking 实测（2026-09-05 分端点拆除后此代价无条件存在）
+- 第 14 节：**每帧 flash 依赖收编 ILM**——一次布局回归的定位、4 镜像 × 2 轮数据表、链接期检查（2026-09-21）
 
 ---
 
@@ -204,6 +205,10 @@ payload 1023（3 个包） -> 14498 URB/s -> 14.83 MB/s   更差
 转发胶水就是这一类）。像 `tud_task_ext` 这种"入口在热路径、被调方散落在 flash"的
 函数，搬进 ILM 只会制造跨段调用。`libhcs_ILM_HOT_PATH`（只对 HPM6E8Y 生效）搬的是
 SDK 的 MCAN 叶子驱动，不是这一类，两者不要混为一谈。
+
+**2026-09-21 补全**：本节推论的反向应用成立——`tud_task_ext` 这类入口函数仍然不搬，但把每帧真正执行的
+叶子/闭环依赖（libc 块移动、MCAN 叶子函数、自有收发回调、rodata 查找表）整体收进 ILM 后，此前随布局
+漂移的 RTT 回归消失、板端单帧最大值 23.4 µs → 3.2 µs。数据与检查方法见第 14 节。
 
 ---
 
@@ -712,4 +717,73 @@ p50 几乎不动，但 p99 从 104.5 涨到 144。而且只要 25 kB/s（线速�
 > 但样本数会。另外负载线程的定速**必须钳位** `next`，`next += period` 一旦落后于当下就
 > 会退化成 flood——实测踩过一次：sent 24 MB / delivered 86 kB，13101 次超时。
 > `uartcontend` 的负载轴陷阱（核号越界导致实际负载与标称不符）见 4.5 节。
+## 14. 每帧 flash 依赖收编 ILM：一次布局回归的定位与修复 [实测 2026-09-21]
 
+**结论先行**：2026-09-21 的三处改动（①CAN 消息 RAM 加深 RX 8→16 / TX 8→12，②`serializer.hpp`/`can_dlc.hpp`
+上行重构引入 `dlc_override`，③`ring_buffer.hpp` CAN 发送队列下标前置）单独上板时，RTT 从 110/131/133
+退到 118–120/147–148/151–153。回归根源不在三处改动本身——它们的指令级差异全在 ILM 内或为纳秒级
+（[DMTOOL_PROTOCOL.md](DMTOOL_PROTOCOL.md) 第 5 节）——而在镜像布局：每帧真正执行的代码与只读表
+（libc 块移动 `memcpy/memmove/memset`、4 个 MCAN 叶子函数、自有 4 个收发回调、protocol rodata 与
+`CSWTCH` 查找表）仍留在 FLASH，它们能否留在 XIP cache 里取决于整个镜像的地址布局，任何无关编辑都可能
+把 RTT 推动几 µs。把这组依赖整体收进 ILM 并加链接期检查后：RTT 恢复 110/131/133，板端单帧最大
+23.4 µs → 3.2–3.7 µs，①②③ 的净收益量出为下行段 −165 ns、上行段 −144 ns（各约 −6%）。
+
+### 14.1 现象与定位
+
+- 含 ①②③ 的镜像多批复现回归：o 批 116/145/152，z 批 120/148/152 与 118/147/153；板端拆解同步显示
+  下行 avg 2.8→8.9 µs、上行 2.3–2.4→4.1–4.3 µs。对照镜像（无 ①②③）在所有批次始终 110/131/133–135。
+- 回归幅度随轮次抖动（同一 optm 镜像测出过 111/133/146 也测出过 120/148/152）——这正是"工作集卡在
+  cache 边缘"的形态：挤出去多少取决于地址布局与当轮扰动，而修复后的镜像落回舒适区，不再抖。
+- 三处改动没有一处把代码放进每帧 FLASH 取指路径，回归量却跟着无关编辑与构建漂移；用 map/objdump 盘点
+  每帧执行、却仍在 FLASH 的符号，得到结论先行里那份清单。任一项被挤出 cache，该帧的 XIP 取指全部变慢，
+  量级正好对得上"下行 +6 µs、上行 +1.8 µs"。
+
+### 14.2 4 镜像 × 2 轮数据表
+
+四个 scratch 镜像来自同一棵源码树：`isot`（无 ①②③ 对照）、`optm`（①②③，未修布局）、`isoz`（对照 +
+ILM 收编）、`optz`（①②③ + ILM 收编，与最终落仓库的代码同源）。每镜像 2 轮 × 60 s，真实 HCS 1 kHz
+probe（`HcsLinkProbe`），板端拆解走 EP0 `kGetLatencyBreakdown`。RTT 单位 µs；板端"下行"= bulk OUT 到
+TX FIFO、"上行"= CAN RX ISR 到 serialized，单位 µs（avg/max）：
+
+| 镜像 | 轮 | RTT p50/p99/p99.9 | 板端下行 avg/max | 板端上行 avg/max |
+|---|---|---|---|---|
+| isot | 1 | 110/131/133 | 2.84 / 23.4 | 2.41 / 8.2 |
+| isot | 2 | 110/131/134 | 2.77 / 23.4 | 2.32 / 8.2 |
+| optm | 1 | 120/148/152 | 8.94 / 17.7 | 4.34 / 7.3 |
+| optm | 2 | 118/147/153 | 8.87 / 17.7 | 4.07 / 7.3 |
+| isoz | 1 | 110/131/133 | 2.70 / 3.7 | 2.24 / 2.9 |
+| isoz | 2 | 110/131/133 | 2.70 / 3.7 | 2.24 / 2.6 |
+| optz | 1 | 110/131/133 | 2.54 / 3.2 | 2.09 / 2.9 |
+| optz | 2 | 109/131/134 | 2.54 / 3.2 | 2.09 / 2.5 |
+
+读法：optm 两轮复现回归形态（RTT p99 +16–17 µs；下行 avg 2.8→8.9、上行 2.3–2.4→4.1–4.3）——链接脚本
+注释里那组数字的出处就在这两行；isoz/optz 把 RTT 拉回基线，板端单帧最大值从 23.4 µs 压到 3.2–3.7 µs；
+optz − isoz = ①②③ 的净收益（下行 −165 ns、上行 −144 ns，各约 −6%），方向与静态分析一致。
+
+### 14.3 修复内容与检查方法
+
+修复落在仓库两处（scratch 原型是 `zpatch.py`，内容一致）：
+
+1. `boards/hpm5321/linker/app_flash_uf2.ld`：ILM 收编规则补齐——3 个 libc 块移动函数
+   （`*libc*.a:*-memcpy*.o` 等 archive:member 形式）、4 个 MCAN 叶子函数、protocol 命名空间的 rodata、
+   `CSWTCH` 查找表；并加 `ASSERT` 钉死关键符号必须落在 ILM 内。
+2. 自有 4 个每帧回调加 `ATTR_PLACE_AT(".fast")`：`vendor.cpp` 的 `tud_vendor_rx_cb`、
+   `host_session.hpp` 的 `can_deserialized_callback`、`uplink_usb.cpp` 的两个函数。
+
+检查方法（规则失配必须链接失败，已验证触发有效）：
+
+- 链接期：`ASSERT` 逐项钉住关键符号的落段，规则失配（mangled name 变了、函数改名或被内联掉）直接
+  链接失败，不会静默回到 FLASH。
+- 构建后：`riscv32-unknown-elf-nm` 或 map 文件核对上述符号全部落 ILM，`CSWTCH` 看 map 落段。
+- 上板：先跑板端延迟拆解（EP0 `kGetLatencyBreakdown`）再下结论——RTT 相差几 µs 时，第一嫌疑人是
+  镜像布局，不是刚改的那几行。
+
+`[实测 2026-09-21，TL101，主机 powersave 未调优，5321 单板 1 kHz]`。二分中间批次（opt1/opt2/opt3 等）
+未收敛成结论，不列。
+
+**2026-09-22 补充（UART 下行同法收编）**：`HostSession::uart_deserialized_callback` →
+`Uart::handle_downlink` → `TxBuffer::try_enqueue` 每 chunk 路径已收进 ILM（回调 `.fast`，
+enqueue 内联其中）；`try_dequeue`/`trigger_dma` 由主循环每拍调用，属热缓存路径，未强迁。
+三个 SDK 调用（`dma_channel_is_enable`、`uart_is_txline_idle`、`uart_clear_txline_idle_flag`）
+均为头文件 static inline，随调用点落段，无需链接规则。无独立 UART 测量，收益为静态推断
+`[推断，未上板]`；CAN RTT 复测无回归。

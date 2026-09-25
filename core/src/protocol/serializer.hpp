@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <utility>
 
 #include "core/include/libhcs/data/datas.hpp"
 #include "core/include/libhcs/protocol/can_dlc.hpp"
@@ -33,459 +34,352 @@ public:
     explicit Serializer(SerializeBuffer& buffer) noexcept
         : buffer_(buffer) {}
 
-    SerializeResult write_can(FieldId field_id, const data::CanDataView& view) noexcept {
-        const std::size_t required = required_can_size(field_id, view);
-        libhcs_VERIFY_LIKELY(required, SerializeResult::kInvalidArgument);
+    [[nodiscard]] SerializeResult
+        write_can(FieldId field_id, const data::CanDataView& view) noexcept {
+        return emit(required_can_size(field_id, view), [&](Cursor& cursor) {
+            write_field_header(cursor, field_id);
 
-        auto dst = buffer_.allocate(required);
-        libhcs_VERIFY_LIKELY(!dst.empty(), SerializeResult::kBadAlloc);
-        utility::assert_debug(dst.size() == required);
-        std::byte* cursor = dst.data();
+            const std::size_t can_data_length = view.can_data.size();
+            const bool has_data = can_data_length != 0;
+            const bool is_long_frame = can_data_length > kCanClassicMaxPayload;
+            const bool has_timestamp = view.timestamp_us.has_value();
+            std::uint8_t data_length_code = 0;
+            if (has_data)
+                // Long form stores the wire DLC offset by kCanFdLongDlcBase; the
+                // length was already validated against the table by
+                // required_can_size(), so the subtraction cannot underflow.
+                data_length_code =
+                    is_long_frame ? static_cast<std::uint8_t>(
+                                        dlc_from_payload_len(can_data_length) - kCanFdLongDlcBase)
+                                  : static_cast<std::uint8_t>(can_data_length - 1);
 
-        write_field_header(cursor, field_id);
+            // The standard and extended headers name the same fields and differ
+            // only in layout (3 vs 5 bytes), so the field writes are spelled
+            // once; each instantiation is inlined into its own branch and the
+            // two can no longer drift apart.
+            const auto write_header = [&]<typename Header>() {
+                auto header = cursor.emplace<Header>();
+                header.template set<typename Header::IsLongFrame>(is_long_frame);
+                header.template set<typename Header::IsExtendedCanId>(view.is_extended_can_id);
+                header.template set<typename Header::IsRemoteTransmission>(
+                    view.is_remote_transmission);
+                header.template set<typename Header::HasTimestamp>(has_timestamp);
+                header.template set<typename Header::HasCanData>(has_data);
+                header.template set<typename Header::CanId>(view.can_id);
+                header.template set<typename Header::DataLengthCode>(data_length_code);
+            };
+            if (view.is_extended_can_id)
+                write_header.template operator()<CanHeaderExtended>();
+            else
+                write_header.template operator()<CanHeaderStandard>();
 
-        const std::size_t can_data_length = view.can_data.size();
-        const bool has_data = can_data_length != 0;
-        const bool is_long_frame = can_data_length > kCanClassicMaxPayload;
-        // Long form stores the wire DLC offset by kCanFdLongDlcBase; the
-        // length was already validated against the table by
-        // required_can_size(), so the subtraction cannot underflow.
-        const std::uint8_t data_length_code =
-            !has_data       ? 0
-            : is_long_frame ? static_cast<std::uint8_t>(
-                                  dlc_from_payload_len(can_data_length) - kCanFdLongDlcBase)
-                            : static_cast<std::uint8_t>(can_data_length - 1);
+            cursor.copy(view.can_data);
 
-        const bool has_timestamp = view.timestamp_us.has_value();
-
-        if (view.is_extended_can_id) {
-            auto header = CanHeaderExtended::Ref(cursor);
-            cursor += sizeof(CanHeaderExtended);
-            header.set<CanHeaderExtended::IsLongFrame>(is_long_frame);
-            header.set<CanHeaderExtended::IsExtendedCanId>(true);
-            header.set<CanHeaderExtended::IsRemoteTransmission>(view.is_remote_transmission);
-            header.set<CanHeaderExtended::HasTimestamp>(has_timestamp);
-            header.set<CanHeaderExtended::HasCanData>(has_data);
-            header.set<CanHeaderExtended::CanId>(view.can_id);
-            header.set<CanHeaderExtended::DataLengthCode>(data_length_code);
-        } else {
-            auto header = CanHeaderStandard::Ref(cursor);
-            cursor += sizeof(CanHeaderStandard);
-            header.set<CanHeaderStandard::IsLongFrame>(is_long_frame);
-            header.set<CanHeaderStandard::IsExtendedCanId>(false);
-            header.set<CanHeaderStandard::IsRemoteTransmission>(view.is_remote_transmission);
-            header.set<CanHeaderStandard::HasTimestamp>(has_timestamp);
-            header.set<CanHeaderStandard::HasCanData>(has_data);
-            header.set<CanHeaderStandard::CanId>(view.can_id);
-            header.set<CanHeaderStandard::DataLengthCode>(data_length_code);
-        }
-
-        if (has_data) {
-            std::memcpy(cursor, view.can_data.data(), can_data_length);
-            cursor += can_data_length;
-        }
-
-        if (has_timestamp) {
-            // Explicit little-endian to match every other wire field -- this
-            // used to be a native memcpy, which made it the one field whose
-            // layout depended on the CPU endianness. On a little-endian host
-            // the bitfield store compiles to the same plain store.
-            utility::Bitfield<4>::Ref{cursor}.set<layouts::CanTimestampLayout::TimestampUs>(
-                *view.timestamp_us);
-            cursor += sizeof(uint32_t);
-        }
-
-        utility::assert_debug(cursor == dst.data() + dst.size());
-        return SerializeResult::kSuccess;
+            if (has_timestamp) {
+                // Explicit little-endian to match every other wire field -- this
+                // used to be a native memcpy, which made it the one field whose
+                // layout depended on the CPU endianness. On a little-endian host
+                // the bitfield store compiles to the same plain store.
+                cursor.emplace<utility::Bitfield<4>>()
+                    .set<layouts::CanTimestampLayout::TimestampUs>(*view.timestamp_us);
+            }
+        });
     }
 
-    SerializeResult write_uart(
+    [[nodiscard]] SerializeResult write_uart(
         FieldId field_id, const data::UartDataView& view,
         std::span<const std::byte> suffix_data = {}) noexcept {
-        const std::size_t required = required_uart_size(field_id, view, suffix_data);
-        libhcs_VERIFY_LIKELY(required, SerializeResult::kInvalidArgument);
+        return emit(required_uart_size(field_id, view, suffix_data), [&](Cursor& cursor) {
+            write_field_header(cursor, field_id);
 
-        auto dst = buffer_.allocate(required);
-        libhcs_VERIFY_LIKELY(!dst.empty(), SerializeResult::kBadAlloc);
-        utility::assert_debug(dst.size() == required);
-        std::byte* cursor = dst.data();
+            const std::size_t uart_data_length = view.uart_data.size() + suffix_data.size();
+            if (uart_data_length >= 4) {
+                auto header = cursor.emplace<UartHeaderExtended>();
+                header.set<UartHeaderExtended::IdleDelimited>(view.idle_delimited);
+                header.set<UartHeaderExtended::IsExtendedLength>(true);
+                header.set<UartHeaderExtended::DataLengthExtended>(
+                    static_cast<std::uint16_t>(uart_data_length));
+            } else {
+                auto header = cursor.emplace<UartHeader>();
+                header.set<UartHeader::IdleDelimited>(view.idle_delimited);
+                header.set<UartHeader::IsExtendedLength>(false);
+                header.set<UartHeader::DataLength>(static_cast<std::uint8_t>(uart_data_length));
+            }
 
-        write_field_header(cursor, field_id);
-
-        const std::size_t uart_data_length = view.uart_data.size() + suffix_data.size();
-        const bool use_extended_length = uart_data_length >= 4;
-        if (use_extended_length) {
-            auto header = UartHeaderExtended::Ref(cursor);
-            cursor += sizeof(UartHeaderExtended);
-            header.set<UartHeaderExtended::IdleDelimited>(view.idle_delimited);
-            header.set<UartHeaderExtended::IsExtendedLength>(true);
-            header.set<UartHeaderExtended::DataLengthExtended>(
-                static_cast<std::uint16_t>(uart_data_length));
-        } else {
-            auto header = UartHeader::Ref(cursor);
-            cursor += sizeof(UartHeader);
-            header.set<UartHeader::IdleDelimited>(view.idle_delimited);
-            header.set<UartHeader::IsExtendedLength>(false);
-            header.set<UartHeader::DataLength>(static_cast<std::uint8_t>(uart_data_length));
-        }
-
-        if (!view.uart_data.empty()) {
-            std::memcpy(cursor, view.uart_data.data(), view.uart_data.size());
-            cursor += view.uart_data.size();
-        }
-        if (!suffix_data.empty()) {
-            std::memcpy(cursor, suffix_data.data(), suffix_data.size());
-            cursor += suffix_data.size();
-        }
-
-        utility::assert_debug(cursor == dst.data() + dst.size());
-        return SerializeResult::kSuccess;
+            cursor.copy(view.uart_data);
+            cursor.copy(suffix_data);
+        });
     }
 
     // Sparse patch semantics: a view with nothing set writes no bytes at all and
     // reports success, so callers can pass a partially filled config through
     // unconditionally.
-    SerializeResult write_uart_config(FieldId field_id, const data::UartConfigView& view) noexcept {
+    [[nodiscard]] SerializeResult
+        write_uart_config(FieldId field_id, const data::UartConfigView& view) noexcept {
         if (!view.baudrate.has_value())
             return SerializeResult::kSuccess;
 
-        const std::size_t required = required_uart_config_size(field_id, *view.baudrate);
-        libhcs_VERIFY_LIKELY(required, SerializeResult::kInvalidArgument);
-
-        auto dst = buffer_.allocate(required);
-        libhcs_VERIFY_LIKELY(!dst.empty(), SerializeResult::kBadAlloc);
-        utility::assert_debug(dst.size() == required);
-        std::byte* cursor = dst.data();
-
-        write_field_header(cursor, field_id);
-
-        auto payload = UartConfigPayload::Ref(cursor);
-        cursor += sizeof(UartConfigPayload);
-        payload.set<UartConfigPayload::Baudrate>(*view.baudrate);
-
-        utility::assert_debug(cursor == dst.data() + dst.size());
-        return SerializeResult::kSuccess;
+        return emit(required_uart_config_size(field_id, *view.baudrate), [&](Cursor& cursor) {
+            write_field_header(cursor, field_id);
+            cursor.emplace<UartConfigPayload>().set<UartConfigPayload::Baudrate>(*view.baudrate);
+        });
     }
 
-    SerializeResult write_gpio_digital_value(
+    [[nodiscard]] SerializeResult write_gpio_digital_value(
         uint8_t channel_index, const data::GpioDigitalDataView& view) noexcept {
         utility::assert_debug(channel_index < (1U << GpioHeader::ChannelIndex::kBitWidth));
         const auto payload_type = view.high ? GpioHeader::PayloadEnum::kDigitalHigh
                                             : GpioHeader::PayloadEnum::kDigitalLow;
-        const std::size_t required =
-            required_gpio_size(FieldId::kGpio, payload_type, view.timestamp_quarter_us.has_value());
-        libhcs_VERIFY_LIKELY(required, SerializeResult::kInvalidArgument);
+        const bool timestamped = view.timestamp_quarter_us.has_value();
 
-        auto dst = buffer_.allocate(required);
-        libhcs_VERIFY_LIKELY(!dst.empty(), SerializeResult::kBadAlloc);
-        utility::assert_debug(dst.size() == required);
-        std::byte* cursor = dst.data();
+        return emit(
+            required_gpio_size(FieldId::kGpio, payload_type, timestamped), [&](Cursor& cursor) {
+                write_field_header(cursor, FieldId::kGpio);
 
-        write_field_header(cursor, FieldId::kGpio);
+                auto header = cursor.emplace<GpioHeader>();
+                header.set<GpioHeader::PayloadType>(payload_type);
+                header.set<GpioHeader::ChannelIndex>(channel_index);
+                header.set<GpioHeader::Timestamped>(timestamped);
 
-        auto header = GpioHeader::Ref(cursor);
-        cursor += sizeof(GpioHeader);
-        header.set<GpioHeader::PayloadType>(payload_type);
-        header.set<GpioHeader::ChannelIndex>(channel_index);
-        header.set<GpioHeader::Timestamped>(view.timestamp_quarter_us.has_value());
-
-        if (view.timestamp_quarter_us) {
-            auto payload = GpioDigitalReadTimestampPayload::Ref(cursor);
-            cursor += sizeof(GpioDigitalReadTimestampPayload);
-            payload.set<GpioDigitalReadTimestampPayload::TimestampQuarterUs>(
-                *view.timestamp_quarter_us);
-        }
-
-        utility::assert_debug(cursor == dst.data() + dst.size());
-        return SerializeResult::kSuccess;
+                if (timestamped) {
+                    cursor.emplace<GpioDigitalReadTimestampPayload>()
+                        .set<GpioDigitalReadTimestampPayload::TimestampQuarterUs>(
+                            *view.timestamp_quarter_us);
+                }
+            });
     }
 
-    SerializeResult write_gpio_digital_read_config(
+    [[nodiscard]] SerializeResult write_gpio_digital_read_config(
         uint8_t channel_index, const data::GpioReadConfigView& view) noexcept {
         utility::assert_debug(channel_index < (1U << GpioHeader::ChannelIndex::kBitWidth));
-        const std::size_t required =
-            required_gpio_size(FieldId::kGpio, GpioHeader::PayloadEnum::kDigitalReadConfig);
-        libhcs_VERIFY_LIKELY(required, SerializeResult::kInvalidArgument);
+        return emit(
+            required_gpio_size(FieldId::kGpio, GpioHeader::PayloadEnum::kDigitalReadConfig),
+            [&](Cursor& cursor) {
+                write_field_header(cursor, FieldId::kGpio);
 
-        auto dst = buffer_.allocate(required);
-        libhcs_VERIFY_LIKELY(!dst.empty(), SerializeResult::kBadAlloc);
-        utility::assert_debug(dst.size() == required);
-        std::byte* cursor = dst.data();
+                auto header = cursor.emplace<GpioHeader>();
+                header.set<GpioHeader::PayloadType>(GpioHeader::PayloadEnum::kDigitalReadConfig);
+                header.set<GpioHeader::ChannelIndex>(channel_index);
+                header.set<GpioHeader::Timestamped>(view.capture_timestamp);
 
-        write_field_header(cursor, FieldId::kGpio);
-
-        auto header = GpioHeader::Ref(cursor);
-        cursor += sizeof(GpioHeader);
-        header.set<GpioHeader::PayloadType>(GpioHeader::PayloadEnum::kDigitalReadConfig);
-        header.set<GpioHeader::ChannelIndex>(channel_index);
-        header.set<GpioHeader::Timestamped>(view.capture_timestamp);
-
-        auto payload = GpioReadConfigPayload::Ref(cursor);
-        cursor += sizeof(GpioReadConfigPayload);
-        payload.set<GpioReadConfigPayload::Asap>(view.asap);
-        payload.set<GpioReadConfigPayload::RisingEdge>(view.rising_edge);
-        payload.set<GpioReadConfigPayload::FallingEdge>(view.falling_edge);
-        payload.set<GpioReadConfigPayload::Pull>(view.pull);
-        payload.set<GpioReadConfigPayload::PeriodMs>(view.period_ms);
-
-        utility::assert_debug(cursor == dst.data() + dst.size());
-        return SerializeResult::kSuccess;
+                write_gpio_read_config_payload(cursor, view, view.rising_edge, view.falling_edge);
+            });
     }
 
-    SerializeResult write_gpio_analog_value(
+    [[nodiscard]] SerializeResult write_gpio_analog_value(
         uint8_t channel_index, const data::GpioAnalogDataView& view) noexcept {
         utility::assert_debug(channel_index < (1U << GpioHeader::ChannelIndex::kBitWidth));
-        const std::size_t required =
-            required_gpio_size(FieldId::kGpio, GpioHeader::PayloadEnum::kAnalog);
-        libhcs_VERIFY_LIKELY(required, SerializeResult::kInvalidArgument);
+        return emit(
+            required_gpio_size(FieldId::kGpio, GpioHeader::PayloadEnum::kAnalog),
+            [&](Cursor& cursor) {
+                write_field_header(cursor, FieldId::kGpio);
 
-        auto dst = buffer_.allocate(required);
-        libhcs_VERIFY_LIKELY(!dst.empty(), SerializeResult::kBadAlloc);
-        utility::assert_debug(dst.size() == required);
-        std::byte* cursor = dst.data();
+                auto header = cursor.emplace<GpioHeader>();
+                header.set<GpioHeader::PayloadType>(GpioHeader::PayloadEnum::kAnalog);
+                header.set<GpioHeader::ChannelIndex>(channel_index);
+                header.set<GpioHeader::Timestamped>(false);
 
-        write_field_header(cursor, FieldId::kGpio);
-
-        auto header = GpioHeader::Ref(cursor);
-        cursor += sizeof(GpioHeader);
-        header.set<GpioHeader::PayloadType>(GpioHeader::PayloadEnum::kAnalog);
-        header.set<GpioHeader::ChannelIndex>(channel_index);
-        header.set<GpioHeader::Timestamped>(false);
-
-        auto payload = GpioAnalogPayload::Ref(cursor);
-        cursor += sizeof(GpioAnalogPayload);
-        payload.set<GpioAnalogPayload::Value>(view.value);
-
-        utility::assert_debug(cursor == dst.data() + dst.size());
-        return SerializeResult::kSuccess;
+                cursor.emplace<GpioAnalogPayload>().set<GpioAnalogPayload::Value>(view.value);
+            });
     }
 
-    SerializeResult write_gpio_analog_read_config(
+    [[nodiscard]] SerializeResult write_gpio_analog_read_config(
         uint8_t channel_index, const data::GpioReadConfigView& view) noexcept {
         utility::assert_debug(channel_index < (1U << GpioHeader::ChannelIndex::kBitWidth));
         libhcs_VERIFY_LIKELY(
             !view.falling_edge && !view.rising_edge, SerializeResult::kInvalidArgument);
         libhcs_VERIFY_LIKELY(!view.capture_timestamp, SerializeResult::kInvalidArgument);
 
-        const std::size_t required =
-            required_gpio_size(FieldId::kGpio, GpioHeader::PayloadEnum::kAnalogReadConfig);
-        libhcs_VERIFY_LIKELY(required, SerializeResult::kInvalidArgument);
+        return emit(
+            required_gpio_size(FieldId::kGpio, GpioHeader::PayloadEnum::kAnalogReadConfig),
+            [&](Cursor& cursor) {
+                write_field_header(cursor, FieldId::kGpio);
 
-        auto dst = buffer_.allocate(required);
-        libhcs_VERIFY_LIKELY(!dst.empty(), SerializeResult::kBadAlloc);
-        utility::assert_debug(dst.size() == required);
-        std::byte* cursor = dst.data();
+                auto header = cursor.emplace<GpioHeader>();
+                header.set<GpioHeader::PayloadType>(GpioHeader::PayloadEnum::kAnalogReadConfig);
+                header.set<GpioHeader::ChannelIndex>(channel_index);
+                header.set<GpioHeader::Timestamped>(false);
 
-        write_field_header(cursor, FieldId::kGpio);
-
-        auto header = GpioHeader::Ref(cursor);
-        cursor += sizeof(GpioHeader);
-        header.set<GpioHeader::PayloadType>(GpioHeader::PayloadEnum::kAnalogReadConfig);
-        header.set<GpioHeader::ChannelIndex>(channel_index);
-        header.set<GpioHeader::Timestamped>(false);
-
-        auto payload = GpioReadConfigPayload::Ref(cursor);
-        cursor += sizeof(GpioReadConfigPayload);
-        payload.set<GpioReadConfigPayload::Asap>(view.asap);
-        payload.set<GpioReadConfigPayload::RisingEdge>(false);
-        payload.set<GpioReadConfigPayload::FallingEdge>(false);
-        payload.set<GpioReadConfigPayload::Pull>(view.pull);
-        payload.set<GpioReadConfigPayload::PeriodMs>(view.period_ms);
-
-        utility::assert_debug(cursor == dst.data() + dst.size());
-        return SerializeResult::kSuccess;
+                // The analog form has no edge semantics; the guards above make
+                // that an argument error rather than a silently dropped bit.
+                write_gpio_read_config_payload(cursor, view, false, false);
+            });
     }
 
-    SerializeResult write_imu_accelerometer(const data::ImuAccelerometerDataView& view) noexcept {
-        const std::size_t required = required_imu_size(FieldId::kImu, ImuPayload::kAccelerometer);
-        libhcs_VERIFY_LIKELY(required, SerializeResult::kInvalidArgument);
-
-        auto dst = buffer_.allocate(required);
-        libhcs_VERIFY_LIKELY(!dst.empty(), SerializeResult::kBadAlloc);
-        utility::assert_debug(dst.size() == required);
-        std::byte* cursor = dst.data();
-
-        write_field_header(cursor, FieldId::kImu);
-
-        auto header = ImuHeader::Ref(cursor);
-        cursor += sizeof(ImuHeader);
-        header.set<ImuHeader::PayloadType>(ImuHeader::PayloadEnum::kAccelerometer);
-
-        auto payload = ImuAccelerometerPayload::Ref(cursor);
-        cursor += sizeof(ImuAccelerometerPayload);
-        payload.set<ImuAccelerometerPayload::X>(view.x);
-        payload.set<ImuAccelerometerPayload::Y>(view.y);
-        payload.set<ImuAccelerometerPayload::Z>(view.z);
-        payload.set<ImuAccelerometerPayload::TimestampQuarterUs>(view.timestamp_quarter_us);
-
-        utility::assert_debug(cursor == dst.data() + dst.size());
-        return SerializeResult::kSuccess;
+    [[nodiscard]] SerializeResult
+        write_imu_accelerometer(const data::ImuAccelerometerDataView& view) noexcept {
+        return write_imu<ImuHeader::PayloadEnum::kAccelerometer, ImuAccelerometerPayload>(
+            [&](auto payload) {
+                payload.template set<ImuAccelerometerPayload::X>(view.x);
+                payload.template set<ImuAccelerometerPayload::Y>(view.y);
+                payload.template set<ImuAccelerometerPayload::Z>(view.z);
+                payload.template set<ImuAccelerometerPayload::TimestampQuarterUs>(
+                    view.timestamp_quarter_us);
+            });
     }
 
-    SerializeResult write_imu_gyroscope(const data::ImuGyroscopeDataView& view) noexcept {
-        const std::size_t required = required_imu_size(FieldId::kImu, ImuPayload::kGyroscope);
-        libhcs_VERIFY_LIKELY(required, SerializeResult::kInvalidArgument);
-
-        auto dst = buffer_.allocate(required);
-        libhcs_VERIFY_LIKELY(!dst.empty(), SerializeResult::kBadAlloc);
-        utility::assert_debug(dst.size() == required);
-        std::byte* cursor = dst.data();
-
-        write_field_header(cursor, FieldId::kImu);
-
-        auto header = ImuHeader::Ref(cursor);
-        cursor += sizeof(ImuHeader);
-        header.set<ImuHeader::PayloadType>(ImuHeader::PayloadEnum::kGyroscope);
-
-        auto payload = ImuGyroscopePayload::Ref(cursor);
-        cursor += sizeof(ImuGyroscopePayload);
-        payload.set<ImuGyroscopePayload::X>(view.x);
-        payload.set<ImuGyroscopePayload::Y>(view.y);
-        payload.set<ImuGyroscopePayload::Z>(view.z);
-        payload.set<ImuGyroscopePayload::TimestampQuarterUs>(view.timestamp_quarter_us);
-
-        utility::assert_debug(cursor == dst.data() + dst.size());
-        return SerializeResult::kSuccess;
+    [[nodiscard]] SerializeResult
+        write_imu_gyroscope(const data::ImuGyroscopeDataView& view) noexcept {
+        return write_imu<ImuHeader::PayloadEnum::kGyroscope, ImuGyroscopePayload>(
+            [&](auto payload) {
+                payload.template set<ImuGyroscopePayload::X>(view.x);
+                payload.template set<ImuGyroscopePayload::Y>(view.y);
+                payload.template set<ImuGyroscopePayload::Z>(view.z);
+                payload.template set<ImuGyroscopePayload::TimestampQuarterUs>(
+                    view.timestamp_quarter_us);
+            });
     }
 
-    SerializeResult write_imu_temperature(const data::ImuTemperatureDataView& view) noexcept {
-        const std::size_t required = required_imu_size(FieldId::kImu, ImuPayload::kTemperature);
-        libhcs_VERIFY_LIKELY(required, SerializeResult::kInvalidArgument);
-
-        auto dst = buffer_.allocate(required);
-        libhcs_VERIFY_LIKELY(!dst.empty(), SerializeResult::kBadAlloc);
-        utility::assert_debug(dst.size() == required);
-        std::byte* cursor = dst.data();
-
-        write_field_header(cursor, FieldId::kImu);
-
-        auto header = ImuHeader::Ref(cursor);
-        cursor += sizeof(ImuHeader);
-        header.set<ImuHeader::PayloadType>(ImuHeader::PayloadEnum::kTemperature);
-
-        auto payload = ImuTemperaturePayload::Ref(cursor);
-        cursor += sizeof(ImuTemperaturePayload);
-        payload.set<ImuTemperaturePayload::Temperature>(view.raw_register_value);
-        payload.set<ImuTemperaturePayload::TimestampQuarterUs>(view.timestamp_quarter_us);
-
-        utility::assert_debug(cursor == dst.data() + dst.size());
-        return SerializeResult::kSuccess;
+    [[nodiscard]] SerializeResult
+        write_imu_temperature(const data::ImuTemperatureDataView& view) noexcept {
+        return write_imu<ImuHeader::PayloadEnum::kTemperature, ImuTemperaturePayload>(
+            [&](auto payload) {
+                payload.template set<ImuTemperaturePayload::Temperature>(view.raw_register_value);
+                payload.template set<ImuTemperaturePayload::TimestampQuarterUs>(
+                    view.timestamp_quarter_us);
+            });
     }
 
-    SerializeResult write_session_control(const data::SessionControlView& view) noexcept {
-        const std::size_t required = required_session_size();
-
-        auto dst = buffer_.allocate(required);
-        libhcs_VERIFY_LIKELY(!dst.empty(), SerializeResult::kBadAlloc);
-        utility::assert_debug(dst.size() == required);
-        std::byte* cursor = dst.data();
-
-        write_field_header(cursor, FieldId::kSession);
-
-        auto header = SessionHeader::Ref(cursor);
-        cursor += sizeof(SessionHeader);
-        header.set<SessionHeader::Type>(view.type);
-        header.set<SessionHeader::Nonce>(view.nonce);
-
-        utility::assert_debug(cursor == dst.data() + dst.size());
-        return SerializeResult::kSuccess;
+    [[nodiscard]] SerializeResult
+        write_session_control(const data::SessionControlView& view) noexcept {
+        return emit(required_session_size(), [&](Cursor& cursor) {
+            write_session_header(cursor, view.type, view.nonce);
+        });
     }
 
     // Session field carrying a kTimeAnchor payload. Kept separate from
     // write_session_control() rather than folded into it, because the two have
     // different sizes and the fixed-size path is on the keepalive hot path of
     // every board, including the ones that know nothing about time sync.
-    SerializeResult write_time_anchor(const data::TimeAnchorView& view) noexcept {
-        const std::size_t required = required_session_size() + sizeof(TimeAnchorPayload);
-
-        auto dst = buffer_.allocate(required);
-        libhcs_VERIFY_LIKELY(!dst.empty(), SerializeResult::kBadAlloc);
-        utility::assert_debug(dst.size() == required);
-        std::byte* cursor = dst.data();
-
-        write_field_header(cursor, FieldId::kSession);
-
-        auto header = SessionHeader::Ref(cursor);
-        cursor += sizeof(SessionHeader);
-        header.set<SessionHeader::Type>(data::SessionType::kTimeAnchor);
-        header.set<SessionHeader::Nonce>(view.nonce);
-
-        auto payload = TimeAnchorPayload::Ref(cursor);
-        cursor += sizeof(TimeAnchorPayload);
-        payload.set<TimeAnchorPayload::Microframe>(view.microframe);
-
-        utility::assert_debug(cursor == dst.data() + dst.size());
-        return SerializeResult::kSuccess;
+    [[nodiscard]] SerializeResult write_time_anchor(const data::TimeAnchorView& view) noexcept {
+        return emit(required_session_size() + sizeof(TimeAnchorPayload), [&](Cursor& cursor) {
+            write_session_header(cursor, data::SessionType::kTimeAnchor, view.nonce);
+            cursor.emplace<TimeAnchorPayload>().set<TimeAnchorPayload::Microframe>(view.microframe);
+        });
     }
 
-    SerializeResult write_time_status(const data::TimeStatusView& view) noexcept {
-        const std::size_t required = required_session_size() + sizeof(TimeStatusPayload);
+    [[nodiscard]] SerializeResult write_time_status(const data::TimeStatusView& view) noexcept {
+        return emit(required_session_size() + sizeof(TimeStatusPayload), [&](Cursor& cursor) {
+            write_session_header(cursor, data::SessionType::kTimeStatus, view.nonce);
 
-        auto dst = buffer_.allocate(required);
-        libhcs_VERIFY_LIKELY(!dst.empty(), SerializeResult::kBadAlloc);
-        utility::assert_debug(dst.size() == required);
-        std::byte* cursor = dst.data();
-
-        write_field_header(cursor, FieldId::kSession);
-
-        auto header = SessionHeader::Ref(cursor);
-        cursor += sizeof(SessionHeader);
-        header.set<SessionHeader::Type>(data::SessionType::kTimeStatus);
-        header.set<SessionHeader::Nonce>(view.nonce);
-
-        auto payload = TimeStatusPayload::Ref(cursor);
-        cursor += sizeof(TimeStatusPayload);
-        payload.set<TimeStatusPayload::Microframe>(view.microframe);
-        payload.set<TimeStatusPayload::TimestampQuarterUs>(view.timestamp_quarter_us);
-        payload.set<TimeStatusPayload::TicksPerMicroframeQ16>(view.ticks_per_microframe_q16);
-        payload.set<TimeStatusPayload::State>(view.state);
-        payload.set<TimeStatusPayload::AnomalyCount>(view.anomaly_count);
-        payload.set<TimeStatusPayload::ResidualMeanQ16>(view.residual_mean_q16);
-        payload.set<TimeStatusPayload::ResidualAbsMaxQ16>(view.residual_abs_max_q16);
-        payload.set<TimeStatusPayload::ResidualCount>(view.residual_count);
-
-        utility::assert_debug(cursor == dst.data() + dst.size());
-        return SerializeResult::kSuccess;
+            auto payload = cursor.emplace<TimeStatusPayload>();
+            payload.set<TimeStatusPayload::Microframe>(view.microframe);
+            payload.set<TimeStatusPayload::TimestampQuarterUs>(view.timestamp_quarter_us);
+            payload.set<TimeStatusPayload::TicksPerMicroframeQ16>(view.ticks_per_microframe_q16);
+            payload.set<TimeStatusPayload::State>(view.state);
+            payload.set<TimeStatusPayload::AnomalyCount>(view.anomaly_count);
+            payload.set<TimeStatusPayload::ResidualMeanQ16>(view.residual_mean_q16);
+            payload.set<TimeStatusPayload::ResidualAbsMaxQ16>(view.residual_abs_max_q16);
+            payload.set<TimeStatusPayload::ResidualCount>(view.residual_count);
+        });
     }
 
-    SerializeResult write_pulse_schedule(const data::PulseScheduleView& view) noexcept {
-        const std::size_t required = required_session_size() + sizeof(PulseSchedulePayload);
-        auto dst = buffer_.allocate(required);
-        libhcs_VERIFY_LIKELY(!dst.empty(), SerializeResult::kBadAlloc);
-        std::byte* cursor = dst.data();
-        write_field_header(cursor, FieldId::kSession);
-        auto header = SessionHeader::Ref(cursor);
-        cursor += sizeof(SessionHeader);
-        header.set<SessionHeader::Type>(data::SessionType::kPulseSchedule);
-        header.set<SessionHeader::Nonce>(view.nonce);
-        auto payload = PulseSchedulePayload::Ref(cursor);
-        cursor += sizeof(PulseSchedulePayload);
-        payload.set<PulseSchedulePayload::Microframe>(view.microframe);
-        utility::assert_debug(cursor == dst.data() + dst.size());
-        return SerializeResult::kSuccess;
+    [[nodiscard]] SerializeResult
+        write_pulse_schedule(const data::PulseScheduleView& view) noexcept {
+        return emit(required_session_size() + sizeof(PulseSchedulePayload), [&](Cursor& cursor) {
+            write_session_header(cursor, data::SessionType::kPulseSchedule, view.nonce);
+            cursor.emplace<PulseSchedulePayload>().set<PulseSchedulePayload::Microframe>(
+                view.microframe);
+        });
     }
 
-    SerializeResult write_pulse_report(const data::PulseReportView& view) noexcept {
-        const std::size_t required = required_session_size() + sizeof(PulseReportPayload);
-        auto dst = buffer_.allocate(required);
-        libhcs_VERIFY_LIKELY(!dst.empty(), SerializeResult::kBadAlloc);
-        std::byte* cursor = dst.data();
-        write_field_header(cursor, FieldId::kSession);
-        auto header = SessionHeader::Ref(cursor);
-        cursor += sizeof(SessionHeader);
-        header.set<SessionHeader::Type>(data::SessionType::kPulseReport);
-        header.set<SessionHeader::Nonce>(view.nonce);
-        auto payload = PulseReportPayload::Ref(cursor);
-        cursor += sizeof(PulseReportPayload);
-        payload.set<PulseReportPayload::ScheduledMicroframe>(view.scheduled_microframe);
-        payload.set<PulseReportPayload::CapturedMicroframeQ16>(view.captured_microframe_q16);
-        payload.set<PulseReportPayload::TicksPerMicroframeQ16>(view.ticks_per_microframe_q16);
-        payload.set<PulseReportPayload::Flags>(view.flags);
-        utility::assert_debug(cursor == dst.data() + dst.size());
-        return SerializeResult::kSuccess;
+    [[nodiscard]] SerializeResult write_pulse_report(const data::PulseReportView& view) noexcept {
+        return emit(required_session_size() + sizeof(PulseReportPayload), [&](Cursor& cursor) {
+            write_session_header(cursor, data::SessionType::kPulseReport, view.nonce);
+
+            auto payload = cursor.emplace<PulseReportPayload>();
+            payload.set<PulseReportPayload::ScheduledMicroframe>(view.scheduled_microframe);
+            payload.set<PulseReportPayload::CapturedMicroframeQ16>(view.captured_microframe_q16);
+            payload.set<PulseReportPayload::TicksPerMicroframeQ16>(view.ticks_per_microframe_q16);
+            payload.set<PulseReportPayload::Flags>(view.flags);
+        });
     }
 
 private:
+    // Write position into the allocated field. Turns the hand-written pair
+    // `auto x = Layout::Ref(cursor); cursor += sizeof(Layout);` into one call:
+    // forgetting the second half compiled fine and silently made the next
+    // field overwrite this one.
+    class Cursor {
+    public:
+        constexpr explicit Cursor(std::byte* position) noexcept
+            : position_(position) {}
+
+        // `advance` defaults to the layout size; the field header, which shares
+        // its last byte with the header after it, passes a smaller value.
+        template <typename Layout>
+        typename Layout::Ref emplace(std::size_t advance = sizeof(Layout)) noexcept {
+            typename Layout::Ref ref{position_};
+            position_ += advance;
+            return ref;
+        }
+
+        void copy(std::span<const std::byte> bytes) noexcept {
+            if (bytes.empty())
+                return;
+            std::memcpy(position_, bytes.data(), bytes.size());
+            position_ += bytes.size();
+        }
+
+        [[nodiscard]] constexpr const std::byte* position() const noexcept { return position_; }
+
+    private:
+        std::byte* position_;
+    };
+
+    // Shared skeleton of every write_*: validated size -> allocate -> let
+    // `write` fill it -> check it was filled exactly. This used to be copied
+    // into each writer by hand, and two of the copies had already lost the
+    // size assertion. `write` is a lambda and is always inlined, so the
+    // generated code matches the hand-expanded form.
+    template <typename Write>
+    SerializeResult emit(std::size_t required, Write&& write) noexcept {
+        libhcs_VERIFY_LIKELY(required, SerializeResult::kInvalidArgument);
+
+        auto dst = buffer_.allocate(required);
+        libhcs_VERIFY_LIKELY(!dst.empty(), SerializeResult::kBadAlloc);
+        utility::assert_debug(dst.size() == required);
+
+        Cursor cursor{dst.data()};
+        std::forward<Write>(write)(cursor);
+
+        utility::assert_debug(cursor.position() == dst.data() + dst.size());
+        return SerializeResult::kSuccess;
+    }
+
+    // Header shared by every kSession payload.
+    static void
+        write_session_header(Cursor& cursor, data::SessionType type, uint32_t nonce) noexcept {
+        write_field_header(cursor, FieldId::kSession);
+        auto header = cursor.emplace<SessionHeader>();
+        header.set<SessionHeader::Type>(type);
+        header.set<SessionHeader::Nonce>(nonce);
+    }
+
+    // Digital and analog read configs share this payload; only the edge bits
+    // differ (analog has no edge semantics, so its caller passes false).
+    static void write_gpio_read_config_payload(
+        Cursor& cursor, const data::GpioReadConfigView& view, bool rising_edge,
+        bool falling_edge) noexcept {
+        auto payload = cursor.emplace<GpioReadConfigPayload>();
+        payload.set<GpioReadConfigPayload::Asap>(view.asap);
+        payload.set<GpioReadConfigPayload::RisingEdge>(rising_edge);
+        payload.set<GpioReadConfigPayload::FallingEdge>(falling_edge);
+        payload.set<GpioReadConfigPayload::Pull>(view.pull);
+        payload.set<GpioReadConfigPayload::PeriodMs>(view.period_ms);
+    }
+
+    // The three IMU payloads share one skeleton (field header + ImuHeader +
+    // fixed-size payload) and differ only in layout and field names.
+    template <ImuHeader::PayloadEnum payload, typename Payload, typename WriteFields>
+    SerializeResult write_imu(WriteFields&& write_fields) noexcept {
+        return emit(required_imu_size(FieldId::kImu, payload), [&](Cursor& cursor) {
+            write_field_header(cursor, FieldId::kImu);
+            cursor.emplace<ImuHeader>().set<ImuHeader::PayloadType>(payload);
+            std::forward<WriteFields>(write_fields)(cursor.emplace<Payload>());
+        });
+    }
+
     static constexpr bool use_extended_field_header(FieldId field_id) {
         utility::assert_debug(field_id != FieldId::kExtend);
         return static_cast<std::uint8_t>(field_id) > 0xF;
@@ -496,15 +390,17 @@ private:
                                                    : sizeof(FieldHeader);
     }
 
-    static void write_field_header(std::byte*& cursor, FieldId field_id) noexcept {
+    // The field header shares its last byte with the header that follows it
+    // (the size computations subtract that byte back out), so it advances by
+    // less than its sizeof.
+    static void write_field_header(Cursor& cursor, FieldId field_id) noexcept {
         if (use_extended_field_header(field_id)) {
-            auto header = FieldHeaderExtended::Ref(cursor);
-            cursor += 1;
             static_assert(sizeof(FieldHeaderExtended) == sizeof(FieldHeader) + 1);
+            auto header = cursor.emplace<FieldHeaderExtended>(1);
             header.set<FieldHeaderExtended::Id>(FieldId::kExtend);
             header.set<FieldHeaderExtended::IdExtended>(field_id);
         } else {
-            auto header = FieldHeader::Ref(cursor);
+            auto header = cursor.emplace<FieldHeader>(0);
             header.set<FieldHeader::Id>(field_id);
         }
     }
@@ -602,16 +498,19 @@ private:
         return total;
     }
 
-    enum class ImuPayload : std::uint8_t { kAccelerometer = 0, kGyroscope = 1, kTemperature = 2 };
-
-    static std::size_t required_imu_size(FieldId field_id, ImuPayload payload) noexcept {
+    static std::size_t
+        required_imu_size(FieldId field_id, ImuHeader::PayloadEnum payload) noexcept {
         const std::size_t field_header_bytes = required_field_header_size(field_id);
         const std::size_t imu_header_bytes = sizeof(ImuHeader);
         std::size_t payload_bytes = 0;
         switch (payload) {
-        case ImuPayload::kAccelerometer: payload_bytes = sizeof(ImuAccelerometerPayload); break;
-        case ImuPayload::kGyroscope: payload_bytes = sizeof(ImuGyroscopePayload); break;
-        case ImuPayload::kTemperature: payload_bytes = sizeof(ImuTemperaturePayload); break;
+        case ImuHeader::PayloadEnum::kAccelerometer:
+            payload_bytes = sizeof(ImuAccelerometerPayload);
+            break;
+        case ImuHeader::PayloadEnum::kGyroscope: payload_bytes = sizeof(ImuGyroscopePayload); break;
+        case ImuHeader::PayloadEnum::kTemperature:
+            payload_bytes = sizeof(ImuTemperaturePayload);
+            break;
         default: return 0;
         }
 

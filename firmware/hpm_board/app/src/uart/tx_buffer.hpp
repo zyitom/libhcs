@@ -26,7 +26,11 @@ namespace libhcs::firmware::uart {
 
 class TxBuffer {
 public:
-    static constexpr size_t kBufferSize = 2048;
+    // 16 KB: DMTool 串口升级把 8198 B 整块一次性灌入 CDC(UART IAP 的真实用法),
+    // 缓冲必须装得下整块, 否则 try_enqueue 溢出丢弃 -> 电机收残块 -> 静默超时
+    // (2026-09-22 实测: 2048 时 8198B 块丢 ~6KB, DMTool 报 packet ack timeout)。
+    // 正版适配器同样在设备侧缓冲整块。
+    static constexpr size_t kBufferSize = 16384;
     static constexpr size_t kBufferMask = kBufferSize - 1;
     static_assert((kBufferSize & (kBufferSize - 1)) == 0);
 
@@ -44,6 +48,7 @@ public:
         init_dma(dmamux_src);
     }
 
+    ATTR_PLACE_AT(".fast")
     bool try_enqueue(const data::UartDataView& data_view) {
         const auto in = in_.load(std::memory_order::relaxed);
         const auto out = out_.load(std::memory_order::acquire);
@@ -127,6 +132,7 @@ public:
         in_flight_ = 0;
     }
 
+    ATTR_PLACE_AT(".fast")
     bool try_dequeue() {
         if (dma_channel_is_enable(dma_.base, dma_.channel))
             return false;
@@ -206,6 +212,7 @@ private:
         // 无需 cache flush: 描述符在 AHB SRAM。
     }
 
+    ATTR_PLACE_AT(".fast")
     void trigger_dma(const std::byte* src, size_t size, const std::byte* src2, size_t size2) {
         core::utility::assert_debug(src);
         // 无需 cache flush: 缓冲在 AHB SRAM。

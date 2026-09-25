@@ -100,6 +100,20 @@ void push_can_rx(std::size_t can_index, const CanFrameEvent& event);
 // ---- libhcs 会话 ----
 
 // libhcs 会话建立: 本模块让位(Vendor::session_activated_callback 调用)。
+//
+// 让位不止是"不处理": DMTool 的 6 个端点全部 STALL。原因在总线上而不在 CPU 上 --
+// 主机若还开着 DMTool, 它挂在 0x81/0x83 上的读请求会让主机控制器每个微帧反复
+// 轮询这两个端点, 板子只能回 NAK, 白占 libhcs 的总线时间(多一条挂着 URB 的管道,
+// 包率实测掉 22%, 见 USB_OPTIMIZATION_LOG.md 4.5)。STALL 由 USB 控制器硬件直接
+// 应答, 不产生任何中断或事件; 主机侧 DMTool 拿到 LIBUSB_ERROR_PIPE, 报 USB 故障
+// 并按 100 ms 退避重试(DMTool 2.1.9.3 can_rec_thread_func), 总线上只剩零星的
+// STALL 握手。代价是 libhcs 接管期间 DMTool 必然报错断开 -- 两者本就按约定不同时
+// 用, HCS 退出后重新打开 DMTool 即可。
 void on_libhcs_session();
+
+// libhcs 会话结束(租约到期、挂起、拔线; Vendor::session_deactivated_callback 调用):
+// 解除上面的 STALL, 重新挂上 OUT 端点, DMTool 可以重新打开本板。没有被隔离时是
+// 空操作。
+void on_libhcs_session_end();
 
 } // namespace libhcs::firmware::dmtool

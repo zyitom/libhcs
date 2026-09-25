@@ -58,6 +58,37 @@ SECTIONS
         *(.text._ZN6libhcs8firmware4link19InterruptSafeBuffer*)
         *(.text._ZNK6libhcs8firmware4link19InterruptSafeBuffer*)
         *(.text.mcan_read_rxfifo*)
+        /* Everything the ILM code above still reached in FLASH on every frame.
+         * One out-of-ILM callee is enough to put the whole path back on the
+         * XIP caches: whether its line survives the ~1 ms between frames
+         * depends on where unrelated code happens to land, so any edit
+         * anywhere in FLASH could move the forwarding latency. Measured
+         * 2026-09-21 on identical hot-path code (see
+         * firmware/hpm_board/USB_OPTIMIZATION_LOG.md section 14): CAN RX ISR
+         * to serialized 2.3-2.4 -> 4.1-4.3 us, bulk OUT to TX FIFO
+         * 2.8 -> 8.9 us, host rtt p99 +16-17 us, flipped by layout alone.
+         *
+         * The per-frame callees: MCAN TX (+ its slot fill) and RX timestamp
+         * read, and the libc block moves the compiler emits for the
+         * serializer, deserializer and MCAN element copies. All are leaves or
+         * call only each other, so no call from here crosses back into FLASH
+         * (USB_OPTIMIZATION_LOG.md 3.2 is why that matters). The libc members
+         * come from plain assembly/.text objects, hence archive:member specs. */
+        *(.text.mcan_get_timestamp_from_received_message*)
+        *(.text.mcan_transmit_via_txfifo_nonblocking*)
+        *(.text.mcan_fill_tx_frame_to_msg_ram_slot*)
+        *libc*.a:*-memcpy*.o(.text .text.*)
+        *libc*.a:*-memmove*.o(.text .text.*)
+        *libc*.a:*-memset*.o(.text .text.*)
+        /* Read-only tables the code above indexes per frame: the coroutine
+         * resume jump tables of the deserializer and the switch-conversion
+         * lookups (CSWTCH) in the MCAN driver and can.cpp. Left in the .text
+         * catch-all they are FLASH loads through the D-cache, the same layout
+         * lottery on the data side. ILM serves loads (the SDK ram.ld keeps all
+         * of .rodata there). */
+        *(.rodata._ZN6libhcs4core8protocol*)
+        *(.rodata._ZNK6libhcs4core8protocol*)
+        *(.srodata.CSWTCH.* .rodata.CSWTCH.*)
         . = ALIGN(8);
         __vector_ram_end__ = .;
     } > ILM
@@ -68,6 +99,19 @@ SECTIONS
     ASSERT(
         _ZN6libhcs8firmware4link19InterruptSafeBuffer8allocateEj < ORIGIN(ILM) + LENGTH(ILM),
         "ILM name rules in .vectors matched nothing: InterruptSafeBuffer::allocate is outside ILM. Recheck the mangled prefixes there against riscv32-unknown-elf-nm.")
+
+    /* Same tripwire for the per-frame callees: a toolchain whose libc names its
+     * objects differently, or an SDK that renames an MCAN function, must fail
+     * the link instead of silently reopening the layout lottery.
+     * mcan_fill_tx_frame_to_msg_ram_slot is static in hpm_mcan_drv.c, so an
+     * expression cannot name it; it shares the object and naming scheme of
+     * mcan_transmit_via_txfifo_nonblocking, its only caller, checked here. */
+    ASSERT(
+        memcpy < ORIGIN(ILM) + LENGTH(ILM) && memmove < ORIGIN(ILM) + LENGTH(ILM)
+            && memset < ORIGIN(ILM) + LENGTH(ILM)
+            && mcan_get_timestamp_from_received_message < ORIGIN(ILM) + LENGTH(ILM)
+            && mcan_transmit_via_txfifo_nonblocking < ORIGIN(ILM) + LENGTH(ILM),
+        "A per-frame callee of the ILM hot path is in FLASH: check the libc archive:member and mcan_* specs in .vectors against the linker map.")
 
     .text (__vector_load_addr__ + SIZEOF(.vectors)): {
         . = ALIGN(8);

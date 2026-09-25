@@ -165,11 +165,13 @@ public:
         return (uart_base_->LCR & UART_LCR_STB_MASK) != 0U ? 2U : 1U;
     }
 
+    ATTR_PLACE_AT(".fast")
     void handle_downlink(const data::UartDataView& data) {
         if (!TxBuffer::try_enqueue(data))
             led::led->downlink_buffer_full();
     }
 
+    ATTR_PLACE_AT(".fast")
     void try_transmit() { TxBuffer::try_dequeue(); }
 
     void irq_handler() {
