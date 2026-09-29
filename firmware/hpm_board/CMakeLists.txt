@@ -42,6 +42,9 @@ option(libhcs_PULSE_TEST "Measure cross-board skew with GPTMR pulses (takes over
 # 透传给 app 子构建为 libhcs_APP_SOF_DIAG; 见 app/CMakeLists.txt。
 option(libhcs_SOF_DIAG "Emit USB SOF / FRINDEX validation telemetry on the UART0 uplink" OFF)
 
+# 透传给 app 子构建为 libhcs_APP_WATCHDOG; 见 app/CMakeLists.txt。
+option(libhcs_WATCHDOG "Reset the board from the EWDG when the main loop stops feeding it" OFF)
+
 # 透传给 app 子构建为 libhcs_APP_ILM_HOT_PATH。HPM5321 始终用板自有的链接布局;
 # 该开关只作用于 HPM6E8Y。
 option(libhcs_ILM_HOT_PATH "Run the HPM6E8Y CAN driver from ILM" OFF)
@@ -95,6 +98,7 @@ add_hpm_board_subbuild(
     -Dlibhcs_APP_TIME_SYNC=${libhcs_TIME_SYNC}
     -Dlibhcs_APP_PULSE_TEST=${libhcs_PULSE_TEST}
     -Dlibhcs_APP_SOF_DIAG=${libhcs_SOF_DIAG}
+    -Dlibhcs_APP_WATCHDOG=${libhcs_WATCHDOG}
     -Dlibhcs_APP_ILM_HOT_PATH=${libhcs_ILM_HOT_PATH}
 )
 add_hpm_board_subbuild(

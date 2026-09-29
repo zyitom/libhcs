@@ -77,9 +77,12 @@ SECTIONS
         *(.text.mcan_get_timestamp_from_received_message*)
         *(.text.mcan_transmit_via_txfifo_nonblocking*)
         *(.text.mcan_fill_tx_frame_to_msg_ram_slot*)
-        *libc*.a:*-memcpy*.o(.text .text.*)
-        *libc*.a:*-memmove*.o(.text .text.*)
-        *libc*.a:*-memset*.o(.text .text.*)
+        /* lib[gc]_nano.a 的成员还叫 lib_a-memcpy-asm.o（汇编实现），归档名也不
+         * 带 c —— 2023.10.18 工具链在 zbb multilib 下解析出它们，原 *libc* 模式
+         * 漏配、断言如实拦截。放宽到 lib[gc]* 并保持成员通配。 */
+        *lib[gc]*.a:*-memcpy*.o(.text .text.*)
+        *lib[gc]*.a:*-memmove*.o(.text .text.*)
+        *lib[gc]*.a:*-memset*.o(.text .text.*)
         /* Read-only tables the code above indexes per frame: the coroutine
          * resume jump tables of the deserializer and the switch-conversion
          * lookups (CSWTCH) in the MCAN driver and can.cpp. Left in the .text

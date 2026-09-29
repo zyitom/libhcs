@@ -204,3 +204,13 @@ libhcs_add_dfu_image(
     DEVICE_ID 0x0300
     COMMENT "Generating mc02_app.dfu"
 )
+
+# IWDG hardware watchdog (src/watchdog/watchdog.hpp): resets the board when the
+# main loop stops feeding it for 500 ms -- the hard backstop against any hang.
+# OFF by default because a watchdog turns every hang into a silent reboot:
+# debug builds must be able to see the hang instead. IWDG cannot be stopped
+# once started, hence a compile-time gate rather than a runtime one.
+option(libhcs_APP_WATCHDOG "Reset the board when the main loop stops feeding the IWDG" OFF)
+if(libhcs_APP_WATCHDOG)
+    target_compile_definitions(mc02_app PRIVATE libhcs_APP_WATCHDOG=1)
+endif()

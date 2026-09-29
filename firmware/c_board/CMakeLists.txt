@@ -64,5 +64,9 @@ function(c_board_apply_target_options target linker_file)
 endfunction()
 
 
+# 看门狗顶层开关:与 hpm_board 一致的命令行入口,透传为 app 级 libhcs_APP_WATCHDOG。
+option(libhcs_WATCHDOG "Reset the board when the main loop stops feeding the IWDG" OFF)
+set(libhcs_APP_WATCHDOG ${libhcs_WATCHDOG} CACHE BOOL "" FORCE)
+
 add_subdirectory(app)
 add_subdirectory(bootloader)

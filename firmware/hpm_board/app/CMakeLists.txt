@@ -71,6 +71,13 @@ option(libhcs_APP_PULSE_TEST "Measure cross-board skew with GPTMR pulses" OFF)
 # hook compiles to nothing and the 8 kHz interrupt is never enabled.
 option(libhcs_APP_SOF_DIAG "Emit USB SOF / FRINDEX validation telemetry on the UART0 uplink" OFF)
 
+# EWDG hardware watchdog (src/watchdog/watchdog.hpp): resets the board when the
+# main loop stops feeding it for 500 ms -- the hard backstop against any hang,
+# USB IRQ spin included. OFF by default because a watchdog turns every hang into
+# a silent reboot: debug builds must be able to see the hang instead. Turn it on
+# for match images.
+option(libhcs_APP_WATCHDOG "Reset the board when the main loop stops feeding the EWDG" OFF)
+
 set(CONFIG_DMA_MGR 1)
 set(CONFIG_USB_DEVICE 1)
 set(libhcs_BUILDING_FIRMWARE_APP 1)
@@ -132,6 +139,9 @@ if(libhcs_APP_PULSE_TEST)
 endif()
 if(libhcs_APP_SOF_DIAG)
     sdk_compile_definitions(-Dlibhcs_APP_SOF_DIAG=1)
+endif()
+if(libhcs_APP_WATCHDOG)
+    sdk_compile_definitions(-Dlibhcs_APP_WATCHDOG=1)
 endif()
 
 sdk_compile_definitions(-Dlibhcs_PROJECT_VERSION_STRING="${libhcs_PROJECT_VERSION}")

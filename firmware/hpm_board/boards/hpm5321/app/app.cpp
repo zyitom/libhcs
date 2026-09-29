@@ -20,6 +20,7 @@
 #include "firmware/hpm_board/app/src/usb/vendor.hpp"
 #include "firmware/hpm_board/app/src/utility/boot_mailbox.hpp"
 #include "firmware/hpm_board/app/src/utility/interrupt_lock.hpp"
+#include "firmware/hpm_board/app/src/watchdog/watchdog.hpp"
 
 int main() { libhcs::firmware::app.init().run(); }
 
@@ -38,6 +39,10 @@ App::App() {
         l1c_dc_enable_writearound();
 
         boot::BootMailbox::clear();
+
+        // 硬件看门狗（libhcs_WATCHDOG，默认 OFF）：主循环停止喂狗 500ms 即复位。
+        // 默认不编进调试镜像——挂死现场比自动恢复更值得看到。
+        watchdog::watchdog.init();
 
         led::led.init();
         timer::timer.init();
@@ -136,6 +141,8 @@ bool host_session_established() {
 
         for (auto& board_uart : uart::uart_array)
             board_uart->try_transmit();
+
+        watchdog::watchdog->feed();
     }
 }
 

@@ -28,6 +28,7 @@
 #include "firmware/mc02/app/src/usb/vendor.hpp"
 #include "firmware/mc02/app/src/utility/boot_mailbox.hpp"
 #include "firmware/mc02/app/src/utility/interrupt_lock.hpp"
+#include "firmware/mc02/app/src/watchdog/watchdog.hpp"
 
 int main() {
     SCB->VTOR = 0x08040000U;
@@ -124,6 +125,10 @@ App::App() {
     PeriphCommonClock_Config();
 
     utility::boot_mailbox.clear();
+
+    // 硬件看门狗（libhcs_WATCHDOG，默认 OFF）：主循环停止喂狗 500ms 即复位。
+    // 默认不编进调试镜像——挂死现场比自动恢复更值得看到。
+    watchdog::watchdog.init();
 
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CYCCNT = 0;
@@ -327,6 +332,8 @@ App::App() {
 #endif
 
         diag::profile::end_pass();
+
+        watchdog::watchdog->feed();
     }
 }
 
