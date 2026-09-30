@@ -1,10 +1,16 @@
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 #include <libhcs/board/common.hpp>
+#include <libhcs/board/hcs_can_port.hpp>
 #include <libhcs/board/hcs_config.hpp>
 #include <libhcs/data/datas.hpp>
 #include <libhcs/protocol/handler.hpp>
@@ -34,7 +40,7 @@ namespace libhcs::board {
  * finished construction. Delay board construction with `std::optional` or `std::unique_ptr` when
  * callback behavior depends on such state.
  */
-class CBoard final {
+class CBoard final : public hcs::Reconfigurable {
 public:
     class Callback : public data::DataCallback {
     public:
@@ -130,10 +136,20 @@ public:
         }
     };
 
+    // 构造期经 EP0 应用并回读, 被拒即抛; 见 libhcs/board/hcs_config.hpp。
+    using Configuration = hcs::Configuration;
+
     explicit CBoard(
         Callback& callback = default_callback_, std::string_view serial_filter = {},
-        const AdvancedOptions& options = {})
-        : handler_(0xA511, 0xF407, serial_filter, options, callback) {}
+        const AdvancedOptions& options = {}, const Configuration& configuration = {})
+        : configuration_(configuration)
+        , handler_(
+              0xA511, 0xF407, serial_filter, options, callback,
+              [this](host::protocol::Handler& handler) {
+                  // 读 kGetInterface 即 EP0 握手, 固件在此之前不应答会话。
+                  const std::scoped_lock guard{reconfigure_mutex_};
+                  interface_.store(hcs::apply(handler, configuration_), std::memory_order_release);
+              }) {}
 
     CBoard(const CBoard&) = delete;
     CBoard& operator=(const CBoard&) = delete;
@@ -145,16 +161,19 @@ public:
         friend class CBoard;
 
     public:
-        PacketBuilder& can1_transmit(const libhcs::data::CanDataView& data) {
-            hcs::reject_long_payload(data.can_data, "CAN1");
-            if (!builder_.write_can(data::DataId::kCan1, data)) [[unlikely]]
-                throw std::invalid_argument{"CAN1 transmission failed: Invalid CAN data"};
-            return *this;
-        }
-        PacketBuilder& can2_transmit(const libhcs::data::CanDataView& data) {
-            hcs::reject_long_payload(data.can_data, "CAN2");
-            if (!builder_.write_can(data::DataId::kCan2, data)) [[unlikely]]
-                throw std::invalid_argument{"CAN2 transmission failed: Invalid CAN data"};
+        // Transmits on the CAN port named as the enclosure labels it.
+        // Ports on this board: CanPort::kCan1, CanPort::kCan2 (silkscreen
+        // CAN1..CAN2). Same entry point as every other board's, so a caller
+        // that does not know which board it holds can still address a port.
+        PacketBuilder& can_transmit(hcs::CanPort port, const libhcs::data::CanDataView& data) {
+            // kCanN == DataId::kCanN on this board (silkscreen CAN1..CAN2).
+            const auto index = std::to_underlying(port);
+            if (index < 1 || index > spec::c_board::kCanIds.size()) [[unlikely]]
+                throw std::out_of_range{
+                    "CBoard: CAN port out of range (this board has CAN1..CAN2)"};
+            hcs::reject_long_payload(data.can_data, spec::c_board::kCanNames[index - 1]);
+            if (!builder_.write_can(spec::c_board::kCanIds[index - 1], data)) [[unlikely]]
+                throw std::invalid_argument{"CAN transmission failed: Invalid CAN data"};
             return *this;
         }
 
@@ -164,6 +183,8 @@ public:
             return *this;
         }
 
+        // 带内旧路径, 只写不回报; 新代码用 CBoard::configure_uart1()。阶段 6 实测后删。
+        //
         // Runtime reconfiguration of UART1. Rides the same downlink stream as
         // the data above, so it is ordered against it: bytes queued earlier in
         // this batch are sent at the old baudrate, later ones at the new one.
@@ -178,6 +199,8 @@ public:
             return *this;
         }
 
+        // 带内旧路径, 只写不回报; 新代码用 CBoard::configure_uart2()。阶段 6 实测后删。
+        //
         // Runtime reconfiguration of UART2. Rides the same downlink stream as
         // the data above, so it is ordered against it: bytes queued earlier in
         // this batch are sent at the old baudrate, later ones at the new one.
@@ -228,8 +251,48 @@ public:
 
     PacketBuilder start_transmit() noexcept { return PacketBuilder{handler_}; }
 
+    // EP0 运行期重配: 同步、板端确认后才返回, 被拒即抛; 与已排队数据不定序, 切换前先静默链路。
+    // 下标即板端 EP0 顺序: 0=DBUS, 1=UART1, 2=UART2。
+    void configure_dbus(uint32_t baudrate) { configure_uart(0, {.baudrate = baudrate}); }
+    void configure_uart1(uint32_t baudrate) { configure_uart(1, {.baudrate = baudrate}); }
+    void configure_uart2(uint32_t baudrate) { configure_uart(2, {.baudrate = baudrate}); }
+
+    // 完整形式: 速率 + 帧格式(字长 7/8、校验、停止位 1/2), 0 字段不动。见 hcs::UartSetting。
+    void configure_dbus(const hcs::UartSetting& setting) { configure_uart(0, setting); }
+    void configure_uart1(const hcs::UartSetting& setting) { configure_uart(1, setting); }
+    void configure_uart2(const hcs::UartSetting& setting) { configure_uart(2, setting); }
+
+    // 硬件实际速率, 由板端 BRR 反推, 不是上次请求值。
+    uint32_t dbus_baudrate() { return hcs::read_uart_baudrate(handler_, 0); }
+    uint32_t uart1_baudrate() { return hcs::read_uart_baudrate(handler_, 1); }
+    uint32_t uart2_baudrate() { return hcs::read_uart_baudrate(handler_, 2); }
+
+    // 单口完整回读(速率 + 分频器 + 帧格式), 下标同上。
+    hcs::UartSetting read_uart_setting(std::size_t port) {
+        return hcs::read_uart_setting(handler_, port);
+    }
+
+    // 板子最近一次拒绝配置的原因, 粘滞到下次拒绝或复位。
+    [[nodiscard]] hcs::vc::LastConfigErrorPayload last_config_error() {
+        return hcs::read_last_config_error(handler_);
+    }
+
+    // 板子经 EP0 报告的通道数与能力位(快照; 重连时由 keepalive 线程刷新)。
+    [[nodiscard]] hcs::Interface interface() const {
+        return interface_.load(std::memory_order_relaxed);
+    }
+
 private:
+    // configure_*() 的共用体: 整个 EP0 往返持重配锁, 并写回 configuration_ 供重连重放。
+    void configure_uart(std::size_t port, const hcs::UartSetting& setting) {
+        const std::scoped_lock guard{reconfigure_mutex_};
+        hcs::reconfigure_uart(handler_, configuration_, port, setting);
+    }
+
     static inline Callback default_callback_{};
+    // 两者须声明在 handler_ 之前: 钩子在 handler_ 构造期间就会访问它们。
+    std::atomic<hcs::Interface> interface_;
+    Configuration configuration_;
     host::protocol::Handler handler_;
 };
 

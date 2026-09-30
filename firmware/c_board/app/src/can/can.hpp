@@ -12,6 +12,7 @@
 #include <stm32f4xx_hal_def.h>
 
 #include "core/include/libhcs/data/datas.hpp"
+#include "core/include/libhcs/spec/c_board/can.hpp"
 #include "core/src/protocol/serializer.hpp"
 #include "core/src/utility/assert.hpp"
 #include "core/src/utility/immovable.hpp"
@@ -171,5 +172,12 @@ private:
 // loop, all CPU-only (no DMA touches them), so CCM keeps them off the AHB bus.
 [[gnu::section(".ccmram")]] inline constinit Can::Lazy can1{&hcan1, 0, 14};
 [[gnu::section(".ccmram")]] inline constinit Can::Lazy can2{&hcan2, 14, 14};
+
+// 本板总线条数, 取自规范表的容量 —— 与 mc02 同为编译期常量, 与 hpm_board 的
+// can_count()(单 CAN / 双 CAN 共用镜像, 运行期按板型判定, 见其注释)不同:
+// bxCAN 的两路都在同一颗芯片上, 没有需要运行期分辨的板型。EP0 的 InterfacePayload
+// 与下标校验都用它, 避免"2"这个数字散落在两处。
+inline constexpr size_t kCanCount = std::size(spec::c_board::kCanIds);
+static_assert(kCanCount == 2);
 
 } // namespace libhcs::firmware::can

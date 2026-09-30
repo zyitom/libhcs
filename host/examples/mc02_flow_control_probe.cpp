@@ -49,9 +49,10 @@ int main(int argc, char** argv) {
                 payload[i] = static_cast<std::byte>((sequence + i) & 0xFFU);
 
             auto builder = board.start_transmit();
-            builder.can1_transmit({.can_id = 0x321,
-                                   .can_data = {payload.data(), payload.size()},
-                                   .is_extended_can_id = false});
+            builder.can_transmit(libhcs::board::hcs::CanPort::kCan1,
+                                 {.can_id = 0x321,
+                                  .can_data = {payload.data(), payload.size()},
+                                  .is_extended_can_id = false});
             ++slice_frames;
 
             if (slice_frames == 100) {

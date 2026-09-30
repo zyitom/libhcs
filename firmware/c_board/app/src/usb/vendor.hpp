@@ -52,6 +52,10 @@ public:
     // USB enumeration, which says nothing about whether a host is talking.
     bool session_established() const { return session_established_; }
 
+    // EP0 接口握手: 主机读过 kGetInterface 即置位, 之后才允许开会话。
+    // EP0 处理器(usb/vendor_control.cpp)在应答之后调用它。
+    void set_ep0_handshake_done(bool done) { ep0_handshake_done_ = done; }
+
     void deactivate_session() {
         session_established_ = false;
         // A session takes the GPIO outputs it set with it; see Gpio::stop_outputs().
@@ -230,6 +234,14 @@ private:
     void session_control_deserialized_callback(const data::SessionControlView& data) override {
         switch (data.type) {
         case data::SessionType::kStart: {
+            // 主机完成 EP0 接口握手之前静默拒绝。会话协议没有否定应答, 开不了
+            // 会话的主机约一秒后自行触发 ack 超时并给出自己的报错; 沉默是本层
+            // 唯一能说的话。这道门挡的是**旧主机**: EP0 之前的 SDK 会跳过
+            // kGetInterface 直接开会话, 而它的带内配置写入(本板已改为只走 EP0)
+            // 会被忽略, 于是"配了但没生效"静默发生 —— 那正是本任务要消灭的失败。
+            if (!ep0_handshake_done_)
+                return;
+
             const bool same_session = session_established_ && data.nonce == current_session_nonce_;
 
             if (!same_session)
@@ -282,6 +294,9 @@ private:
     const InterruptSafeBuffer::Batch* transmitting_batch_ = nullptr;
     size_t transmitted_size_ = 0;
     bool session_established_ = false;
+    // EP0 接口握手标志, 由 usb/vendor_control.cpp 置位。见
+    // session_control_deserialized_callback() 的说明。
+    bool ep0_handshake_done_ = false;
     uint32_t current_session_nonce_ = 0;
     timer::Timer::TimePoint48 last_session_refresh_ = timer::Timer::TimePoint48::min();
 };

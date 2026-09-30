@@ -86,9 +86,13 @@ ch32_board 的机壳从 CAN1 起，不用这个 id。数值仍是线格式的一
 
 ## UART
 
-| 逻辑名 | 硬件 | TXD | RXD | 波特率 | 校验 | 来源 |
+| 接口 | 硬件 | TXD | RXD | 波特率 | 校验 | 来源 |
 | ------- | -------- | ---- | ---- | ------ | ------ | ------------------------- |
 | UART0 | UART2 | PB08 | PB09 | 921600 | 无 | `app/board_app.cpp` 的 `init_uart()` |
+
+"接口"列是线协议的 `DataId::kUart0`（主机 `configure_uart0()` / EP0 UART 下标 0），不是芯片外设号：
+本板的 `kUart0` 实物是 **UART2**；芯片上的 UART0 存在但板上未用。hpm6e8y 上同一个 `kUart0`
+实物是 UART1——逐板不同，见 [UART_EP0_MIGRATION.md](../../../../UART_EP0_MIGRATION.md) 2.4。
 
 端口表在 `app/board_app.hpp`（`kUartPorts`）。两个引脚都启用了内部上拉；RX 额外开了
 施密特触发器。收发均由 DMA 驱动（`HPM_DMA_SRC_UART2_TX/RX`），环形缓冲放在

@@ -14,13 +14,15 @@
 //      at its previous rate. This is the case that used to look like success.
 //   4. A rate inside the solver's 3% tolerance is accepted and reported as the
 //      value actually programmed, not the value requested (3000000 -> 3076923).
-//   5. A wrong CAN mode expectation throws at construction instead of quietly
-//      producing frames of the other type on the wire.
+//   5. A CAN setting from the host is APPLIED: classic re-initializes the
+//      controller with FD off (a CAN 2.0 bus must never see an FD bit) and the
+//      data phase reads back as 0; a host-sent rate is solved at the pinned
+//      87.5%; an unrepresentable rate is refused with the bus untouched.
 //   6. Construction-time configuration works, and a board object that finished
 //      constructing is a board whose configuration is known.
 //   7. The board's CAN timing identity reads back as one coherent truth: mode,
-//      rates and sample points, plus the capability bits (this board clears
-//      kCapCanModeSettable -- mode application is an mc02 feature).
+//      rates and sample points, plus the capability bits (kCapCanModeSettable
+//      and kCapCanRateSettable set).
 //   8. UART framing (stop bits here) applies, reads back from the live
 //      registers, and restores -- the same apply-then-verify contract the
 //      baudrate checks above exercise.
@@ -144,6 +146,14 @@ int main(int argc, char** argv) {
         check(
             approximate > 2'900'000 && approximate < 3'200'000,
             "and it is within the solver's tolerance");
+        // 80 MHz 下 3M 解为 osc=26 div=1: 核对上报的是过采样倍数本身。
+        const hcs::UartSetting approximate_setting = board.read_uart_setting(0);
+        std::printf(
+            "   divisor %u, oversample %u\n", approximate_setting.divisor,
+            approximate_setting.oversample);
+        check(
+            approximate_setting.divisor == 1 && approximate_setting.oversample == 26,
+            "it reports the integers it programmed (divisor 1, oversample 26)");
 
         board.configure_uart0(kBaseBaudrate);
         check(
@@ -155,22 +165,68 @@ int main(int argc, char** argv) {
         ++g_failures;
     }
 
-    std::printf("5. wrong CAN mode expectation fails construction\n");
-    {
-        bool threw = false;
+    std::printf("5. CAN settings from the host: mode and rates applied, bad rate refused\n");
+    try {
+        AdvancedOptions options;
+        options.set_dangerously_skip_version_checks(true);
+        Hpm5321::Configuration configuration;
+        configuration.can[0] = hcs::kClassic1M; // 端口表默认 FD 1M/5M, 构造期即切到经典 1M
+        Hpm5321 board{callback, filter, options, configuration};
+        using hcs::vc::CanMode;
+        const auto print = [](const char* label, const hcs::vc::CanConfigPayload& config) {
+            std::printf(
+                "   %s: mode=%u arb=%u data=%u nominal_sp=%u data_sp=%u\n", label, config.mode,
+                config.arbitration_baudrate, config.data_baudrate, config.nominal_sample_point,
+                config.data_sample_point);
+        };
+
+        const auto classic = board.can_config(hcs::CanPort::kCan1);
+        print("classic 1M", classic);
+        check(!board.can1_is_fd(), "construction switched CAN1 to classic");
+        check(
+            classic.mode == std::to_underlying(CanMode::kClassic),
+            "and the board reads back classic");
+        check(
+            classic.data_baudrate == 0U && classic.data_sample_point == 0U,
+            "controller runs with FD off: no data phase reported");
+        check(
+            classic.arbitration_baudrate == 1'000'000U && classic.nominal_sample_point == 875U,
+            "arbitration phase is 1 Mbit/s at 87.5%");
+
+        board.configure_can1({.fd = false, .arbitration_baudrate = 500'000});
+        const auto slow = board.can_config(hcs::CanPort::kCan1);
+        print("classic 500k", slow);
+        check(
+            slow.arbitration_baudrate == 500'000U && slow.nominal_sample_point == 875U,
+            "a host-sent 500 kbit/s is solved at the pinned 87.5%");
+
+        bool refused = false;
         try {
-            AdvancedOptions options;
-            options.set_dangerously_skip_version_checks(true);
-            Hpm5321::Configuration configuration;
-            configuration.can_fd[0] = false; // the board runs CAN-FD on bus 0
-            Hpm5321 board{
-                callback, filter, options, configuration};
-            (void)board;
+            // 80 MHz / 3 Mbit 除不尽, 87.5% 采样点下解不出。
+            board.configure_can1(
+                {.fd = true, .arbitration_baudrate = 1'000'000, .data_baudrate = 3'000'000});
         } catch (const std::exception& error) {
-            threw = true;
-            std::printf("   threw: %s\n", error.what());
+            refused = true;
+            std::printf("   refused: %s\n", error.what());
         }
-        check(threw, "opening an FD bus as classic CAN throws");
+        check(refused, "an unrepresentable data rate is refused");
+        check(
+            board.can_config(hcs::CanPort::kCan1).arbitration_baudrate == 500'000U
+                && !board.can1_is_fd(),
+            "and the bus keeps its previous setting");
+
+        board.configure_can1(hcs::kFd1M5M);
+        const auto fd = board.can_config(hcs::CanPort::kCan1);
+        print("FD 1M/5M", fd);
+        check(board.can1_is_fd(), "configure_can1(kFd1M5M) switched CAN1 to FD");
+        check(fd.mode == std::to_underlying(CanMode::kCanFd), "and the board reads back FD");
+        check(
+            fd.arbitration_baudrate == 1'000'000U && fd.data_baudrate == 5'000'000U
+                && fd.nominal_sample_point == 875U && fd.data_sample_point == 875U,
+            "FD at 1 / 5 Mbit/s, both phases at 87.5%");
+    } catch (const std::exception& error) {
+        std::printf("  [FAIL] unexpected exception: %s\n", error.what());
+        ++g_failures;
     }
 
     std::printf("6. construction-time configuration is applied and verified\n");
@@ -178,16 +234,48 @@ int main(int argc, char** argv) {
         AdvancedOptions options;
         options.set_dangerously_skip_version_checks(true);
         Hpm5321::Configuration configuration;
-        configuration.uart_baudrate[0] = kDefaultBaudrate;
-        configuration.can_fd[0] = true;
-        configuration.can_fd[1] = true;
+        configuration.uart[0] = hcs::UartSetting{.baudrate = kDefaultBaudrate};
+        configuration.can[0] = hcs::kFd1M5M;
+        configuration.can[1] = hcs::kFd1M5M;
         Hpm5321 board{
             callback, filter, options, configuration};
-        const uint32_t effective = board.uart0_baudrate();
-        std::printf("   board reports %u after construction\n", effective);
+        // The rate is verified on the divisor the board programmed, not on the
+        // baudrate: 921600 is not representable on this board's 80 MHz clock,
+        // so it comes back as 909090 and a percentage comparison would be
+        // measuring the solver's rounding error rather than whether the switch
+        // landed.
+        const hcs::UartSetting effective = board.read_uart_setting(0);
+        std::printf(
+            "   board reports %u baud, divisor %u, oversample %u\n", effective.baudrate,
+            effective.divisor, effective.oversample);
+        check(effective.divisor != 0, "the board reported the divisor it programmed");
         check(
-            within_tolerance(kDefaultBaudrate, effective),
+            within_tolerance(kDefaultBaudrate, effective.baudrate),
             "the constructor left the port at 921600");
+
+        // Re-applying the read-back is an assertion on the whole port: the
+        // board must land on exactly these integers.
+        board.configure_uart0(effective);
+        check(true, "re-asserting the read-back divisor is accepted");
+
+        // 回显错的分频器必须被拒, 锁存 VerifyFailed, 端口不动。
+        hcs::UartSetting wrong = effective;
+        wrong.divisor = static_cast<uint16_t>(effective.divisor + 1U);
+        bool refused = false;
+        try {
+            board.configure_uart0(wrong);
+        } catch (const std::exception& error) {
+            refused = true;
+            std::printf("   threw: %s\n", error.what());
+        }
+        check(refused, "a wrong divisor echo is refused");
+        check(
+            board.last_config_error().reason
+                == std::to_underlying(hcs::vc::ConfigErrorReason::kConfigErrorVerifyFailed),
+            "and the board latched kConfigErrorVerifyFailed");
+        check(
+            board.read_uart_setting(0).divisor == effective.divisor,
+            "and the port kept the divisor it had");
     } catch (const std::exception& error) {
         std::printf("  [FAIL] unexpected exception: %s\n", error.what());
         ++g_failures;
@@ -210,8 +298,8 @@ int main(int argc, char** argv) {
         check(config.nominal_sample_point == 875U, "nominal sample point is 87.5%");
         check(config.data_sample_point == 875U, "data sample point is 87.5%");
         check(
-            !board.interface().can_mode_settable,
-            "and this board does NOT offer host-driven mode changes (mc02 does)");
+            board.interface().can_mode_settable,
+            "and this board offers host-driven mode changes (like mc02)");
     } catch (const std::exception& error) {
         std::printf("  [FAIL] unexpected exception: %s\n", error.what());
         ++g_failures;

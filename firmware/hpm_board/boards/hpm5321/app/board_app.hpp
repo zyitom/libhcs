@@ -46,13 +46,12 @@ constexpr size_t kCanPortCapacity = 2;
 // CAN 端口按表序排列: 丝印 CAN1 = kCanPorts[0] = DataId::kCan1, 丝印
 // CAN2 = kCanPorts[1] = DataId::kCan2。
 //
-// 两种板型都跑 CAN-FD, 表对两块 PCB 相同, 单 CAN 板只是少使能一路。接收方向
-// FD 是经典 CAN 2.0 的严格超集: 开启 FD 的 M_CAN 仍能解码对端的经典帧。发送
-// 方向不再逐帧选择 -- 帧类型跟随总线, 本板发出的每一帧都是 FD(见 can.cpp 与
-// core/src/protocol/protocol.hpp 中已废弃的 IsFdCan 头部位)。运行时不切换
-// 模式: 控制器配置一次, 保持 FD 能力。经典模式完全收不到 FD 帧(实测 FD 对端
-// 0/50, 经典帧 50/50); 单 CAN 板收发器在 5 Mbit 数据段的时序仍待上板确认,
-// 见 README.md。
+// 表项是上电默认帧型: 两种板型都默认 CAN-FD, 表对两块 PCB 相同, 单 CAN 板只是少
+// 使能一路。发送方向不逐帧选择 -- 帧类型跟随总线(见 core/src/protocol/protocol.hpp
+// 中已废弃的 IsFdCan 头部位)。主机可经 EP0 kSetCanConfig 把某路切成经典 2.0: 控制器
+// 重初始化并关 FD, 2.0 总线上硬件层面不出现 FD 位(代价是经典模式收不到 FD 帧, 实测
+// FD 对端 0/50、经典帧 50/50, 纯 2.0 总线上正合适)。单 CAN 板收发器在 5 Mbit 数据段
+// 的时序仍待上板确认, 见 README.md。
 constexpr CanPort kCanPorts[] = {
     {.base = HPM_MCAN0_BASE,
      .irq_num = IRQn_MCAN0,

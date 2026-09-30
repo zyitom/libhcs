@@ -52,6 +52,22 @@ namespace libhcs::core::protocol::vendor_control {
 //   cannot parse long frames must not be handed them, and refusing at
 //   kGetInterface is the mechanism both directions already share.
 //
+//   v3 -> v4 (2026-09-30, automatic): UartConfigPayload grew from 8 to 12
+//   bytes with `divisor` and `oversample`, and ConfigErrorReason gained
+//   kConfigErrorVerifyFailed = 7. This is the UART-configuration unification:
+//   the rate agreement is now checked on the divisor integer the board
+//   actually programmed instead of on a percentage of the requested rate.
+//   Both ends must move together -- a v3 host against a v4 board (or the
+//   reverse) refuses at kGetInterface, which is the intended outcome, since a
+//   v3 host would read the old 8-byte layout out of a 12-byte payload.
+//
+//   v4 -> v5 (2026-09-30, automatic): CanConfigControl gained
+//   kCanConfigApplyTiming and CanCapabilities gained kCapCanRateSettable --
+//   the host now DECLARES a bus's rates (they are a wiring fact the host code
+//   knows, like a UART baudrate) and a board that advertises the capability
+//   solves its bit timing for them. Both are new enum values no payload
+//   layout observes, so they are folded in by hand (see the maintenance rule).
+//
 // The fingerprint itself lives at the bottom of this file, after every payload
 // it folds over.
 
@@ -114,13 +130,13 @@ static_assert(sizeof(InterfacePayload) == 8);
 // What a board lets the host do to its buses. A capability the board does not
 // advertise is not a softer setting -- requesting it stalls.
 enum CanCapabilities : uint8_t {
-    // The host may switch a bus's TX frame type at kSetCanConfig (the CAN
-    // controller stays FD-capable, so reception is unaffected either way).
-    // Clear means the mode is a compile-time property of the firmware's port
-    // table and can only be changed there. hpm_board clears this bit
-    // deliberately: a controller initialized without CAN-FD cannot receive FD
-    // frames at all (measured 0/50 from an FD peer), so mode application is
-    // not offered there.
+    // The host may switch a bus's TX frame type at kSetCanConfig. How is the
+    // board's business: mc02 keeps the controller FD-capable and flips the
+    // Tx-element FDF/BRS flags; hpm_board re-initializes the controller with
+    // FD off for classic, so a CAN 2.0 bus cannot see an FD bit (the price:
+    // a classic-mode controller receives no FD frames -- measured 0/50 --
+    // which on a 2.0-only bus is exactly right). Clear means the mode is a
+    // compile-time property of the firmware (c_board: bxCAN has no FD).
     kCapCanModeSettable = 1U << 0,
     // The board carries CAN-FD long frames (payloads 12-64 bytes) in BOTH
     // directions on an FD bus: its RX elements and TX buffers are sized for
@@ -132,6 +148,12 @@ enum CanCapabilities : uint8_t {
     // (c_board: bxCAN) clear it trivially; mc02 clears it until its RX FIFO
     // elements are widened to match its already FD-capable TX path.
     kCapCanFdLongFrames = 1U << 1,
+    // The host may SET a bus's arbitration/data rates (kCanConfigApplyTiming).
+    // The board keeps its own sample-point policy and solves prescaler and
+    // segments for the requested rate at that point. Clear means the rates are
+    // a compile-time property of the firmware and the rate fields stay pure
+    // assertions. hpm_board sets it; mc02 and c_board clear it.
+    kCapCanRateSettable = 1U << 2,
 };
 
 enum class CanMode : uint8_t {
@@ -145,29 +167,35 @@ enum class CanMode : uint8_t {
 //
 //   mode + control   the REQUEST. control bit kCanConfigApply asks the board
 //                    to switch the bus's TX frame type to `mode`. Boards that
-//                    advertise kCapCanModeSettable (mc02: the switch is the
-//                    FDF/BRS flags in the Tx element, no re-init involved)
-//                    apply it; boards that do not (hpm_board) stall unless
-//                    `mode` already equals the mode they run. A SET without
+//                    advertise kCapCanModeSettable (mc02, hpm_board) apply it;
+//                    boards that do not (c_board) stall unless `mode` already
+//                    equals the mode they run. A SET without
 //                    kCanConfigApply is a pure assertion on every board: it
 //                    ACKs only if the bus already runs `mode`.
 //
-//   timing fields     the ASSERTION. A CAN bit timing is a measured, board-
-//                    specific fact here (sample point pinned to 87.5 per
-//                    mille, TDC, a shared external timebase) and the rates
-//                    are fixed by the bus peers' hardware -- so the four
-//                    fields below can never be applied. They let the host
-//                    state what it BELIEVES the bus runs and have the board
-//                    contradict it with a stall before any traffic flows;
-//                    zero means "no opinion, skip the check".
+//   rate fields       arbitration_baudrate / data_baudrate. The rates are a
+//                    wiring fact -- fixed by the bus peers' hardware, which
+//                    the HOST code knows and the firmware does not. With
+//                    kCanConfigApplyTiming (boards advertising
+//                    kCapCanRateSettable) they are the setting: non-zero is
+//                    the new rate, zero keeps the current one. Without it
+//                    they are an assertion: zero skips, non-zero must equal
+//                    the board's. A classic bus has no data phase: applying
+//                    a non-zero data_baudrate with mode = kClassic stalls.
+//
+//   sample points     always the ASSERTION. The sample point is a measured,
+//                    board-specific policy (pinned to 87.5 per mille, so every
+//                    node on the bus samples at the same place), never set by
+//                    the host; zero means "no opinion, skip the check".
 //
 // GET returns hardware truth, not the last request: mode is what the bus
 // transmits right now, the rates are what the controller is actually timed
-// for (data_baudrate is the FD data phase the receiver runs at -- an FD-
-// capable controller keeps decoding FD frames from peers even while
-// transmitting classic, so it is reported regardless of `mode`), the sample
-// points are the achieved per-mille positions of both phases, and control
-// is zero.
+// for (data_baudrate is the FD data phase the receiver runs at: mc02 keeps
+// its controller FD-capable while transmitting classic and reports it
+// regardless of `mode`; hpm_board turns FD off for classic and reports 0,
+// as does c_board -- a timing assertion on a data phase the bus does not
+// have is a wrong expectation), the sample points are the achieved
+// per-mille positions of both phases, and control is zero.
 struct CanConfigPayload {
     uint8_t mode;                  // CanMode
     uint8_t control;               // CanConfigControl, SET only; GET returns 0
@@ -184,6 +212,11 @@ enum CanConfigControl : uint8_t {
     // Apply `mode` to the bus if the board advertises kCapCanModeSettable.
     // Without this bit the SET only asserts that the bus already runs `mode`.
     kCanConfigApply = 1U << 0,
+    // Apply the rate fields instead of asserting them, on boards advertising
+    // kCapCanRateSettable (see the rate fields above). A board that cannot
+    // solve the rate at its pinned sample point stalls with
+    // kConfigErrorRateUnrepresentable and leaves the bus untouched.
+    kCanConfigApplyTiming = 1U << 1,
 };
 
 // UART framing codings. Zero means "no opinion": the field is skipped on SET
@@ -211,10 +244,46 @@ enum UartStopBits : uint8_t {
 enum UartConfigControl : uint8_t {
     // Apply every non-zero field of the payload. Without this bit the SET is
     // a pure assertion: it ACKs only if the port already runs exactly what
-    // the non-zero fields say (baudrate within the same 5% tolerance the host
-    // read-back uses). With it, non-zero fields are applied and zero fields
-    // are left untouched -- a sparse patch, per setting rather than per bus.
+    // the non-zero fields say (the divisor integers must match exactly; the
+    // framing must match exactly). With it, non-zero fields are applied and
+    // zero fields are left untouched -- a sparse patch, per setting rather
+    // than per bus.
     kUartConfigApply = 1U << 0,
+};
+
+// The divisor a port is actually programmed with, and the oversampling it is
+// programmed at. These are the integers the rate is made of, and the ONLY
+// thing a rate agreement can be checked against:
+//
+// WHY NOT THE BAUDRATE. The host cannot reconstruct the board's divisor: it
+// does not know the board's UART kernel clock (hpm 80 MHz; mc02 STM32H7,
+// resolved at run time from PLL2Q/PLL3Q/HSI by UART_GETCLOCKSOURCE; c_board
+// 42 or 84 MHz off APB1/APB2; ch32 100 MHz). And the requested rate is not a
+// fixed point of the solver: 921600 -- the rate this project uses most --
+// comes out 909090 on hpm (80 MHz, 1.36%), 923076 / 933333 on c_board
+// (84 / 42 MHz, 0.16% / 1.27%), and each board's error has its own shape. So
+// both "compare the requested rate" and "compare within a percentage" are
+// unsound, and the only sound comparison is the divisor integer the board
+// confirms.
+//
+// The divisor is the raw register, deliberately un-normalized; the oversample
+// is the ratio (8..32), not its register encoding:
+//   hpm      divisor = DLM:DLL (16-bit); oversample = OSCR decoded (field 0 -> 32)
+//   mc02     divisor = BRR[15:0];        oversample = 8 or 16
+//   c_board  divisor = BRR[15:0];        oversample = 8 or 16
+// A board reports what its own registers hold, so the host never has to know
+// which family it is talking to -- it only has to compare two integers it got
+// back from the same board.
+//
+// SET treats both as an ASSERTION (never as an instruction): apply the
+// requested rate, then require the resulting divisor to equal the one the
+// caller echoed. A caller that first GETs and then SETs the same values is
+// asserting the whole electrical identity of the port in one transfer -- the
+// same property kSetCanConfig's timing fields have. Zero means "no opinion,
+// skip the check".
+struct UartDivisor {
+    uint16_t divisor;
+    uint8_t oversample;
 };
 
 // One UART port's configuration. SET applies what is non-zero (with
@@ -226,17 +295,22 @@ enum UartConfigControl : uint8_t {
 //
 // Flow control (RTS/CTS) has no field here on purpose: it is pinned by the
 // pins the .ioc routes at boot, a hardware deployment fact no run-time
-// register write can change. The kernel clock source and oversampling are
-// likewise init-time facts -- they define what the divisor means, and the
-// board's read-back already reflects them.
+// register write can change. The kernel clock source is likewise an init-time
+// fact -- it defines what the divisor means, and the board's read-back already
+// reflects it. The OVERsampling is not in that category: it is reported, as
+// UartDivisor::oversample, because it is half of what turns a divisor into a
+// rate.
 struct UartConfigPayload {
     uint32_t baudrate;   // SET: requested rate, 0 = leave unchanged; GET: effective rate
+    uint16_t divisor;    // UartDivisor::divisor -- GET: programmed; SET: asserted
+    uint8_t oversample;  // UartDivisor::oversample -- GET: programmed; SET: asserted
     uint8_t word_length; // UartWordLength
     uint8_t parity;      // UartParity
     uint8_t stop_bits;   // UartStopBits
     uint8_t control;     // UartConfigControl, SET only; GET returns 0
+    uint8_t reserved;
 };
-static_assert(sizeof(UartConfigPayload) == 8);
+static_assert(sizeof(UartConfigPayload) == 12);
 
 // Why a refused configuration request deserves a request of its own: a STALL
 // cannot carry data (the status stage is zero-length by USB definition), so
@@ -255,6 +329,15 @@ enum ConfigErrorReason : uint8_t {
     kConfigErrorModeFixed = 4,           // the board does not let the host change the mode
     kConfigErrorRateUnrepresentable = 5, // the divisor solver cannot produce this rate
     kConfigErrorFramingUnsupported = 6,  // word length / parity / stop bits unsupported
+    // The rate WAS representable and the port was programmed -- but reading
+    // the divisor back gave a different integer than the one that was just
+    // written, or than the one the caller echoed. Distinct from
+    // kConfigErrorRateUnrepresentable on purpose: that one means the solver
+    // refused and nothing was touched, this one means something was written
+    // and the hardware does not agree with what it was given. It is the only
+    // reason that reports a port whose register file no longer matches its
+    // programming, so it must not be collapsed into the other.
+    kConfigErrorVerifyFailed = 7,
 };
 
 struct LastConfigErrorPayload {
@@ -366,6 +449,8 @@ constexpr uint16_t layout_fingerprint() {
     fold(__builtin_offsetof(UartConfigPayload, parity));
     fold(__builtin_offsetof(UartConfigPayload, stop_bits));
     fold(__builtin_offsetof(UartConfigPayload, control));
+    fold(__builtin_offsetof(UartConfigPayload, divisor));
+    fold(__builtin_offsetof(UartConfigPayload, oversample));
     fold(__builtin_offsetof(CanStatusPayload, tx_occurred));
     fold(__builtin_offsetof(LatencyBreakdownPayload, cpu_hz));
 
@@ -383,8 +468,10 @@ constexpr uint16_t layout_fingerprint() {
     fold(static_cast<uint32_t>(CanMode::kClassic));
     fold(static_cast<uint32_t>(CanMode::kCanFd));
     fold(kCanConfigApply);
+    fold(kCanConfigApplyTiming);
     fold(kCapCanModeSettable);
     fold(kCapCanFdLongFrames);
+    fold(kCapCanRateSettable);
     fold(kUartConfigApply);
     fold(static_cast<uint32_t>(UartWordLength::kUartWordLength7));
     fold(static_cast<uint32_t>(UartWordLength::kUartWordLength8));
@@ -394,6 +481,15 @@ constexpr uint16_t layout_fingerprint() {
     fold(static_cast<uint32_t>(UartStopBits::kUartStopBits1));
     fold(static_cast<uint32_t>(UartStopBits::kUartStopBits2));
     fold(static_cast<uint32_t>(ConfigErrorReason::kConfigErrorFramingUnsupported));
+    fold(static_cast<uint32_t>(ConfigErrorReason::kConfigErrorVerifyFailed));
+    // UartDivisor is folded whole, not through UartConfigPayload: it is
+    // embedded there as loose fields, so a change to its own layout would slip
+    // past the payload's size and offsets. Same reasoning as the enum codings
+    // above -- this is the "brand-new type no listed input observes" case the
+    // maintenance rule names.
+    fold(sizeof(UartDivisor));
+    fold(__builtin_offsetof(UartDivisor, divisor));
+    fold(__builtin_offsetof(UartDivisor, oversample));
 
     // The EP0 payloads above cannot see a change to the SESSION payloads (they
     // are defined in core/src/protocol/protocol.hpp, below this header in the

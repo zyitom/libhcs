@@ -52,7 +52,8 @@ public:
     // 序号而非 port: 每个构造点都不依赖端口表的内容。
     using Lazy = utility::Lazy<Can, data::DataId, size_t>;
 
-    // 波特率为编译期常量; 模式由 board_app.hpp 的 CanPort 表按板固定。
+    // 上电默认速率(连同端口表的帧型)。libhcs 由 host 经 EP0 下发实际速率(apply_setting);
+    // DMTool 失败救援也回落到这两个值。
     static constexpr uint32_t kArbitrationBaudrate = 1'000'000;
     static constexpr uint32_t kCanFdDataBaudrate = 5'000'000;
 
@@ -78,8 +79,8 @@ public:
         , can_base_(reinterpret_cast<MCAN_Type*>(port.base))
         , irq_num_(port.irq_num)
         , canfd_(port.mode == CanMode::kCanFd)
-        , port_fd_(port.mode == CanMode::kCanFd)
-        , can_index_(board_can_index) {
+        , can_index_(board_can_index)
+        , libhcs_setting_(default_setting(port.mode)) {
 
         // 只允许初始化 PCB 实际存在的端口。单路 hpm5321 的第二个槽位引脚是 LED
         // 阴极, 构造它等于把 PA30/PA31 交给一个不存在的收发器。
@@ -94,96 +95,6 @@ public:
         const uint32_t can_source_clock_freq = board::init_can(can_base_);
         if (can_source_clock_freq % 1'000'000U == 0)
             can_clock_mhz_ = static_cast<uint16_t>(can_source_clock_freq / 1'000'000U);
-
-        mcan_config_t config;
-        mcan_get_default_config(can_base_, &config);
-        config.baudrate = kArbitrationBaudrate;
-        config.mode = mcan_mode_normal;
-        config.enable_canfd = canfd_;
-        if (canfd_) {
-            config.baudrate_fd = kCanFdDataBaudrate;
-
-            // 发送延迟补偿 (TDC), 该数据段速率下必需; 此前从未开启 --
-            // mcan_get_default_config() 将结构体清零, 该字段保持 false,
-            // mcan_init() 会直接清掉 DBTP.TDC。
-            //
-            // 数据段一位 200 ns, 主采样点在 87.5% = 175 ns。高速 CAN 收发器的
-            // TXD->RXD 环路延迟通常 120-255 ns, 不补偿时发送节点自检回读会读到
-            // 上一位, 报 bit error。TDC 把回读移到 (实测环路延迟 + TDCO) 处的
-            // 二级采样点, 跟随收发器而不是假定它足够快。
-            //
-            // 这是下方采样点修复的另一半: 那处让总线两端对齐"在哪采样", 这里让
-            // 发送自检扛得住自家收发器。症状同族 (PSR.DLEC = bit error, TEC
-            // 升入 error-passive, 单方向失败而经典 CAN 正常), 只修一半时漏掉
-            // 很容易。
-            //
-            // mc02 自 FDCAN bring-up 起就开了 (mc02/app/src/can/can.hpp:
-            // HAL_FDCAN_EnableTxDelayCompensation, offset =
-            // DataPrescaler * DataTimeSeg1)。两板同为 80 MHz 内核时钟下的
-            // 5 Mbit 数据段, 本板不补则两者不对称。
-            //
-            // ssp_offset 保持 0, 让 SDK 从刚解出的位时序推导 TDCO: DBTP.DTSEG1
-            // + 2, 单位 mtq。仅当数据段分频为 1 时才等于主采样点 -- TDCO 计的
-            // 是 CAN 时钟周期而非 time quanta -- mcan_init() 之后的 assert
-            // 钉住了这一前提。
-            config.enable_tdc = true;
-        }
-
-        // 两个相位都把采样点钉在 87.5%, 因为总线上其他板子实际就是这么跑的。
-        //
-        // 硬规则是同段所有节点必须在同一点采样 (两个相位之间不必彼此一致 --
-        // 这里恰好一致)。参照 CubeMX 板 (mc02、c_board): 两相位均
-        // tseg1/tseg2 = 13/2 = 87.5%, 标称相位分频 5 (16 TQ), 数据相位分频 1。
-        // 注意这不是厂商表格对 1 Mbit 仲裁相位给出的 ">800 kbit/s 用 75%" 指导
-        // -- 实测按指导而非按总线来配会失败: 标称相位留在 SDK 的 75%
-        // (59/20, 80 TQ)、只钉数据相位时, 本板的 FD 下行掉到 0/40000,
-        // PSR.DLEC = bit1 error。
-        //
-        // SDK 自己不会到 87.5%: 其窗口是 [750, 875], 求解器爬过 MINIMUM 就停,
-        // 永远落在 75.0%, 875 用不到。数据段一位 200 ns, 12.5 个点的分歧让两端
-        // 差 25 ns, 接收方锁错位 -- 最初表现为 mc02 不 ACK 本板的 FD 帧
-        // (PSR.DLEC = ACK error, TEC 升入 error-passive), 而经典 CAN 与反方向
-        // 正常。
-        config.can20_samplepoint_min = kNominalSamplePointPerMille;
-        config.can20_samplepoint_max = kNominalSamplePointPerMille;
-        config.canfd_samplepoint_min = kDataSamplePointPerMille;
-        config.canfd_samplepoint_max = kDataSamplePointPerMille;
-        apply_message_ram_layout(config);
-        config.disable_auto_retransmission = true;
-
-        // 经时间戳单元 (TSU) 取 64 位硬件时间戳。本 SoC 的 MCAN 没有可用的内部
-        // TSU 时基 (TBCS 被综合固定为 "external"), 每个控制器的 TSU 都由经
-        // TBSEL 槽 0 接入的唯一共享 PTPC0 时基供时。PTPC 维护 IEEE-1588
-        // {seconds:nanoseconds} 计数器, handle_uplink() 把它折算成微秒。所有
-        // 控制器共用 PTPC0, 时间戳在同一时钟上, 跨总线可直接比较。
-        config.use_timestamping_unit = true;
-        config.tsu_config.enable_tsu = true;
-        config.tsu_config.enable_64bit_timestamp = true;
-        config.tsu_config.use_ext_timebase = true;
-        config.tsu_config.ext_timebase_src = MCAN_TSU_EXT_TIMEBASE_SRC_TBSEL_0;
-        config.tsu_config.tbsel_option = MCAN_TSU_TBSEL_PTPC0;
-        config.tsu_config.capture_on_sof = true;
-        config.tsu_config.prescaler = 1; // 外部时基下不使用
-        config.timestamp_cfg.counter_prescaler = 1;
-        config.timestamp_cfg.timestamp_selection = MCAN_TIMESTAMP_SEL_EXT_TS_VAL_USED;
-
-        // 外部 TSU 只给被标记为 sync message 的过滤器所接收的帧打时间戳 (仅在
-        // CCCR.UTSU 置位时求值)。默认 accept-all 过滤器的 sync_message = 0,
-        // 故换成 mask 0 的 accept-all sync 过滤器 (标准帧与扩展帧各一) --
-        // 否则任何帧都不会有时间戳。
-        mcan_filter_elem_t std_sync_filter{};
-        std_sync_filter.filter_type = MCAN_FILTER_TYPE_CLASSIC_FILTER;
-        std_sync_filter.filter_config = MCAN_FILTER_ELEM_CFG_STORE_IN_RX_FIFO0_IF_MATCH;
-        std_sync_filter.can_id_type = MCAN_CAN_ID_TYPE_STANDARD;
-        std_sync_filter.sync_message = 1U;
-        std_sync_filter.filter_id = 0U;
-        std_sync_filter.filter_mask = 0U;
-        mcan_filter_elem_t ext_sync_filter = std_sync_filter;
-        ext_sync_filter.can_id_type = MCAN_CAN_ID_TYPE_EXTENDED;
-        config.all_filters_config.std_id_filter_list.filter_elem_list = &std_sync_filter;
-        config.all_filters_config.std_id_filter_list.mcan_filter_elem_count = 1;
-        config.all_filters_config.ext_id_filter_list.filter_elem_list = &ext_sync_filter;
-        config.all_filters_config.ext_id_filter_list.mcan_filter_elem_count = 1;
 
         // 先一次性启动共享的 PTPC0 时基, 再把本控制器的 TSU 输入指向它。
         // PTPC 由 AHB 时钟组 (clock_ptpc) 供时钟。
@@ -209,15 +120,8 @@ public:
         }
         ptpc_set_timer_output(HPM_PTPC, mcan_get_instance_from_base(can_base_), false);
 
-        mcan_init(can_base_, &config, can_source_clock_freq);
-
-        // 上面的自动 TDCO 以 DTSEG1 为单位推导, 但按 mtq 编程, 只有数据段分频
-        // 为 1 时才落在采样点上。80 MHz / 5 Mbit 下 SDK 求解器选的正是
-        // brp=1 tseg1=13 tseg2=2 (-Dlibhcs_CAN_DIAG=ON 可打印), 但任一数字
-        // 变动后求解器可以另选 -- 二级采样点悄悄错位与完全没补偿看起来一样,
-        // 在此用 assert 拦住。
-        if (canfd_)
-            core::utility::assert_always(MCAN_DBTP_DBRP_GET(can_base_->DBTP) == 0U);
+        // 构造期初始化失败不停机: 其余端口与 USB 照常, 该路由 LED/can_status 暴露。
+        (void)init_controller(libhcs_setting_, can_source_clock_freq);
 
         mcan_enable_interrupts(can_base_, kEnabledInterrupts);
         // CAN RX 是转发关键路径 (电机反馈 -> 主机)。优先级 3, 高于 USB (2) 与
@@ -317,14 +221,80 @@ public:
 
     [[nodiscard]] bool is_fd() const { return canfd_; }
 
+    // 控制器当前帧型(硬件事实)。经典 = 控制器关 FD(CCCR.FDOE=0), 硬件上发不出任何 FD 位。
+    [[nodiscard]] CanMode mode() const { return canfd_ ? CanMode::kCanFd : CanMode::kClassic; }
+
+    // libhcs 的总线设置: 帧型与两段速率由 host 经 EP0 下发(接线事实, host 代码知道),
+    // 采样点与 TDC 是本板的实测策略, 不在其中。
+    struct BusSetting {
+        CanMode mode;
+        uint32_t arbitration_baudrate;
+        uint32_t data_baudrate; // FD 数据段; 经典模式下保留, 切回 FD 时沿用
+
+        friend constexpr bool operator==(const BusSetting&, const BusSetting&) = default;
+    };
+
+    [[nodiscard]] static constexpr BusSetting default_setting(CanMode mode) {
+        return {
+            .mode = mode,
+            .arbitration_baudrate = kArbitrationBaudrate,
+            .data_baudrate = kCanFdDataBaudrate};
+    }
+
+    [[nodiscard]] const BusSetting& libhcs_setting() const { return libhcs_setting_; }
+
+    // libhcs 经 EP0 应用总线设置(usb/vendor_control.cpp): 与硬件现状一致只记下选择, 否则丢弃
+    // 旧设置下排队的帧并重跑 libhcs 配置。解不出(87.5% 采样点下凑不出该速率)时救回原设置,
+    // 返回 false。
+    [[nodiscard]] bool apply_setting(const BusSetting& setting);
+
+    // 两个位相的速率与采样点(‰)。经典模式没有数据段, 两项报 0。
+    struct TimingIdentity {
+        uint32_t arbitration_baudrate;
+        uint32_t data_baudrate;
+        uint16_t nominal_sample_point;
+        uint16_t data_sample_point;
+
+        friend constexpr bool operator==(const TimingIdentity&, const TimingIdentity&) = default;
+    };
+
+    // 一份设置应用成功后应有的时序: 速率即所求, 采样点钉死在 87.5%。
+    [[nodiscard]] static constexpr TimingIdentity timing_of(const BusSetting& setting) {
+        const bool fd = setting.mode == CanMode::kCanFd;
+        return {
+            .arbitration_baudrate = setting.arbitration_baudrate,
+            .data_baudrate = fd ? setting.data_baudrate : 0U,
+            .nominal_sample_point = kNominalSamplePointPerMille,
+            .data_sample_point = fd ? kDataSamplePointPerMille : uint16_t{0},
+        };
+    }
+
+    // 从 NBTP/DBTP 重构的硬件事实; 源时钟非整 MHz(未知)时速率报 0。
+    [[nodiscard]] TimingIdentity timing_identity() const {
+        const BitTiming timing = bit_timing();
+        const auto rate = [&timing](const PhaseTiming& phase) -> uint32_t {
+            const uint32_t divisor = phase.prescaler * (1U + phase.seg1 + phase.seg2);
+            return divisor != 0U ? timing.clock_hz / divisor : 0U;
+        };
+        const auto sample_point = [](const PhaseTiming& phase) {
+            return static_cast<uint16_t>(
+                (1U + phase.seg1) * 1000U / (1U + phase.seg1 + phase.seg2));
+        };
+        return {
+            .arbitration_baudrate = rate(timing.nominal),
+            .data_baudrate = canfd_ ? rate(timing.data) : 0U,
+            .nominal_sample_point = sample_point(timing.nominal),
+            .data_sample_point = canfd_ ? sample_point(timing.data) : uint16_t{0},
+        };
+    }
+
     // DMTool SETUP_BUARD 的运行时重配(实现见 can.cpp): 按命令给定的 TQ 参数
     // (分频/seg1/seg2/sjw, 与 mcan_bit_timing_param_t 同语义)直接写低级位时序,
     // 并切换 FD/经典模式。请求非法或硬件拒绝时端口保持原配置并返回 false。
     bool reconfigure_timing(bool fd, PhaseTiming nominal, PhaseTiming data);
 
-    // 恢复编译期位时序(SDK 求解器解, 87.5% 采样点)与端口原始 FD 模式。libhcs
-    // 会话建立时调用: DMTool 会话可能把总线改成了别的速率, libhcs 期望的
-    // 总线参数由本函数还原。
+    // 按 libhcs_setting_ 重跑 libhcs 配置(初值为上电默认, EP0 可改)。libhcs 会话建立时
+    // 调用: DMTool 会话可能改过速率, 这里还原, 且不冲掉 host 经 EP0 下发的设置。
     bool restore_default_timing();
 
     // 主循环看门狗, 处理 PLIC 已接受却从未送达的中断请求。健康路径仅两次寄存器
@@ -393,9 +363,9 @@ private:
         + (kTxFifoElemCount * MCAN_TXEVT_ELEM_SIZE);
     static_assert(kMsgRamBytes <= MCAN_MSG_BUF_SIZE_IN_WORDS * sizeof(uint32_t));
 
-    // 三处配置(构造、DMTool 重配 reconfigure_timing、还原 restore_default_timing)
-    // 共用同一份布局: 它们必须一致, 否则一次 DMTool 会话之后 libhcs 跑的就是另一
-    // 套深度。自动重传不在其中 -- 那一项三处各有立场, 见各自现场。
+    // libhcs_config() 与 DMTool 重配 reconfigure_timing 共用同一份布局: 两者必须一致,
+    // 否则一次 DMTool 会话之后 libhcs 跑的就是另一套深度。自动重传不在其中 -- 两处
+    // 各有立场, 见各自现场。
     static void apply_message_ram_layout(mcan_config_t& config) noexcept {
         config.ram_config.enable_rxbuf = false;
         config.ram_config.rxbuf_elem_count = 0U;
@@ -415,6 +385,19 @@ private:
         config.ram_config.tx_evt_fifo_elem_count = kTxFifoElemCount;
         config.ram_config.tx_evt_fifo_watermark = 1U;
     }
+
+    // libhcs_config() 的时间戳单元与 sync 过滤器(实现见 can.cpp)。
+    static void apply_timestamping(mcan_config_t& config) noexcept;
+
+    // libhcs 的整套控制器配置(建造者): 构造、会话还原、EP0 应用设置共用这一份, 各处逐字段
+    // 一致由此保证。速率来自 setting, 采样点/TDC/时间戳是本板策略。
+    [[nodiscard]] mcan_config_t libhcs_config(const BusSetting& setting) const;
+
+    // 按 libhcs 配置初始化控制器, 成功才更新 canfd_。
+    bool init_controller(const BusSetting& setting, uint32_t clock_hz);
+
+    // 运行时重初始化到 mode(deinit -> 重挂消息 RAM -> init -> 开中断), 不检查发送队列。
+    bool reinit(const BusSetting& setting);
 
     // libhcs 的下行策略: 三个答案全是编译期常量。实例化后这些判断不留下任何
     // 指令 -- 尤其 explicit_dlc() 恒为空, "调用方给定 DLC"那条分支与它要占的
@@ -498,12 +481,9 @@ private:
     const data::DataId data_id_;
     MCAN_Type* can_base_;
     const uint32_t irq_num_;
-    // DMTool 仿真(SETUP_BUARD)在运行时切换本控制器的 FD/经典模式, 因此不再
-    // 是编译期常量; 初值仍来自端口表, libhcs 路径的行为不变。仅主循环写
-    // (handle_downlink / reconfigure_timing 同线程), ISR 不读。
+    // 控制器当前是否开 FD, 即发送帧型的上限。EP0 apply_setting 与 DMTool 重配都会改它;
+    // 仅主循环写(与 handle_downlink 同线程), ISR 不读。
     bool canfd_;
-    // 端口表的原始 FD 模式, restore_default_timing() 的还原目标。
-    const bool port_fd_;
     // board::init_can() 配出的位时序源时钟, 以 MHz 计(非整 MHz 记 0), 只供
     // bit_timing() 回报。刻意放进 canfd_ 之后的对齐空洞: Can 的尺寸与各成员偏移
     // 不变, ISR 与主循环里对 can_array 的寻址逐条指令保持原样。
@@ -538,6 +518,10 @@ private:
     static_assert(sizeof(QueuedFrame) == 72);
 
     utility::RingBuffer<QueuedFrame, kTransmitQueueSize> transmit_buffer_;
+
+    // host 经 EP0 下发的总线设置, restore_default_timing() 的还原目标。冷数据放类尾:
+    // 不挪动热路径成员的偏移。初值为端口表帧型 + 上电默认速率。
+    BusSetting libhcs_setting_;
 };
 
 // 以下全部由板级 CAN 端口表 (board::kCanPorts) 构建, 没有逐端口宏: 数量、

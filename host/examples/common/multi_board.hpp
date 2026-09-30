@@ -29,8 +29,8 @@
 
 #include <libhcs/board/c_board.hpp>
 #include <libhcs/board/ch32_board.hpp>
+#include <libhcs/board/hcs_can_port.hpp>
 #include <libhcs/board/mc02.hpp>
-#include <libhcs/board/hpm5321.hpp>
 #include <libhcs/board/hpm5321.hpp>
 #include <libhcs/data/datas.hpp>
 
@@ -186,11 +186,11 @@ private:
         libhcs::board::CBoard::PacketBuilder& builder;
         explicit Transmitter(libhcs::board::CBoard::PacketBuilder& b) : builder(b) {}
         BoardTransmitter& can(int bus, const libhcs::data::CanDataView& data) override {
-            switch (bus) {
-            case 0: builder.can1_transmit(data); break;
-            case 1: builder.can2_transmit(data); break;
-            default: throw std::out_of_range{"CBoard: CAN bus index out of range (0-1)"};
-            }
+            if (bus < 0 || bus > 1) [[unlikely]]
+                throw std::out_of_range{"CBoard: CAN bus index out of range (0-1)"};
+            // Bus index 0/1 == CanPort::kCan1/kCan2 (silkscreen CAN1/CAN2).
+            builder.can_transmit(
+                static_cast<libhcs::board::hcs::CanPort>(bus + 1), data);
             return *this;
         }
         BoardTransmitter& uart(int port, const libhcs::data::UartDataView& data) override {
@@ -308,12 +308,11 @@ private:
             : builder(b)
             , board(board_ref) {}
         BoardTransmitter& can(int bus, const libhcs::data::CanDataView& data) override {
-            switch (bus) {
-            case 0: builder.can1_transmit(data); break;
-            case 1: builder.can2_transmit(data); break;
-            case 2: builder.can3_transmit(data); break;
-            default: throw std::out_of_range{"Mc02: CAN bus index out of range (0-2)"};
-            }
+            if (bus < 0 || bus > 2) [[unlikely]]
+                throw std::out_of_range{"Mc02: CAN bus index out of range (0-2)"};
+            // Bus index 0/1/2 == CanPort::kCan1/kCan2/kCan3.
+            builder.can_transmit(
+                static_cast<libhcs::board::hcs::CanPort>(bus + 1), data);
             return *this;
         }
         BoardTransmitter& uart_config(
@@ -447,11 +446,11 @@ private:
         libhcs::board::Ch32Board::PacketBuilder& builder;
         explicit Transmitter(libhcs::board::Ch32Board::PacketBuilder& b) : builder(b) {}
         BoardTransmitter& can(int bus, const libhcs::data::CanDataView& data) override {
-            switch (bus) {
-            case 0: builder.can1_transmit(data); break;
-            case 1: builder.can2_transmit(data); break;
-            default: throw std::out_of_range{"Ch32Board: CAN bus index out of range (0-1)"};
-            }
+            if (bus < 0 || bus > 1) [[unlikely]]
+                throw std::out_of_range{"Ch32Board: CAN bus index out of range (0-1)"};
+            // Bus index 0/1 == CanPort::kCan1/kCan2 (silkscreen CAN1/CAN2).
+            builder.can_transmit(
+                static_cast<libhcs::board::hcs::CanPort>(bus + 1), data);
             return *this;
         }
         BoardTransmitter& uart(int port, const libhcs::data::UartDataView& data) override {

@@ -86,6 +86,10 @@ std::vector<std::pair<std::string, std::string>> enumerate_boards() {
                 value.pop_back();
             return value;
         };
+        // mc02 still enumerates under the legacy HCS vendor id 0xA511: only
+        // hpm_board moved to DM's 0x34B7 (see usb_identity.hpp and
+        // firmware/hpm_board/app/src/usb/usb_descriptors.hpp). Match what the
+        // board actually reports, or this tool finds nothing.
         if (read_line("idVendor") != "a511" || read_line("idProduct") != "0723")
             continue;
         const std::string serial = read_line("serial");

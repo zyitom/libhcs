@@ -101,12 +101,10 @@ void transmit_can(
         .can_data = payload,
         .is_extended_can_id = is_extended,
     };
-    switch (bus) {
-    case 1: builder.can1_transmit(data); break;
-    case 2: builder.can2_transmit(data); break;
-    case 3: builder.can3_transmit(data); break;
-    default: std::unreachable();
-    }
+    if (bus < 1 || bus > 3) [[unlikely]]
+        std::unreachable();
+    // Bus 1/2/3 == CanPort::kCan1/kCan2/kCan3 (silkscreen CAN1..CAN3).
+    builder.can_transmit(static_cast<libhcs::board::hcs::CanPort>(bus), data);
 }
 
 bool run_direction(

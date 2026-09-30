@@ -147,12 +147,12 @@ Full-Speed，**转发吞吐的杠杆在 CAN 侧（CAN-FD），不在 USB 侧**�
 整段从 FLASH 里剪掉——用 `arm-none-eabi-nm` 查 ELF 可以确认符号表里只有被调用的那些。
 
 当前**已配置但 `app.cpp` 未调用**：DCMI、SPI1（LCD）、UART8、UART9、TIM3、TIM12。
-USART2 / USART3 在 `libhcs_APP_RS485_ENABLE`（默认 ON）时会调 `MX_USART2_UART_Init` / `MX_USART3_UART_Init`；开关关掉时它们也落进这一类。
+USART2 / USART3 永远调 `MX_USART2_UART_Init` / `MX_USART3_UART_Init`（原 `libhcs_APP_RS485_ENABLE` 开关已于 2026-09-30 取消）。
 
 ### USART2 / USART3：丝印 UART2 / UART3（RS-485）
 
 这两个口是外壳上的 UART2 / UART3，DataId 就是 `kUart2` / `kUart3`。
-默认镜像初始化它们（`libhcs_APP_RS485_ENABLE=ON`，和 IMU 同一类开关）。关掉时不调 `MX_USARTx_UART_Init`、不构造 D2 对象、主循环不 poll，省约 1.8 KB D2 SRAM 和每圈两次 NDTR 读；host 再发 `uart2`/`uart3` 会被固件丢掉。
+每个镜像都初始化它们。原先的 `libhcs_APP_RS485_ENABLE` 开关（关掉可省约 1.8 KB D2 SRAM 和每圈两次 NDTR 读）已于 2026-09-30 取消：关掉的镜像会让 EP0 UART 下标空间出现两个洞，主机分不清"这块板没有 UART2"与"这版镜像把 UART2 编掉了"。`Lazy<T>` 用 union、DMA 环链接期就占 `.d2_sram`，这 1.8 KB 与是否 `init()` 无关，已明确接受。
 诊断仍走 `kUart0`，与这两个口无关。
 
 `.ioc` 里配的是 **Hardware Flow Control (RS485)**：`PD4=USART2_DE`、`PB14=USART3_DE`，

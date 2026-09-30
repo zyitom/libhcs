@@ -50,12 +50,12 @@ arm-none-eabi-nm firmware/mc02/build/app/mc02_app.elf | grep -c bmi088   # IMU: 
 
 全部定义在 `app/CMakeLists.txt`，默认值即下表。**带 * 的三个都占用 `DataId::kUart0`，
 互斥。** kUart0 不是这块板的丝印 UART；丝印口是 UART1 / UART2 / UART3 / UART7 / UART10 加 DBUS
-（UART2 / UART3 就是 USART2 / USART3 的 RS-485，默认开，可用 `libhcs_APP_RS485_ENABLE=OFF` 整段关掉）。
+（UART2 / UART3 就是 USART2 / USART3 的 RS-485，**永远编入**：原 `libhcs_APP_RS485_ENABLE` 开关已于
+2026-09-30 取消，代价是约 1.8 KB D2 SRAM 常驻，见 [UART_EP0_MIGRATION.md](../../UART_EP0_MIGRATION.md) 第 1 节）。
 
 | 开关 | 默认 | 作用 |
 |---|---|---|
 | `libhcs_APP_IMU_ENABLE` | ON | BMI088 初始化与采样 |
-| `libhcs_APP_RS485_ENABLE` | ON | USART2 / USART3（丝印 UART2 / UART3）初始化、D2 对象与主循环 poll。OFF 时不调 `MX_USARTx_UART_Init`，省约 1.8 KB D2 SRAM 和每圈两次 NDTR 读。DataId 仍是 `kUart2` / `kUart3` |
 | `libhcs_APP_USB_RX_XFER_SIZE` | 1024 | 一次 bulk OUT 传输请求的字节数（64 的倍数）。1024 是实测拐点，比旧的 64 高 59% |
 | `libhcs_APP_LOOP_BALLAST_CYCLES` | 0 | 每圈主循环插入的纯忙等周期数，**只是测量仪器**，出厂镜像永远是 0 |
 | `libhcs_APP_DEBUG_KNOBS` | OFF | 暴露调试器可写的调优旋钮（`diag/knobs`），配合 Ozone / J-Link 在线改参 |
@@ -89,17 +89,19 @@ arm-none-eabi-nm firmware/mc02/build/app/mc02_app.elf | grep -c bmi088   # IMU: 
   表（三条总线全 FD），且可由主机经 EP0 在构造期/运行时切换**——应用即改 Tx 元素的
   FDF/BRS 标志，控制器不进 INIT 重配。每帧 `is_fdcan` 位已废弃（2026-09-12），设计
   细节见 [README.md](README.md)「低延迟设计」。
-- **配置通道：EP0 vendor_control v2**（`app/src/usb/vendor_control.cpp`）：kGetInterface
+- **配置通道：EP0 vendor_control**（`app/src/usb/vendor_control.cpp`，版本是编译期线格式指纹）：kGetInterface
   握手（握手完成前 kStart 被静默拒绝）+ CAN 模式配置（本板置 `kCapCanModeSettable`，
   host 经 kSetCanConfig+apply 位切换 TX 帧型并经 kGetCanConfig 读回）/状态查询 +
   UART 波特率与帧格式（字长 7/8、校验无/偶/奇、停止位 1/2，稀疏 patch + apply 位，
   先全量校验后统一提交，STALL 严格等于零改动；9 位字长不提供——RX 环是字节 DMA）。
+  速率一致性比 `BRR` 整数（`divisor`，GET 回报、SET 回显即断言），不比波特率；写入后
+  回读 `BRR` 不符报 `kConfigErrorVerifyFailed`。
   payload 里的 CAN 仲裁/数据段速率与采样点字段是**核对不是配置**（位时序是本板
   实测整定值、速率由对端电机硬件决定，只能断言）。请求码与 payload 见
   [core vendor_control.hpp](../../core/include/libhcs/protocol/vendor_control.hpp)。
   in-band `kUart*Config` 字段已退役（收到即拒绝并进 discard mode），运行时切波特率走
   host 侧 `configure_uartN()`；EP0 的 UART 索引固定为 DBUS=0、UART1=1、UART2=2、
-  UART3=3、UART7=4、UART10=5（`libhcs_APP_RS485_ENABLE=OFF` 时 2/3 stall 而非重编号）。
+  UART3=3、UART7=4、UART10=5，每个下标背后都有对象。
 - **CAN 的协议与速率由电机硬件决定，不是可调参数**：仲裁段 1 Mbit/s / 数据段
   5 Mbit/s 的上限、能否上 FD，都由总线对端电机固件决定，本仓库**无法修改**
   `[硬件事实，用户确认 2026-09-12]`。吞吐/延迟优化**不要**以「升级 CAN-FD /
@@ -152,7 +154,7 @@ arm-none-eabi-nm firmware/mc02/build/app/mc02_app.elf | grep -c bmi088   # IMU: 
   `drain_transmit_queue`/`drain_pending_transmits_slow` 等放 `.itcm`，启动时从 FLASH 拷入；
   `try_transmit()` 已改为头文件内联的空队列快测，主循环入口是 `drain_pending_transmits()`。
   `[代码核对 main 1022f3e，2026-09-12]`
-- UART：六个口（USART1 / USART2 / USART3 / UART7 / USART10 / UART5-DBUS）各一条**永不停的整环 circular DMA**，写指针由主循环读 `NDTR` 推导，不由中断维护。端口对象（含 DMA 环）放 `.d2_sram`，启动时从 FLASH 拷入，MPU region 1 在 `app.cpp` 里设为非缓存。**不要给 UART 的 DMA 开 FIFO/burst**——`NDTR` 只统计到 DMA FIFO，写指针会算错。DataId 就是丝印号：UART1/2/3/7/10 加 DBUS。USART2 / USART3 受 `libhcs_APP_RS485_ENABLE` 控制（默认 ON）。
+- UART：六个口（USART1 / USART2 / USART3 / UART7 / USART10 / UART5-DBUS）各一条**永不停的整环 circular DMA**，写指针由主循环读 `NDTR` 推导，不由中断维护。端口对象（含 DMA 环）放 `.d2_sram`，启动时从 FLASH 拷入，MPU region 1 在 `app.cpp` 里设为非缓存。**不要给 UART 的 DMA 开 FIFO/burst**——`NDTR` 只统计到 DMA FIFO，写指针会算错。DataId 就是丝印号：UART1/2/3/7/10 加 DBUS。USART2 / USART3 永远编入（开关已取消）。
 - UART 错误策略：`CR3.OVRDIS=1`、**`CR3.DDRE=0`**、`CR3.EIE=0`。`DDRE` 是"出错时禁用 DMA"，**置 1 会让一个坏字符永久杀死端口**——细节见 [UART_RING_LOG.md](UART_RING_LOG.md) 第 1 章。
 - 实测吞吐天花板约 **800 KB/s 聚合**（USB Full-Speed 决定），781 KB/s 时零丢失；主循环在满过载下仍有约 10 倍余量。
 

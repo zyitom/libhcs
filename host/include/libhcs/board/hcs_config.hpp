@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -56,11 +57,13 @@ struct Interface {
     // gate can_transmit() on this plus can_fd(bus): a long frame to a bus
     // that is not running FD has no on-wire encoding either.
     bool can_fd_long_frames = false;
+    // 板子是否按 host 下发的速率解位时序(kCapCanRateSettable)。否则 CanSetting 的速率只作核对。
+    bool can_rate_settable = false;
     // Explicit padding, NOT an afterthought: the atomic<Interface> below must
     // stay is_always_lock_free, and on x86-64 that means 1/2/4/8 bytes -- a
-    // 5-byte Interface would cross the boundary and put an implicit lock on
+    // 6-byte Interface would cross the boundary and put an implicit lock on
     // every transmit path.
-    std::array<uint8_t, 3> reserved = {};
+    std::array<uint8_t, 2> reserved = {};
 
     [[nodiscard]] bool can_fd(std::size_t bus) const {
         return bus < can_count && ((can_fd_mask >> bus) & 1U) != 0U;
@@ -68,6 +71,13 @@ struct Interface {
 
     [[nodiscard]] bool can_long_frames(std::size_t bus) const {
         return can_fd_long_frames && can_fd(bus);
+    }
+
+    // 板子确认 bus 已切到 fd 后同步掩码, 不必再读一次 kGetInterface。
+    void set_can_fd(std::size_t bus, bool fd) {
+        const auto bit = static_cast<uint8_t>(1U << bus);
+        can_fd_mask =
+            fd ? static_cast<uint8_t>(can_fd_mask | bit) : static_cast<uint8_t>(can_fd_mask & ~bit);
     }
 };
 
@@ -78,20 +88,105 @@ struct Interface {
 // transmit path -- refuse to compile instead.
 static_assert(std::atomic<Interface>::is_always_lock_free);
 
+// One UART port's setting, in the EP0 payload's coding: 0 means "leave
+// unchanged" on a request, and a read-back always fills every field with what
+// the hardware actually runs (never a zero, never the last request).
+//
+// `divisor`/`oversample` are the port's rate in its integer form, and they are
+// what a rate agreement is actually checked against -- see vc::UartDivisor for
+// why the baudrate number cannot be. On a request they are an ASSERTION, not an
+// instruction: leave them zero and the apply path only checks that the board
+// programmed something; set them (from a prior read_uart_setting) and the
+// board must land on exactly those integers.
+//
+// Declared above Configuration because Configuration stores the whole setting
+// per port -- see its comment for why there is one array and not two.
+struct UartSetting {
+    uint32_t baudrate = 0;
+    uint16_t divisor = 0;
+    uint8_t oversample = 0;
+    vc::UartWordLength word_length = static_cast<vc::UartWordLength>(0);
+    vc::UartParity parity = static_cast<vc::UartParity>(0);
+    vc::UartStopBits stop_bits = static_cast<vc::UartStopBits>(0);
+};
+
+// 一路 CAN 总线的设置: 帧型与两段速率都是接线事实(由总线对端电机决定), 写死在 host 代码里,
+// 经 EP0 握手下发。速率 0 = 沿用板子当前值。采样点(87.5%)与 TDC 是板端实测策略, 不在此。
+//
+// 速率可设的板(hpm_board)按它解位时序, 解不出即构造失败; 速率写死的板(mc02)把非零速率
+// 当核对, 不符即构造失败。c_board 报不出速率(bxCAN 时序未上报), 在它上面速率须留 0。
+struct CanSetting {
+    bool fd = false;
+    uint32_t arbitration_baudrate = 0;
+    uint32_t data_baudrate = 0; // 仅 FD; 经典总线没有数据段, 须为 0
+
+    friend constexpr bool operator==(const CanSetting&, const CanSetting&) = default;
+};
+
+// 本项目实际存在的两种总线。
+inline constexpr CanSetting kClassic1M{.fd = false, .arbitration_baudrate = 1'000'000};
+inline constexpr CanSetting kFd1M5M{
+    .fd = true, .arbitration_baudrate = 1'000'000, .data_baudrate = 5'000'000};
+
+// Serializes run-time reconfiguration against the reconnect hook.
+//
+// WHY THIS IS SHARED RATHER THAN PER-BOARD. The hazard is identical on every
+// board and does not depend on what a given chip's channels are: the keepalive
+// thread re-runs apply() (and re-learns the interface) before every re-opened
+// session, while an application thread can call configure_uartN()/
+// configure_canN() at any moment. Two writers, one EP0 channel, no ordering
+// between them -- so whichever finishes last decides the board's state, and a
+// configure_*() that lands between the hook's request and the hook's mirror
+// leaves the cached interface describing the hook's request while the board
+// runs this call's. Under one lock, whichever runs second defines both.
+//
+// mc02 held a mutex of its own before this, but only configure_can() took it:
+// its configure_uart*() were unguarded, so the same interleaving was reachable
+// through the UART path. Boards that expose only one kind of mutator inherit
+// the guard anyway -- the cost is an uncontended mutex, and the alternative is
+// per-board reasoning about which mutators happen to exist today.
+//
+// Readers never take this lock: the board classes keep the learned interface
+// in a std::atomic that writers publish to, so canN_is_fd()/interface() stay
+// wait-free (see the static_assert on atomic<Interface>).
+class Reconfigurable {
+public:
+    Reconfigurable() = default;
+    Reconfigurable(const Reconfigurable&) = delete;
+    Reconfigurable& operator=(const Reconfigurable&) = delete;
+    Reconfigurable(Reconfigurable&&) = delete;
+    Reconfigurable& operator=(Reconfigurable&&) = delete;
+    ~Reconfigurable() = default;
+
+protected:
+    std::mutex reconfigure_mutex_;
+};
+
 // Desired configuration, all optional. An unset field is left alone: the board
 // keeps whatever its firmware brought the channel up with, which is the right
 // default for a caller that does not care.
 struct Configuration {
-    // Baudrate per UART port, indexed by the board's own port numbering.
-    std::optional<uint32_t> uart_baudrate[8];
-    // CAN-FD mode per bus, as a REQUEST: on a board advertising
-    // kCapCanModeSettable (mc02, where applying the mode is a per-Tx-element
-    // flag switch) the bus is reconfigured and the mode read back before the
-    // constructor returns; on a board without that capability (hpm_board,
-    // where the mode is a controller-init property) it degrades to an
-    // assertion and construction fails when the board disagrees. Either way a
-    // constructed board runs the requested mode or the constructor threw.
-    std::optional<bool> can_fd[8];
+    // Per-UART-port setting, indexed by the board's own port numbering. An
+    // unset entry is left alone ("don't touch"); a set entry is applied in
+    // full, and a field left zero inside it means "set the rate, keep the
+    // framing the firmware came up with".
+    //
+    // One array of the full setting, NOT a baudrate array beside a framing
+    // one: two parallel arrays would give "is this port configured?" a second
+    // source of truth, and the two answers could disagree. This also fixes a
+    // silent regression -- with only a baudrate replayable, a 7E2 port fell
+    // back to its CubeMX frame format on the first reconnect, because nothing
+    // carried the framing across.
+    std::optional<UartSetting> uart[8];
+    // Per-bus setting (frame type + rates), as a REQUEST: on a board advertising
+    // kCapCanModeSettable / kCapCanRateSettable the bus is reconfigured and the
+    // board verifies its own read-back before ACKing (mc02 flips the Tx-element
+    // FDF/BRS flags; hpm_board re-initializes the controller -- with FD off for
+    // classic, so a CAN 2.0 bus never sees an FD bit -- at the requested
+    // rates); what a board cannot apply degrades to an assertion and
+    // construction fails when the board disagrees. Either way a constructed
+    // board runs the requested setting or the constructor threw.
+    std::optional<CanSetting> can[8];
 };
 
 inline Interface read_interface(host::protocol::Handler& handler) {
@@ -114,6 +209,7 @@ inline Interface read_interface(host::protocol::Handler& handler) {
         .can_fd_mask = payload.can_fd_mask,
         .can_mode_settable = (payload.caps & vc::kCapCanModeSettable) != 0U,
         .can_fd_long_frames = (payload.caps & vc::kCapCanFdLongFrames) != 0U,
+        .can_rate_settable = (payload.caps & vc::kCapCanRateSettable) != 0U,
     };
 }
 
@@ -131,10 +227,6 @@ inline void reject_long_payload(std::span<const std::byte> payload, std::string_
             port)};
 }
 
-// Reads back what the port is REALLY running, reconstructed on the board from
-// the divisor actually programmed. Never the value that was requested: that
-// distinction is the entire point, because a rate the 80 MHz clock cannot
-// represent leaves the divisor untouched and the port on its old rate.
 // Human-readable name for a ConfigErrorReason, for logs and exceptions.
 inline const char* config_error_name(uint8_t reason) {
     switch (static_cast<vc::ConfigErrorReason>(reason)) {
@@ -145,6 +237,8 @@ inline const char* config_error_name(uint8_t reason) {
     case vc::ConfigErrorReason::kConfigErrorModeFixed: return "mode is fixed by the firmware";
     case vc::ConfigErrorReason::kConfigErrorRateUnrepresentable: return "rate unrepresentable";
     case vc::ConfigErrorReason::kConfigErrorFramingUnsupported: return "framing unsupported";
+    case vc::ConfigErrorReason::kConfigErrorVerifyFailed:
+        return "read-back disagrees with what was programmed";
     default: return "unknown";
     }
 }
@@ -164,27 +258,24 @@ inline vc::LastConfigErrorPayload read_last_config_error(host::protocol::Handler
     return payload;
 }
 
-// Suffix for configuration-rejection exceptions: what the board latched. The
-// latch is sticky, so a "none" here may mean the rejection predates this
-// exchange's latch -- hence the soft wording.
-inline std::string config_error_suffix(host::protocol::Handler& handler) {
+// SET 被 STALL 后的唯一一次追问: 读锁存取原因并抛出。锁存粘滞, 请求码或下标对不上
+// 说明是更早那次拒绝留下的, 不能当作本次原因。
+[[noreturn]] inline void throw_rejected(
+    host::protocol::Handler& handler, vc::Request request, std::size_t index,
+    std::string_view what) {
     const auto latch = read_last_config_error(handler);
-    if (latch.reason == std::to_underlying(vc::ConfigErrorReason::kConfigErrorNone))
-        return " (the board latched no rejection reason)";
-    return std::format(
-        " (board latched: request 0x{:02x} index {} -- {})", latch.request, latch.index,
-        config_error_name(latch.reason));
+    const bool ours = latch.request == std::to_underlying(request) && latch.index == index
+                   && latch.reason != std::to_underlying(vc::ConfigErrorReason::kConfigErrorNone);
+    // 只有 VerifyFailed 可能发生在写入之后, 其余原因都保证寄存器没动。
+    const bool maybe_written =
+        !ours
+        || latch.reason == std::to_underlying(vc::ConfigErrorReason::kConfigErrorVerifyFailed);
+    throw std::runtime_error{std::format(
+        "Board rejected {}: {}. {}", what,
+        ours ? config_error_name(latch.reason) : "the board latched no reason for this request",
+        maybe_written ? "Read the channel back before trusting it."
+                      : "The channel keeps its previous configuration.")};
 }
-
-// One UART port's setting, in the EP0 payload's coding: 0 means "leave
-// unchanged" on a request, and a read-back always fills every field with what
-// the hardware actually runs (never a zero, never the last request).
-struct UartSetting {
-    uint32_t baudrate = 0;
-    vc::UartWordLength word_length = static_cast<vc::UartWordLength>(0);
-    vc::UartParity parity = static_cast<vc::UartParity>(0);
-    vc::UartStopBits stop_bits = static_cast<vc::UartStopBits>(0);
-};
 
 // Reads what the port is REALLY running: the effective baudrate reconstructed
 // on the board from the divisor actually programmed, plus the framing decoded
@@ -201,6 +292,8 @@ inline UartSetting read_uart_setting(host::protocol::Handler& handler, std::size
     }
     return {
         .baudrate = payload.baudrate,
+        .divisor = payload.divisor,
+        .oversample = payload.oversample,
         .word_length = static_cast<vc::UartWordLength>(payload.word_length),
         .parity = static_cast<vc::UartParity>(payload.parity),
         .stop_bits = static_cast<vc::UartStopBits>(payload.stop_bits),
@@ -213,72 +306,33 @@ inline uint32_t read_uart_baudrate(host::protocol::Handler& handler, std::size_t
     return read_uart_setting(handler, port).baudrate;
 }
 
-// Applies a setting and confirms it landed. Every non-zero field is applied;
-// zero fields leave the port untouched. Throws on rejection rather than
-// returning a status, because every caller of this is a constructor or an
-// explicit reconfiguration request: there is no sensible way to continue with
-// a port running at a configuration nobody chose. The board guarantees a
-// STALL leaves it exactly as it was (validate-then-commit on its side), and
-// the read-back below is what turns that guarantee into knowledge.
+// Applies a setting: ONE control transfer. Every non-zero field is applied,
+// zero fields leave the port untouched, and `divisor`/`oversample` (if set) are
+// assertions the board checks against its own solution before writing.
 //
-// The rate tolerance is the board's own: its divisor solver accepts a rate
-// within 3%, so 3000000 comes back as 3076923 and is correct. Comparing for
-// equality here would reject a switch that actually worked.
+// 成功路径只有这一次 SET, 不再回读: 板端先全量校验(求解、10% 宽松兜底、回显断言)再写,
+// 写后自己回读分频器与帧格式, 不符即 STALL(kConfigErrorVerifyFailed)。所以 ACK 就等于
+// "已生效", 主机再读一遍只是重复核对。STALL 时才多读一次锁存取原因, 然后抛出。
+// 实际生效的值(如 921600 -> 909090)要看就显式调 read_uart_setting()。
 inline void
     configure_uart(host::protocol::Handler& handler, std::size_t port, const UartSetting& setting) {
     const vc::UartConfigPayload payload{
         .baudrate = setting.baudrate,
+        .divisor = setting.divisor,
+        .oversample = setting.oversample,
         .word_length = std::to_underlying(setting.word_length),
         .parity = std::to_underlying(setting.parity),
         .stop_bits = std::to_underlying(setting.stop_bits),
-        .control = vc::kUartConfigApply};
+        .control = vc::kUartConfigApply,
+        .reserved = 0};
     if (!handler.vendor_control_out(
             std::to_underlying(vc::Request::kSetUartConfig), static_cast<uint16_t>(port), &payload,
-            sizeof(payload))) {
-        throw std::runtime_error{std::format(
-            "Board rejected the UART{} configuration request: {} ({}). The port keeps its "
-            "current configuration{}.",
-            port,
-            [&] {
-                const auto latch = read_last_config_error(handler);
-                return latch.reason == std::to_underlying(vc::ConfigErrorReason::kConfigErrorNone)
-                         ? std::string{"reason not latched"}
-                         : config_error_name(latch.reason);
-            }(),
-            static_cast<unsigned>(read_last_config_error(handler).request),
-            config_error_suffix(handler))};
-    }
-
-    const UartSetting effective = read_uart_setting(handler, port);
-    if (setting.baudrate != 0) {
-        const uint64_t error = effective.baudrate > setting.baudrate
-                                 ? effective.baudrate - setting.baudrate
-                                 : setting.baudrate - effective.baudrate;
-        if (error * 100U > static_cast<uint64_t>(setting.baudrate) * 5U) {
-            throw std::runtime_error{std::format(
-                "UART{} accepted {} baud but reads back {}. The board and the host disagree "
-                "about what was programmed; do not trust this link.",
-                port, setting.baudrate, effective.baudrate)};
-        }
-    }
-    // 0 is the protocol's "leave unchanged", which UartWordLength has no enumerator for.
-    if (std::to_underlying(setting.word_length) != 0
-        && effective.word_length != setting.word_length) {
-        throw std::runtime_error{std::format(
-            "UART{}: word length was not applied (reads back {}).", port,
-            std::to_underlying(effective.word_length))};
-    }
-    if (setting.parity != static_cast<vc::UartParity>(0) && effective.parity != setting.parity) {
-        throw std::runtime_error{std::format(
-            "UART{}: parity was not applied (reads back {}).", port,
-            std::to_underlying(effective.parity))};
-    }
-    if (setting.stop_bits != static_cast<vc::UartStopBits>(0)
-        && effective.stop_bits != setting.stop_bits) {
-        throw std::runtime_error{std::format(
-            "UART{}: stop bits were not applied (reads back {}).", port,
-            std::to_underlying(effective.stop_bits))};
-    }
+            sizeof(payload)))
+        throw_rejected(
+            handler, vc::Request::kSetUartConfig, port,
+            setting.baudrate != 0
+                ? std::format("the UART{} configuration ({} baud)", port, setting.baudrate)
+                : std::format("the UART{} configuration", port));
 }
 
 // Rate-only form, the shape every board class exposed before framing joined
@@ -287,11 +341,30 @@ inline void configure_uart(host::protocol::Handler& handler, std::size_t port, u
     configure_uart(handler, port, UartSetting{.baudrate = baudrate});
 }
 
+// 运行期改口: 应用后并入 configuration, 重连时 apply() 重放它而非回退; 调用方须持重配锁。
+inline void reconfigure_uart(
+    host::protocol::Handler& handler, Configuration& configuration, std::size_t port,
+    const UartSetting& setting) {
+    configure_uart(handler, port, setting);
+    UartSetting stored = configuration.uart[port].value_or(UartSetting{});
+    // 分频器断言只跟它所属的速率走: 换速率即作废旧断言, 无速率的纯断言不记。
+    if (setting.baudrate != 0) {
+        stored.baudrate = setting.baudrate;
+        stored.divisor = setting.divisor;
+        stored.oversample = setting.oversample;
+    }
+    if (std::to_underlying(setting.word_length) != 0)
+        stored.word_length = setting.word_length;
+    if (std::to_underlying(setting.parity) != 0)
+        stored.parity = setting.parity;
+    if (std::to_underlying(setting.stop_bits) != 0)
+        stored.stop_bits = setting.stop_bits;
+    configuration.uart[port] = stored;
+}
+
 // Reads one CAN bus's full timing identity as the board reported it: the TX
-// mode in force, the rates and sample points the controller is actually timed
-// for, and the capability bits. Read-only -- applying a mode goes through
-// request_can_mode(), and the timing fields can never be applied (they are
-// board-measured facts constrained by the bus peers' hardware).
+// mode in force and the rates and sample points the controller is actually
+// timed for. Read-only -- applying a setting goes through request_can_setting().
 inline vc::CanConfigPayload read_can_config(host::protocol::Handler& handler, std::size_t bus) {
     vc::CanConfigPayload payload{};
     if (!handler.vendor_control_in(
@@ -303,82 +376,61 @@ inline vc::CanConfigPayload read_can_config(host::protocol::Handler& handler, st
     return payload;
 }
 
-// Requests a bus's TX frame type and confirms the board agrees. The exchange is
-// deliberately GET -> SET -> GET:
+// Requests a bus's setting: ONE control transfer.
 //
-//   1. GET captures the bus's current timing identity (rates, sample points).
-//   2. The SET asks for `want_fd` AND echoes that captured timing back in the
-//      assertion fields. This is what makes it impossible to forget the data
-//      phase: the caller only says want_fd, and the SDK asserts the whole
-//      electrical identity along with the mode -- a mode switch that somehow
-//      disturbed the timing (no re-init is involved, so it cannot) would be
-//      caught instead of silently accepted. A caller working with raw
-//      Handler::vendor_control calls can still skip the timing fields (0 =
-//      skip); the helper exists so nobody HAS to remember.
-//   3. The final GET re-reads the mode, so the decision rests on what the
-//      board says it runs, not on the absence of a stall.
-//
-// The `settable` flag (the board's own capability report) selects between the
-// two failure stories:
-//   settable    the board applies the mode; a stall or a disagreeing read-back
-//               means the board refused, and the caller's expectation is wrong
-//               for a bus someone else may have configured.
-//   !settable   the mode is a compile-time property of the firmware's port
-//               table (hpm_board: a controller initialized without CAN-FD
-//               cannot receive FD frames at all -- measured 0/50 -- so mode
-//               application is deliberately not offered). A mismatch is the
-//               caller's expectation being wrong, and it is fatal here rather
-//               than silently producing frames of the other type on the wire.
-inline void request_can_mode(
-    host::protocol::Handler& handler, std::size_t bus, bool want_fd, bool settable) {
-    const vc::CanConfigPayload before = read_can_config(handler, bus);
+// 成功路径只有这一次 SET: 速率可设的板(hpm_board)带 kCanConfigApplyTiming, 按速率重初始化后
+// 自己回读帧型/速率/采样点, 不符即 STALL(kConfigErrorVerifyFailed), 解不出即 STALL
+// (kConfigErrorRateUnrepresentable); 其余板速率字段是核对, 帧型按 kCapCanModeSettable 切或
+// 核对。所以 ACK 就等于"总线已是这份设置"。STALL 时读一次锁存取原因并抛出。要看速率与采样点
+// 就显式调 read_can_config()。
+inline void request_can_setting(
+    host::protocol::Handler& handler, std::size_t bus, const CanSetting& setting,
+    const Interface& interface) {
+    if (!setting.fd && setting.data_baudrate != 0U) {
+        throw std::invalid_argument{std::format(
+            "CAN{}: a classic bus has no data phase, but data_baudrate = {} was given.", bus + 1,
+            setting.data_baudrate)};
+    }
+    uint8_t control = vc::kCanConfigApply;
+    if (interface.can_rate_settable)
+        control |= vc::kCanConfigApplyTiming;
     const vc::CanConfigPayload payload{
-        .mode = std::to_underlying(want_fd ? vc::CanMode::kCanFd : vc::CanMode::kClassic),
-        .control = vc::kCanConfigApply,
+        .mode = std::to_underlying(setting.fd ? vc::CanMode::kCanFd : vc::CanMode::kClassic),
+        .control = control,
         .reserved0 = 0,
-        .arbitration_baudrate = before.arbitration_baudrate,
-        .data_baudrate = before.data_baudrate,
-        .nominal_sample_point = before.nominal_sample_point,
-        .data_sample_point = before.data_sample_point,
+        .arbitration_baudrate = setting.arbitration_baudrate,
+        .data_baudrate = setting.data_baudrate,
+        .nominal_sample_point = 0,
+        .data_sample_point = 0,
         .reserved1 = 0};
     if (!handler.vendor_control_out(
             std::to_underlying(vc::Request::kSetCanConfig), static_cast<uint16_t>(bus), &payload,
-            sizeof(payload))) {
-        if (settable)
-            throw std::runtime_error{std::format(
-                "CAN{}: the board refused the requested {} ({}). The bus keeps its current mode.",
-                bus + 1, want_fd ? "CAN-FD" : "classic CAN",
-                config_error_name(read_last_config_error(handler).reason))};
-        throw std::runtime_error{std::format(
-            "CAN{} runs {} on this board, but was opened expecting {}. The bus mode is fixed "
-            "by the firmware's port table; change the expectation or the firmware.",
-            bus + 1, want_fd ? "classic CAN" : "CAN-FD", want_fd ? "CAN-FD" : "classic CAN")};
-    }
+            sizeof(payload)))
+        throw_rejected(
+            handler, vc::Request::kSetCanConfig, bus,
+            setting.fd
+                ? std::format(
+                      "CAN{} as CAN-FD ({} / {} baud)", bus + 1, setting.arbitration_baudrate,
+                      setting.data_baudrate)
+                : std::format(
+                      "CAN{} as classic CAN ({} baud)", bus + 1, setting.arbitration_baudrate));
+}
 
-    const vc::CanConfigPayload after = read_can_config(handler, bus);
-    if (after.mode != payload.mode) {
-        const char* actual_mode =
-            after.mode == std::to_underlying(vc::CanMode::kCanFd) ? "CAN-FD" : "classic CAN";
-        throw std::runtime_error{std::format(
-            "CAN{} was asked to run {} but reads back {}. The board and the host disagree "
-            "about what was configured; do not trust this bus.",
-            bus + 1, want_fd ? "CAN-FD" : "classic CAN", actual_mode)};
+// 运行期改总线设置: 成功后同步 FD 掩码并写回 configuration, 重连时 apply() 重放本次设置而非
+// 回退。调用方须持重配锁(见 Reconfigurable)。
+inline void reconfigure_can(
+    host::protocol::Handler& handler, Configuration& configuration,
+    std::atomic<Interface>& interface, std::size_t bus, const CanSetting& setting) {
+    Interface current = interface.load(std::memory_order_relaxed);
+    if (bus >= current.can_count || bus >= std::size(configuration.can)) {
+        throw std::out_of_range{std::format(
+            "CAN{} does not exist: this board reports {} CAN bus(es).", bus + 1,
+            current.can_count)};
     }
-    // The timing fields were echoed from the board itself, so any drift here
-    // means the mode switch disturbed the bit timing -- impossible by
-    // construction (mode application never re-initializes the controller), and
-    // cheap to prove rather than assume.
-    if (after.arbitration_baudrate != before.arbitration_baudrate
-        || after.data_baudrate != before.data_baudrate
-        || after.nominal_sample_point != before.nominal_sample_point
-        || after.data_sample_point != before.data_sample_point) {
-        throw std::runtime_error{std::format(
-            "CAN{}: the mode switch changed the reported timing ({} -> {} baud, {} -> {} per "
-            "mille). The controller was re-initialized behind this exchange; do not trust "
-            "this bus.",
-            bus + 1, before.arbitration_baudrate, after.arbitration_baudrate,
-            before.nominal_sample_point, after.nominal_sample_point)};
-    }
+    request_can_setting(handler, bus, setting, current);
+    current.set_can_fd(bus, setting.fd);
+    interface.store(current, std::memory_order_release);
+    configuration.can[bus] = setting;
 }
 
 // Reads a CAN controller's own error state. Available on the shipping image --
@@ -431,44 +483,43 @@ inline vc::LatencyBreakdownPayload
 
 // One place for the whole construction-time exchange, so every board class in
 // this directory performs it identically and in the same order: learn what the
-// board is, assert the CAN modes, then apply the UART rates.
+// board is, apply the CAN settings, then apply the UART rates.
 //
 // The board classes run it again from the keepalive thread before every
-// re-opened session, with the configuration they were CONSTRUCTED with: every
-// channel that configuration names is set back to it, whatever configure_*()
-// calls changed since; channels it leaves unset keep what the board runs.
+// re-opened session, under their reconfigure lock, with their stored
+// configuration: the constructor's, plus every run-time UART change written
+// back by reconfigure_uart(). Channels it leaves unset keep what the board runs.
 inline Interface apply(host::protocol::Handler& handler, const Configuration& configuration) {
     Interface interface = read_interface(handler);
 
-    for (std::size_t bus = 0; bus < std::size(configuration.can_fd); ++bus) {
-        const auto& can_fd = configuration.can_fd[bus];
-        if (!can_fd.has_value())
+    for (std::size_t bus = 0; bus < std::size(configuration.can); ++bus) {
+        const auto& setting = configuration.can[bus];
+        if (!setting.has_value())
             continue;
         if (bus >= interface.can_count) {
             throw std::runtime_error{std::format(
                 "CAN{} was configured but this board reports only {} CAN bus(es).", bus + 1,
                 interface.can_count)};
         }
-        request_can_mode(handler, bus, *can_fd, interface.can_mode_settable);
+        request_can_setting(handler, bus, *setting, interface);
         // The mask above was read before this request. On a settable board
-        // (mc02) the request can change the mode, and request_can_mode() has
-        // just confirmed the board now runs *can_fd -- without this, canN_is_fd()
-        // would report the firmware's mode instead of the configured one.
-        const auto bit = static_cast<uint8_t>(1U << bus);
-        interface.can_fd_mask = *can_fd ? static_cast<uint8_t>(interface.can_fd_mask | bit)
-                                        : static_cast<uint8_t>(interface.can_fd_mask & ~bit);
+        // (mc02, hpm_board) the request can change the mode, and the board's
+        // ACK has just confirmed it now runs setting->fd -- without this,
+        // canN_is_fd() would report the firmware's mode instead of the
+        // configured one.
+        interface.set_can_fd(bus, setting->fd);
     }
 
-    for (std::size_t port = 0; port < std::size(configuration.uart_baudrate); ++port) {
-        const auto& baudrate = configuration.uart_baudrate[port];
-        if (!baudrate.has_value())
+    for (std::size_t port = 0; port < std::size(configuration.uart); ++port) {
+        const auto& setting = configuration.uart[port];
+        if (!setting.has_value())
             continue;
         if (port >= interface.uart_count) {
             throw std::runtime_error{std::format(
                 "UART{} was configured but this board reports only {} UART port(s).", port,
                 interface.uart_count)};
         }
-        configure_uart(handler, port, *baudrate);
+        configure_uart(handler, port, *setting);
     }
 
     return interface;

@@ -1,11 +1,13 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 #include <libhcs/board/common.hpp>
 #include <libhcs/board/hcs_can_port.hpp>
@@ -48,7 +50,7 @@ namespace libhcs::board {
  * fields, so a caller that kept using one would fail the link rather than
  * switch a baudrate.
  */
-class Mc02 final {
+class Mc02 final : public hcs::Reconfigurable {
 public:
     class Callback : public data::DataCallback {
     public:
@@ -195,32 +197,30 @@ public:
         friend class Mc02;
 
     public:
-        // Transmits on the silkscreen CAN port named by the method. The frame
-        // type is a property of the BUS, not of a frame: the firmware puts every
-        // frame on the wire in its compiled bus mode (CAN-FD on all three mc02
-        // buses) and reports that mode over EP0 -- read can1_is_fd() and
-        // friends instead of assuming. There is no per-frame flag to set.
+        // Transmits on the CAN port named as the enclosure labels it.
+        // Ports on this board: CanPort::kCan1, CanPort::kCan2, CanPort::kCan3
+        // (silkscreen CAN1..CAN3). Same entry point as every other board's, so
+        // a caller that does not know which board it holds can still address a
+        // port.
         //
-        // Long payloads stay refused until the mc02 firmware widens its RX
-        // FIFO elements to 64 bytes (its TX path is already FD-capable; an
-        // asymmetric capability would let the host send frames the board can
-        // never receive back).
-        PacketBuilder& can1_transmit(const libhcs::data::CanDataView& data) {
-            hcs::reject_long_payload(data.can_data, "CAN1");
-            if (!builder_.write_can(data::DataId::kCan1, data)) [[unlikely]]
-                throw std::invalid_argument{"CAN1 transmission failed: Invalid CAN data"};
-            return *this;
-        }
-        PacketBuilder& can2_transmit(const libhcs::data::CanDataView& data) {
-            hcs::reject_long_payload(data.can_data, "CAN2");
-            if (!builder_.write_can(data::DataId::kCan2, data)) [[unlikely]]
-                throw std::invalid_argument{"CAN2 transmission failed: Invalid CAN data"};
-            return *this;
-        }
-        PacketBuilder& can3_transmit(const libhcs::data::CanDataView& data) {
-            hcs::reject_long_payload(data.can_data, "CAN3");
-            if (!builder_.write_can(data::DataId::kCan3, data)) [[unlikely]]
-                throw std::invalid_argument{"CAN3 transmission failed: Invalid CAN data"};
+        // The frame type is a property of the BUS, not of a frame: the firmware
+        // puts every frame on the wire in its compiled bus mode (CAN-FD on all
+        // three mc02 buses) and reports that mode over EP0 -- read
+        // can1_is_fd() and friends instead of assuming. There is no per-frame
+        // flag to set.
+        PacketBuilder& can_transmit(hcs::CanPort port, const libhcs::data::CanDataView& data) {
+            // Ports on this board are CanPort::kCan1..kCan3, and kCanN is
+            // DataId::kCanN -- same numbering as the silkscreen.
+            const auto index = std::to_underlying(port);
+            if (index < 1 || index > spec::mc02::kCanIds.size()) [[unlikely]]
+                throw std::out_of_range{"Mc02: CAN port out of range (this board has CAN1..CAN3)"};
+            // Long payloads stay refused until the mc02 firmware widens its RX
+            // FIFO elements to 64 bytes (its TX path is already FD-capable; an
+            // asymmetric capability would let the host send frames the board
+            // can never receive back).
+            hcs::reject_long_payload(data.can_data, spec::mc02::kCanNames[index - 1]);
+            if (!builder_.write_can(spec::mc02::kCanIds[index - 1], data)) [[unlikely]]
+                throw std::invalid_argument{"CAN transmission failed: Invalid CAN data"};
             return *this;
         }
 
@@ -305,12 +305,17 @@ public:
     // already handed to the board go out at whichever rate the port reaches
     // them at, so quiesce the link before switching. The RS-485 ports keep
     // their own firmware-side turnaround discipline; nothing here paces them.
-    void configure_uart1(uint32_t baudrate) { hcs::configure_uart(handler_, 1, baudrate); }
-    void configure_uart2(uint32_t baudrate) { hcs::configure_uart(handler_, 2, baudrate); }
-    void configure_uart3(uint32_t baudrate) { hcs::configure_uart(handler_, 3, baudrate); }
-    void configure_uart7(uint32_t baudrate) { hcs::configure_uart(handler_, 4, baudrate); }
-    void configure_uart10(uint32_t baudrate) { hcs::configure_uart(handler_, 5, baudrate); }
-    void configure_dbus(uint32_t baudrate) { hcs::configure_uart(handler_, 0, baudrate); }
+    // Every run-time mutator below takes the inherited reconfigure_mutex_, so it
+    // cannot interleave with the reconnect hook's apply() or with another
+    // mutator. Without it, a configure_uartN() landing between the hook's EP0
+    // request and the hook's cached-interface publish leaves the host describing
+    // one state and the board running another. See hcs::Reconfigurable.
+    void configure_uart1(uint32_t baudrate) { configure_uart(1, {.baudrate = baudrate}); }
+    void configure_uart2(uint32_t baudrate) { configure_uart(2, {.baudrate = baudrate}); }
+    void configure_uart3(uint32_t baudrate) { configure_uart(3, {.baudrate = baudrate}); }
+    void configure_uart7(uint32_t baudrate) { configure_uart(4, {.baudrate = baudrate}); }
+    void configure_uart10(uint32_t baudrate) { configure_uart(5, {.baudrate = baudrate}); }
+    void configure_dbus(uint32_t baudrate) { configure_uart(0, {.baudrate = baudrate}); }
 
     // Full-setting forms: baudrate plus framing (word length 7/8, parity
     // none/even/odd, stop bits 1/2), each field optional -- zero fields leave
@@ -318,24 +323,12 @@ public:
     // and configure_uart() for the verify semantics. Framing changes the byte
     // stream the far end sees: quiesce the link and reconfigure the peer in
     // the same breath.
-    void configure_uart1(const hcs::UartSetting& setting) {
-        hcs::configure_uart(handler_, 1, setting);
-    }
-    void configure_uart2(const hcs::UartSetting& setting) {
-        hcs::configure_uart(handler_, 2, setting);
-    }
-    void configure_uart3(const hcs::UartSetting& setting) {
-        hcs::configure_uart(handler_, 3, setting);
-    }
-    void configure_uart7(const hcs::UartSetting& setting) {
-        hcs::configure_uart(handler_, 4, setting);
-    }
-    void configure_uart10(const hcs::UartSetting& setting) {
-        hcs::configure_uart(handler_, 5, setting);
-    }
-    void configure_dbus(const hcs::UartSetting& setting) {
-        hcs::configure_uart(handler_, 0, setting);
-    }
+    void configure_uart1(const hcs::UartSetting& setting) { configure_uart(1, setting); }
+    void configure_uart2(const hcs::UartSetting& setting) { configure_uart(2, setting); }
+    void configure_uart3(const hcs::UartSetting& setting) { configure_uart(3, setting); }
+    void configure_uart7(const hcs::UartSetting& setting) { configure_uart(4, setting); }
+    void configure_uart10(const hcs::UartSetting& setting) { configure_uart(5, setting); }
+    void configure_dbus(const hcs::UartSetting& setting) { configure_uart(0, setting); }
 
     // What each port is really running, reconstructed on the board from the
     // divisor actually programmed -- not the value that was last requested.
@@ -426,12 +419,14 @@ private:
     // whichever runs second defines both.
     void configure_can(std::size_t bus, bool fd) {
         const std::scoped_lock guard{reconfigure_mutex_};
-        hcs::request_can_mode(handler_, bus, fd, true);
-        auto interface = interface_.load(std::memory_order_relaxed);
-        const auto bit = static_cast<uint8_t>(1U << bus);
-        interface.can_fd_mask = fd ? static_cast<uint8_t>(interface.can_fd_mask | bit)
-                                   : static_cast<uint8_t>(interface.can_fd_mask & ~bit);
-        interface_.store(interface, std::memory_order_release);
+        // 本板速率写死(CubeMX), 只切帧型: 速率留 0 = 不核对。
+        hcs::reconfigure_can(handler_, configuration_, interface_, bus, hcs::CanSetting{.fd = fd});
+    }
+
+    // configure_uartN() 的共用体: 整个 EP0 往返持重配锁, 并写回 configuration_ 供重连重放。
+    void configure_uart(std::size_t port, const hcs::UartSetting& setting) {
+        const std::scoped_lock guard{reconfigure_mutex_};
+        hcs::reconfigure_uart(handler_, configuration_, port, setting);
     }
 
     // mc02 uses the shared HCS vendor id (0xA511) and the fixed board-type PID
@@ -448,11 +443,11 @@ private:
     // hook re-learns it on the keepalive thread at every reconnect, and
     // configure_can() writes it from whichever thread calls it, while
     // canN_is_fd()/interface() read it concurrently. The writers serialize on
-    // reconfigure_mutex_; readers never take it. See hcs_config.hpp's
+    // the inherited reconfigure_mutex_ (see hcs::Reconfigurable for why it is
+    // shared rather than per-board); readers never take it. See hcs_config.hpp's
     // static_assert.
     std::atomic<hcs::Interface> interface_;
     Configuration configuration_;
-    std::mutex reconfigure_mutex_;
     host::protocol::Handler handler_;
 };
 

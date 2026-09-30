@@ -186,10 +186,11 @@ void transmit_can(Board& board, int bus, uint32_t id, std::span<const std::byte>
         .can_data = payload,
         .is_extended_can_id = is_extended,
     };
-    if (bus == 1)
-        builder.can2_transmit(data);
-    else
-        builder.can3_transmit(data);
+    // This probe only drives the second and third mc02 buses (silkscreen
+    // CAN2/CAN3), which are CanPort::kCan2/kCan3.
+    builder.can_transmit(
+        bus == 1 ? libhcs::board::hcs::CanPort::kCan2 : libhcs::board::hcs::CanPort::kCan3,
+        data);
 }
 
 bool run_can_case(

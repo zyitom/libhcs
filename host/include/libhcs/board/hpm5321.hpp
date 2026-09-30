@@ -32,7 +32,7 @@ namespace libhcs::board {
 // What the two PCBs still differ in is the port count, and that is checked at
 // run time: transmitting on a bus this board does not have throws rather than
 // going quietly nowhere.
-class Hpm5321 final {
+class Hpm5321 final : public hcs::Reconfigurable {
 public:
     class Callback : public data::DataCallback {
     public:
@@ -127,6 +127,7 @@ public:
         , handler_(
               core::protocol::usb_identity::kDmtoolVendorId, kProductIds, serial_filter, options,
               callback, [this](host::protocol::Handler& handler) {
+                  const std::scoped_lock guard{reconfigure_mutex_};
                   interface_.store(hcs::apply(handler, configuration_), std::memory_order_release);
               }) {}
 
@@ -195,12 +196,17 @@ public:
     // throws if it refused. They are NOT ordered against queued data -- bytes
     // already handed to the board go out at whichever rate the port reaches
     // them at, so quiesce the link before switching.
-    void configure_uart0(uint32_t baudrate) { hcs::configure_uart(handler_, 0, baudrate); }
+    // 两种形式都在重配锁内写回 configuration_, 重连重放而非回退, 见 hcs::reconfigure_uart。
+    void configure_uart0(uint32_t baudrate) {
+        const std::scoped_lock guard{reconfigure_mutex_};
+        hcs::reconfigure_uart(handler_, configuration_, 0, {.baudrate = baudrate});
+    }
 
     // Full-setting form: baudrate plus framing (word length 7/8, parity
     // none/even/odd, stop bits 1/2), each field optional. See hcs::UartSetting.
     void configure_uart0(const hcs::UartSetting& setting) {
-        hcs::configure_uart(handler_, 0, setting);
+        const std::scoped_lock guard{reconfigure_mutex_};
+        hcs::reconfigure_uart(handler_, configuration_, 0, setting);
     }
 
     // What UART0 is really running, reconstructed on the board from the
@@ -213,10 +219,17 @@ public:
         return hcs::read_uart_setting(handler_, port);
     }
 
-    // Frame type of each CAN bus, as the board reported it during construction.
-    // It is a property of the bus, not of a frame: the wire protocol carries no
-    // per-frame type flag any more, and this board's firmware sends every frame
-    // in its bus's compiled mode. Read this instead of assuming.
+    // 运行期改 CAN 总线设置(帧型 + 速率, 经 EP0), 如 configure_can1(hcs::kClassic1M)。板端按
+    // 速率在 87.5% 采样点上重解位时序并重初始化控制器, 经典即关掉 FD(2.0 总线上硬件层面不出现
+    // 任何 FD 位); 板子自己回读确认后才 ACK, 被拒或解不出即抛。与已排队数据不定序, 且板端会
+    // 丢弃旧设置下排队的帧: 先静默链路。写回 configuration_, 重连重放本次设置。
+    void configure_can1(const hcs::CanSetting& setting) { configure_can(0, setting); }
+    void configure_can2(const hcs::CanSetting& setting) { configure_can(1, setting); }
+
+    // Frame type of each CAN bus: seeded by the construction handshake, kept in
+    // step by configure_canN(). It is a property of the bus, not of a frame --
+    // the wire protocol carries no per-frame type flag. Read this instead of
+    // assuming.
     [[nodiscard]] bool can1_is_fd() const {
         return interface_.load(std::memory_order_relaxed).can_fd(0);
     }
@@ -238,10 +251,11 @@ public:
         return hcs::read_last_config_error(handler_);
     }
 
-    // One CAN bus's full timing identity over EP0: the TX mode in force (this
-    // board applies nothing -- the capability bit is clear), the rates and
-    // sample points the controller is actually timed for (1 Mbit/s / 5 Mbit/s /
-    // 875 per mille), and the capability bits.
+    // One CAN bus's full timing identity over EP0: the TX mode in force, and the
+    // rates and sample points reconstructed from the controller's registers
+    // (the rates the host configured, sample points pinned at 875 per mille;
+    // classic reports the data phase as 0 because the controller runs with FD
+    // off). Read-only -- configure_canN() changes the setting.
     [[nodiscard]] hcs::vc::CanConfigPayload can_config(hcs::CanPort port) {
         return hcs::read_can_config(handler_, static_cast<std::size_t>(port) - 1);
     }
@@ -269,6 +283,12 @@ public:
     }
 
 private:
+    // configure_canN() 的共用体: 整个 EP0 往返持重配锁, 与重连钩子的 apply() 互斥。
+    void configure_can(std::size_t bus, const hcs::CanSetting& setting) {
+        const std::scoped_lock guard{reconfigure_mutex_};
+        hcs::reconfigure_can(handler_, configuration_, interface_, bus, setting);
+    }
+
     // Both PCBs, in the order the scanner should prefer to report them. The
     // firmware picks its own product ID from OTP, so which one answers is a
     // property of the hardware, not of this call.

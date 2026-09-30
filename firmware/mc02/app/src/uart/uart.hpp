@@ -69,40 +69,43 @@ public:
         hal_uart_handle_->Instance->BRR = brr;
     }
 
-    // 应用帧格式。字长直接用数据位数(7/8; 9 位不提供 -- RX 环是字节 DMA, 第
-    // 九位会被静默截断), 校验与停止位用协议编码(0 = 保持不变; 校验 1=无 2=偶
-    // 3=奇; 停止位 1=1 2=2; 1.5 停止位不提供 -- 本系列控制器只在 5 位字长下
-    // 实现它)。先全量校验后一次 UE 下拉内写完: M/PCE/PS/STOP 只能在 UE=0 时
-    // 写, 窗口内到达的字节会失配。
-    bool set_framing(uint32_t word_length, uint32_t parity, uint32_t stop_bits) {
-        // 纯校验, 不碰寄存器。
+    // 应用帧格式前的**纯校验**, 不碰任何寄存器。EP0 处理器先调它排除非法组合,
+    // 于是"帧格式非法"这条路一个寄存器都没动 —— 与波特率的 solve_brr() 对称,
+    // 二者合起来使 STALL 严格等于"什么都没改"。编码见 commit_framing() 上方。
+    [[nodiscard]] bool
+        check_framing(uint32_t word_length, uint32_t parity, uint32_t stop_bits) const {
+        if (word_length != 0U && word_length != 7U && word_length != 8U)
+            return false;
+        if (parity != 0U && (parity < 1U || parity > 3U))
+            return false;
+        if (stop_bits != 0U && stop_bits != 1U && stop_bits != 2U)
+            return false;
+        return true;
+    }
+
+    // 提交 check_framing() 已通过的帧格式。字长直接用数据位数(7/8; 9 位不提供 --
+    // RX 环是字节 DMA, 第九位会被静默截断), 校验与停止位用协议编码(0 = 保持不变;
+    // 校验 1=无 2=偶 3=奇; 停止位 1=1 2=2; 1.5 停止位不提供 -- 本系列控制器只在
+    // 5 位字长下实现它)。一次 UE 下拉内写完: M/PCE/PS/STOP 只能在 UE=0 时写,
+    // 窗口内到达的字节会失配, 故调用方必须先静默链路。
+    //
+    // 本函数无失败路径 —— 校验已在 check_framing() 完成, 这正是拆开的目的: 旧
+    // 的 set_framing() 把校验与写入揉在一起, 校验失败时虽已提前 return, 但
+    // 一旦有人在这中间插入一次寄存器写, "STALL 即未改"就悄悄失效了。
+    void commit_framing(uint32_t word_length, uint32_t parity, uint32_t stop_bits) {
         uint32_t m_bits = 0;
-        if (word_length != 0U) {
-            if (word_length == 7U)
-                m_bits = USART_CR1_M1;
-            else if (word_length == 8U)
-                m_bits = 0U;
-            else
-                return false;
-        }
+        if (word_length == 7U)
+            m_bits = USART_CR1_M1;
         uint32_t parity_bits = 0;
-        if (parity != 0U) {
-            switch (parity) {
-            case 1U: parity_bits = 0U; break;                           // 无校验
-            case 2U: parity_bits = USART_CR1_PCE; break;                // 偶
-            case 3U: parity_bits = USART_CR1_PCE | USART_CR1_PS; break; // 奇
-            default: return false;
-            }
+        switch (parity) {
+        case 1U: parity_bits = 0U; break;                           // 无校验
+        case 2U: parity_bits = USART_CR1_PCE; break;                // 偶
+        case 3U: parity_bits = USART_CR1_PCE | USART_CR1_PS; break; // 奇
+        default: break;
         }
         uint32_t stop_reg = 0;
-        if (stop_bits != 0U) {
-            if (stop_bits == 1U)
-                stop_reg = 0U;
-            else if (stop_bits == 2U)
-                stop_reg = USART_CR2_STOP_1;
-            else
-                return false;
-        }
+        if (stop_bits == 2U)
+            stop_reg = USART_CR2_STOP_1;
 
         auto* instance = hal_uart_handle_->Instance;
         const uint32_t cr1 = instance->CR1;
@@ -116,7 +119,6 @@ public:
         if (stop_bits != 0U)
             instance->CR2 = (instance->CR2 & ~USART_CR2_STOP) | stop_reg;
         instance->CR1 = new_cr1; // UE 恢复
-        return true;
     }
 
     // ---- 帧格式读回: 从活寄存器解码, 编码同上, 永不返回 0(0 只表示"跳过") ----
@@ -137,7 +139,7 @@ public:
     }
 
     [[nodiscard]] uint32_t stop_bits() const {
-        // 1.5 停止位的编码不会由本驱动写出(见 set_framing); 万一出现, 如实上报
+        // 1.5 停止位的编码不会由本驱动写出(见 check_framing); 万一出现, 如实上报
         // 协议中无此编码的原始值没有意义, 按最近的 2 处理并注释于此。
         return (hal_uart_handle_->Instance->CR2 & USART_CR2_STOP) == USART_CR2_STOP_1 ? 2U : 1U;
     }
@@ -146,8 +148,12 @@ public:
     // 值, 被拒绝的请求两者都不会写。读 BRR 才能让主机区分"切换已生效"与
     // "切换被拒、仍按旧速率运行"。
     [[nodiscard]] uint32_t effective_baudrate() const {
+        return baudrate_for(hal_uart_handle_->Instance->BRR & 0xFFFFU);
+    }
+
+    // 给定 BRR 值在本口时钟下的速率; EP0 用它在写入前核对 solve_brr() 的结果。
+    [[nodiscard]] uint32_t baudrate_for(uint32_t brr) const {
         const uint32_t kernel_clock_hz = peripheral_clock_hz();
-        const uint32_t brr = hal_uart_handle_->Instance->BRR & 0xFFFFU;
         if (!kernel_clock_hz || !brr) [[unlikely]]
             return 0;
         const uint32_t presc = UARTPrescTable[hal_uart_handle_->Init.ClockPrescaler & 0x0FU];
@@ -158,6 +164,28 @@ public:
             return usartdiv ? (2U * clock) / usartdiv : 0U;
         }
         return clock / brr;
+    }
+
+    // UartDivisor 的两个整数, 供 EP0 的 kGetUartConfig 上报与 kSetUartConfig
+    // 回读比对。**divisor 就是 BRR 寄存器本身**(低 16 位), 不做任何归一化 ——
+    // 与 solve_brr() 交给 commit_brr() 写进去的那个整数逐位相等, 因此这里报的
+    // 既是硬件事实, 又正是 solve_brr() 的返回值, 两端比对不需要任何换算。
+    //
+    // 8 倍过采样下 BRR 的低四位有特殊编码, 但那也是"实际写入的值", 如实上报;
+    // 换算成真实波特率是 effective_baudrate() 的事。
+    [[nodiscard]] uint16_t divisor_u16() const {
+        return static_cast<uint16_t>(hal_uart_handle_->Instance->BRR & 0xFFFFU);
+    }
+
+    [[nodiscard]] uint8_t oversample() const {
+        return hal_uart_handle_->Init.OverSampling == UART_OVERSAMPLING_8 ? 8U : 16U;
+    }
+
+    // 写入之后再回读, 确认 BRR 真的收下了这次编程。与 hpm 的
+    // verify_baudrate() 同一契约, 见 core vendor_control.hpp 的 UartDivisor。
+    [[nodiscard]] bool
+        verify_baudrate(uint16_t expected_divisor, uint8_t expected_oversample) const {
+        return divisor_u16() == expected_divisor && oversample() == expected_oversample;
     }
 
 protected:
@@ -293,7 +321,7 @@ private:
 // 无 TX 路径的两个独立原因: CubeMX 只给 UART5 接了 RX DMA 流
 // (bsp/cubemx/Core/Src/usart.c 只声明 hdma_uart5_rx 而无 hdma_uart5_tx); 协议
 // 也不会把下行路由到 kUartDbus, usb/vendor.hpp 的 uart_deserialized_callback
-// 只分发 kUart1/kUart7/kUart10(libhcs_APP_RS485_ENABLE 时另含两个 RS-485 口)。
+// 只分发 kUart1/kUart2/kUart3/kUart7/kUart10(不含 DBUS)。
 // 仅 kUartDbusConfig 路由至此, 落在 UartCommon::handle_config。
 class UartRxOnly
     : public UartCommon
@@ -447,10 +475,14 @@ private:
 // mc02 的 CAN 也有同样缺口, 见 firmware/mc02/AGENTS.md 的"未做"注(hpm_board
 // 的下行流控未移植)。
 //
-// libhcs_APP_RS485_ENABLE(默认开)时始终编译。它们就是机壳的 UART2/UART3, 不
-// 是叠在备用 DataId 上的别名; 诊断构建改用 kUart0 输出, 与这两个口不再冲突。
-// 关掉该开关即可连同 1.8 KB D2 SRAM 与每遍 NDTR 轮询一起去掉。
-#ifdef libhcs_APP_RS485_ENABLE
+// 始终编译 —— 它们就是机壳的 UART2/UART3, 不是叠在备用 DataId 上的别名;
+// 诊断构建改用 kUart0 输出, 与这两个口不再冲突。
+//
+// 原先有 libhcs_APP_RS485_ENABLE 开关, 已取消 [2026-09-30, UART_EP0_MIGRATION.md
+// 阶段 7]: 端口在每块同型板上都存在, 去掉它只会得到一份 EP0 下标空间带两个洞的
+// 镜像 —— 主机分不清"这块板没有 UART2"与"这版镜像把 UART2 编掉了"。代价是
+// ~1.8 KB D2 SRAM 常驻(Lazy 与其 DMA ring 在链接期就占位, 与是否 init() 无关),
+// 已明确接受。
 [[gnu::section(".d2_sram")]] inline constinit UartRs485::Lazy uart2{data::DataId::kUart2, &huart2};
 
 // 第二个 RS-485 口, USART3 经收发器 U6: 485_DIR1 由 PB14 上的 USART3_DE 驱动,
@@ -458,6 +490,5 @@ private:
 // 拉到 3V3 使禁用的接收器维持空闲电平, R18 把 DE 网络拉低使端口上电即接收,
 // R16 在本端装 120R 端接。
 [[gnu::section(".d2_sram")]] inline constinit UartRs485::Lazy uart3{data::DataId::kUart3, &huart3};
-#endif
 
 } // namespace libhcs::firmware::uart

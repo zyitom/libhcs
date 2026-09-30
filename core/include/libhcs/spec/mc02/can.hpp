@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <iterator>
 
@@ -65,5 +66,19 @@ public:
 } // namespace internal
 
 inline constexpr internal::CanDescriptors kCanDescriptors{};
+
+// Port -> wire id, indexed by CanPort. Same numbering as the silkscreen on
+// this board: CanPort::kCanN is DataId::kCanN. Spelled as a table because the
+// transmit path takes a port as a VALUE, so the mapping must be expressive at
+// run time -- the port's name is what the error messages carry, and the wire
+// id is what write_can() takes.
+inline constexpr std::array<data::DataId, 3> kCanIds{
+    data::DataId::kCan1,
+    data::DataId::kCan2,
+    data::DataId::kCan3,
+};
+
+// Port names for diagnostics, indexed the same way.
+inline constexpr std::array<const char*, 3> kCanNames{"CAN1", "CAN2", "CAN3"};
 
 } // namespace libhcs::spec::mc02

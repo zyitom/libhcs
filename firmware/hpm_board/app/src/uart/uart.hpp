@@ -60,6 +60,15 @@ public:
         if (baudrate == 0) [[unlikely]]
             return false;
 
+        // 先解不写。求解器拒绝时一个寄存器都没碰 —— 包括下面的
+        // abort_transmit()。这正是 D2: 旧实现无条件先拆在途 TX DMA 再交给
+        // uart_set_baudrate(), 于是"STALL 严格等于什么都没改"为假: 求解失败
+        // 时 DMA 已停、FIFO 里那批字节成了孤儿, 而主机以为自己什么都没改。
+        uint16_t want_divisor = 0;
+        uint8_t want_oversample = 0;
+        if (!solve_divisor(uart_clock_hz_, baudrate, want_divisor, want_oversample)) [[unlikely]]
+            return false;
+
         // 已交给 DMA 的字节会按新速率移位输出。
         //
         // 必须先于 uart_set_baudrate() 执行, 且不只为了不让在途字节按错误
@@ -76,14 +85,9 @@ public:
         // 两种结局。
         uart_base_->LCR &= ~UART_LCR_DLAB_MASK;
 
-        // 被拒: 分频器未被触碰, 端口仍按旧速率运行, 队列中的字节依旧有效。
-        // 跳过 FIFO 复位即可保留它们, 与 SDK 自带的 LIN 示例一致 -- 该路径
-        // 上它在 uart_reset_rx_fifo() 之前就返回, 不因一个什么都没改变的
-        // 请求丢数据。
-        //
-        // 80 MHz 时钟无法在 SDK 的 3% 容差内表示所有速率, 此处若误报成功,
-        // 主机会以为切换已完成 -- 这是唯一一种让对端速率失配看起来像接线
-        // 或硬件故障的失败模式。
+        // 上面已用同一个求解器筛过, 走到这里再失败说明 SDK 的求解器与本类
+        // 的复制品给出不同答案(见 solve_divisor 的说明)。分频器未被触碰,
+        // 端口仍按旧速率运行, 队列中的字节依旧有效, 按原样返回。
         if (status != status_success) [[unlikely]]
             return false;
 
@@ -94,6 +98,20 @@ public:
 
         snapshot_divisor();
         return true;
+    }
+
+    // 写入之后再回读, 确认寄存器真的收下了这次编程。EP0 的 kSetUartConfig 用它
+    // 把"求解器接受"升级为"硬件确认": 求解通过但回读不符, 是 kConfigErrorVerifyFailed,
+    // 与"求解器拒绝"(kConfigErrorRateUnrepresentable) 是两件事。
+    //
+    // 比对的是分频器整数与过采样, 不是波特率: 主机的内核时钟与板子不同, 波特率
+    // 无法在两侧复算, 而请求值本身不是求解器的不动点。见 UartDivisor 的注释。
+    //
+    // 只在 set_baudrate() 成功之后调用: 此时 DMA 已由那一步停稳, snapshot_divisor()
+    // 也已刷新, 这里读快照不会引入新的 DLAB 竞争。
+    [[nodiscard]] bool
+        verify_baudrate(uint16_t expected_divisor, uint8_t expected_oversample) const {
+        return divisor_u16() == expected_divisor && oversample() == expected_oversample;
     }
 
     // ---- 帧格式: EP0 配置通道的运行时切换与读回 ----
@@ -194,18 +212,109 @@ public:
     [[nodiscard]] uint32_t oscr() const { return uart_base_->OSCR; }
     [[nodiscard]] UART_Type* base() const { return uart_base_; }
 
+    // UartDivisor 的两个整数, 供 EP0 的 kGetUartConfig 上报与 kSetUartConfig
+    // 回读比对。**分频器取自快照** -- 理由同 divisor() 上方: 按需回读要置
+    // LCR.DLAB, 会与在途 TX DMA 争用 0x20。过采样取自活寄存器 OSCR(它不在
+    // DLAB 的别名窗口里, 直接读安全), 按 SDK 的编码把 0 还原成 32。
+    //
+    // 这一对是主机唯一能用来判定"速率切换是否真的生效"的东西: 主机的内核时钟
+    // 与板子的不同, 分频器无法在主机侧复算, 而请求的波特率又不是求解器的不动点
+    // (921600 在 80 MHz 上得 909090)。见 UartDivisor 的注释。
+    [[nodiscard]] uint16_t divisor_u16() const { return static_cast<uint16_t>(uart_divisor_); }
+
+    [[nodiscard]] uint8_t oversample() const {
+        const uint32_t osc_field = uart_base_->OSCR & UART_OSCR_OSC_MASK;
+        return static_cast<uint8_t>(osc_field ? osc_field : 32U);
+    }
+
     // 硬件实际运行的波特率, 由实际写入的分频器与过采样率重建 -- 而非
     // 主机请求的数值。这一区分正是意义所在: 被拒的请求不触碰分频器, 这里
     // 便仍报旧速率, 主机据此分辨成败。
     //
     // OSCR 存过采样率, 0 表示 32(SDK 如此编码, 因为该字段只有 5 位)。
     [[nodiscard]] uint32_t effective_baudrate() const {
-        const uint32_t osc_field = uart_base_->OSCR & UART_OSCR_OSC_MASK;
-        const uint32_t osc = osc_field ? osc_field : 32U;
-        const uint32_t divisor = uart_divisor_;
-        if (!osc || !divisor) [[unlikely]]
+        return baudrate_for(divisor_u16(), oversample());
+    }
+
+    // 给定 (分频器, 过采样倍数) 在本口时钟下的速率; EP0 用它在写入前核对求解结果。
+    [[nodiscard]] uint32_t baudrate_for(uint32_t divisor, uint32_t oversample) const {
+        if (!oversample || !divisor) [[unlikely]]
             return 0;
-        return uart_clock_hz_ / (osc * divisor);
+        return uart_clock_hz_ / (oversample * divisor);
+    }
+
+    // 只解不写: 求给定速率的 (divisor, 过采样倍数), 供 EP0 处理器先校验再提交。
+    //
+    // 为什么必须有它。uart_set_baudrate() 在自己开头置 LCR.DLAB, 而本类
+    // set_baudrate() 里的 TxBuffer::abort_transmit() 必须早于该窗口(DLL 与 THR
+    // 同址 0x20, DLAB 置位期间在途 TX DMA 的写会落进分频锁存器)。于是"先求解、
+    // 失败即 STALL"与"必须已停 DMA 才能进 DLAB 窗口"这两条互相顶住: SDK 的
+    // uart_set_baudrate() 是唯一求解入口, 而它自己就会开 DLAB。解法是把求解拆出来
+    // 前置 —— 复制 SDK 的求解器(它不导出: hpm_uart_drv.c:66 是 static), 在碰任何
+    // 寄存器之前先解一次; 解不出来就原样返回 false, 一个寄存器都没动, "STALL 严格
+    // 等于什么都没改"才机械成立。
+    //
+    // 与 SDK 逐位一致是硬要求: SDK 在同一个 (clock, baudrate) 上给出同一答案, 因此
+    // 本函数通过之后 uart_set_baudrate() 不会反过来失败 —— 它只会在"本函数已拒绝"
+    // 的输入上失败, 而那条路径现在到不了。
+    //
+    // 这份复制**无法在编译期钉住**: SDK 把容差/范围/SCALE 全定义在
+    // hpm_uart_drv.c 里(第 14-29 行), 不是头文件, 本翻译单元看不见(只有寄存器
+    // 位域宏在 soc/*/ip/hpm_uart_regs.h 里可见, 那几项下面已 static_assert)。
+    // 所以复制品的正确性由**运行期回读**兜底, 而不是由编译器: 写入之后立即回读
+    // DLL/DLM/OSCR 与本函数算出的 (divisor, 过采样倍数) 比对, 不等即 verify_failed。
+    // 若哪天 SDK 改了容差使两者分道扬镳, 症状是一个明确的 kConfigErrorVerifyFailed,
+    // 而不是一个静默错误的波特率 —— 这正是本任务要消灭的那类失败。
+    [[nodiscard]] static bool solve_divisor(
+        uint32_t clock_hz, uint32_t baudrate, uint16_t& divisor_out, uint8_t& oversample_out) {
+        // SDK 的常量, 逐一镜像(hpm_uart_drv.c:14-29)。
+        constexpr uint32_t kMinimumBaudrate = 200U;
+        constexpr uint32_t kTolerance = 3U;
+        constexpr uint32_t kOscMax = 32U;
+        constexpr uint32_t kOscMin = 8U;
+        constexpr uint32_t kDivMax = 0xFFFFU;
+        constexpr uint32_t kDivMin = 1U;
+        constexpr uint32_t kScale = 1000U;
+        // 循环上界是 SoC 头里可见的宏(HPM5301/5361 降到 30), SDK 同式取默认。
+#ifdef UART_SOC_OVERSAMPLE_MAX
+        constexpr uint32_t kOscLoopMax = UART_SOC_OVERSAMPLE_MAX;
+#else
+        constexpr uint32_t kOscLoopMax = kOscMax;
+#endif
+
+        // 只有寄存器位域宏在头文件里可见, 其余 SDK 常量在 .c 内, 见上方说明。
+        static_assert(UART_OSCR_OSC_MASK == 0x1FU);
+        static_assert(UART_DLL_DLL_MASK == 0xFFU);
+        static_assert(UART_DLM_DLM_MASK == 0xFFU);
+
+        if (clock_hz == 0U || baudrate == 0U) [[unlikely]]
+            return false;
+        // SDK 的入参闸门, 逐条对应。
+        if (baudrate < kMinimumBaudrate || clock_hz / kDivMin < baudrate * kOscMin
+            || clock_hz / kDivMax > baudrate * kOscMax) [[unlikely]]
+            return false;
+
+        const uint64_t tmp = (static_cast<uint64_t>(clock_hz) * kScale) / baudrate;
+
+        for (uint32_t osc = kOscMin; osc <= kOscLoopMax; osc += 2) {
+            // 带舍入的分频器(与 SDK 同式)。
+            const uint32_t div = static_cast<uint32_t>((tmp + osc * (kScale / 2)) / (osc * kScale));
+            if (div < kDivMin || div > kDivMax)
+                continue;
+            uint32_t delta = 0;
+            const uint64_t achieved = static_cast<uint64_t>(div) * osc * kScale;
+            if (achieved > tmp)
+                delta = static_cast<uint32_t>(achieved - tmp);
+            else if (achieved < tmp)
+                delta = static_cast<uint32_t>(tmp - achieved);
+            if (delta && (((delta * 100U) / tmp) > kTolerance))
+                continue;
+            divisor_out = static_cast<uint16_t>(div);
+            // 报倍数而非 OSCR 编码(32 写进寄存器是 0), 与 oversample() 同域比较。
+            oversample_out = static_cast<uint8_t>(osc);
+            return true;
+        }
+        return false;
     }
 
 private:

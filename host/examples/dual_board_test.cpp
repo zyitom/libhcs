@@ -388,7 +388,9 @@ std::vector<std::pair<std::string, std::string>> enumerate_boards() {
                 value.pop_back();
             return value;
         };
-        if (read_line("idVendor") != "a511" || read_line("idProduct") != "5322")
+        // DM USB2FDCAN identity of the HPM5321 dual-CAN PCB; the board
+        // enumerates under it rather than under 0xA511.
+        if (read_line("idVendor") != "34b7" || read_line("idProduct") != "6632")
             continue;
         const std::string serial = read_line("serial");
         if (!serial.empty())
@@ -402,7 +404,7 @@ std::vector<std::pair<std::string, std::string>> enumerate_boards() {
 bool discover() {
     const auto found = enumerate_boards();
     if (found.size() < 2) {
-        fprintf(stderr, "need two hpm5321_dual_can boards (a511:5322), found %zu\n", found.size());
+        fprintf(stderr, "need two hpm5321_dual_can boards (34b7:6632), found %zu\n", found.size());
         return false;
     }
     // Deterministic A/B assignment: sorted serial order. HCS_BOARD_A /

@@ -451,28 +451,31 @@ bool Can::reconfigure_timing(bool fd, PhaseTiming nominal, PhaseTiming data) {
     return true;
 }
 
-// 恢复编译期位时序与端口 FD 模式(声明见 can.hpp)。配置序列与构造函数一致,
-// 仅是运行时再次执行; 消息 RAM 属性与 PTPC 时基不受 mcan_deinit 影响, 重下发
-// 是幂等的。
-bool Can::restore_default_timing() {
-    if (transmit_buffer_.readable() != 0)
-        return false;
+namespace {
 
-    mcan_config_t config;
-    mcan_get_default_config(can_base_, &config);
-    config.baudrate = kArbitrationBaudrate;
-    config.mode = mcan_mode_normal;
-    config.enable_canfd = port_fd_;
-    if (port_fd_) {
-        config.baudrate_fd = kCanFdDataBaudrate;
-        config.enable_tdc = true;
-    }
-    config.can20_samplepoint_min = kNominalSamplePointPerMille;
-    config.can20_samplepoint_max = kNominalSamplePointPerMille;
-    config.canfd_samplepoint_min = kDataSamplePointPerMille;
-    config.canfd_samplepoint_max = kDataSamplePointPerMille;
-    apply_message_ram_layout(config);
-    config.disable_auto_retransmission = true;
+// 外部 TSU 只给被标记为 sync message 的过滤器所接收的帧打时间戳 (仅在
+// CCCR.UTSU 置位时求值)。默认 accept-all 过滤器的 sync_message = 0,
+// 故换成 mask 0 的 accept-all sync 过滤器 (标准帧与扩展帧各一) --
+// 否则任何帧都不会有时间戳。静态存储: mcan_init 读的是指针。
+constexpr mcan_filter_elem_t make_sync_filter(uint8_t can_id_type) {
+    mcan_filter_elem_t filter{}; // 值初始化: filter_id = filter_mask = 0, 即 accept-all
+    filter.filter_type = MCAN_FILTER_TYPE_CLASSIC_FILTER;
+    filter.filter_config = MCAN_FILTER_ELEM_CFG_STORE_IN_RX_FIFO0_IF_MATCH;
+    filter.can_id_type = can_id_type;
+    filter.sync_message = 1U;
+    return filter;
+}
+constexpr mcan_filter_elem_t kStdSyncFilter = make_sync_filter(MCAN_CAN_ID_TYPE_STANDARD);
+constexpr mcan_filter_elem_t kExtSyncFilter = make_sync_filter(MCAN_CAN_ID_TYPE_EXTENDED);
+
+} // namespace
+
+void Can::apply_timestamping(mcan_config_t& config) noexcept {
+    // 经时间戳单元 (TSU) 取 64 位硬件时间戳。本 SoC 的 MCAN 没有可用的内部
+    // TSU 时基 (TBCS 被综合固定为 "external"), 每个控制器的 TSU 都由经
+    // TBSEL 槽 0 接入的唯一共享 PTPC0 时基供时。PTPC 维护 IEEE-1588
+    // {seconds:nanoseconds} 计数器, handle_uplink() 把它折算成微秒。所有
+    // 控制器共用 PTPC0, 时间戳在同一时钟上, 跨总线可直接比较。
     config.use_timestamping_unit = true;
     config.tsu_config.enable_tsu = true;
     config.tsu_config.enable_64bit_timestamp = true;
@@ -480,32 +483,132 @@ bool Can::restore_default_timing() {
     config.tsu_config.ext_timebase_src = MCAN_TSU_EXT_TIMEBASE_SRC_TBSEL_0;
     config.tsu_config.tbsel_option = MCAN_TSU_TBSEL_PTPC0;
     config.tsu_config.capture_on_sof = true;
-    config.tsu_config.prescaler = 1;
+    config.tsu_config.prescaler = 1; // 外部时基下不使用
     config.timestamp_cfg.counter_prescaler = 1;
     config.timestamp_cfg.timestamp_selection = MCAN_TIMESTAMP_SEL_EXT_TS_VAL_USED;
-    mcan_filter_elem_t std_sync_filter{};
-    std_sync_filter.filter_type = MCAN_FILTER_TYPE_CLASSIC_FILTER;
-    std_sync_filter.filter_config = MCAN_FILTER_ELEM_CFG_STORE_IN_RX_FIFO0_IF_MATCH;
-    std_sync_filter.can_id_type = MCAN_CAN_ID_TYPE_STANDARD;
-    std_sync_filter.sync_message = 1U;
-    std_sync_filter.filter_id = 0U;
-    std_sync_filter.filter_mask = 0U;
-    mcan_filter_elem_t ext_sync_filter = std_sync_filter;
-    ext_sync_filter.can_id_type = MCAN_CAN_ID_TYPE_EXTENDED;
-    config.all_filters_config.std_id_filter_list.filter_elem_list = &std_sync_filter;
-    config.all_filters_config.std_id_filter_list.mcan_filter_elem_count = 1;
-    config.all_filters_config.ext_id_filter_list.filter_elem_list = &ext_sync_filter;
-    config.all_filters_config.ext_id_filter_list.mcan_filter_elem_count = 1;
 
+    config.all_filters_config.std_id_filter_list = {
+        .mcan_filter_elem_count = 1, .filter_elem_list = &kStdSyncFilter};
+    config.all_filters_config.ext_id_filter_list = {
+        .mcan_filter_elem_count = 1, .filter_elem_list = &kExtSyncFilter};
+}
+
+mcan_config_t Can::libhcs_config(const BusSetting& setting) const {
+    mcan_config_t config;
+    mcan_get_default_config(can_base_, &config);
+    // 速率是接线事实, 由 host 经 EP0 下发; SDK 求解器在下面钉死的采样点上解分频与时间段,
+    // 解不出则 mcan_init 失败, EP0 据此 STALL。
+    config.baudrate = setting.arbitration_baudrate;
+    config.mode = mcan_mode_normal;
+    // 经典 = 控制器不开 FD(CCCR.FDOE/BRSE=0): 总线只支持 CAN 2.0, 任何 FD 位上线都会
+    // 让总线崩溃, 所以不靠 Tx 元素的 FDF 标志, 由硬件保证发不出 FD 帧。
+    config.enable_canfd = setting.mode == CanMode::kCanFd;
+    if (config.enable_canfd) {
+        config.baudrate_fd = setting.data_baudrate;
+
+        // 发送延迟补偿 (TDC), 该数据段速率下必需; 此前从未开启 --
+        // mcan_get_default_config() 将结构体清零, 该字段保持 false,
+        // mcan_init() 会直接清掉 DBTP.TDC。
+        //
+        // 数据段一位 200 ns, 主采样点在 87.5% = 175 ns。高速 CAN 收发器的
+        // TXD->RXD 环路延迟通常 120-255 ns, 不补偿时发送节点自检回读会读到
+        // 上一位, 报 bit error。TDC 把回读移到 (实测环路延迟 + TDCO) 处的
+        // 二级采样点, 跟随收发器而不是假定它足够快。
+        //
+        // 这是下方采样点修复的另一半: 那处让总线两端对齐"在哪采样", 这里让
+        // 发送自检扛得住自家收发器。症状同族 (PSR.DLEC = bit error, TEC
+        // 升入 error-passive, 单方向失败而经典 CAN 正常), 只修一半时漏掉
+        // 很容易。
+        //
+        // mc02 自 FDCAN bring-up 起就开了 (mc02/app/src/can/can.hpp:
+        // HAL_FDCAN_EnableTxDelayCompensation, offset =
+        // DataPrescaler * DataTimeSeg1)。两板同为 80 MHz 内核时钟下的
+        // 5 Mbit 数据段, 本板不补则两者不对称。
+        //
+        // ssp_offset 保持 0, 让 SDK 从刚解出的位时序推导 TDCO: DBTP.DTSEG1
+        // + 2, 单位 mtq。仅当数据段分频为 1 时才等于主采样点 -- TDCO 计的
+        // 是 CAN 时钟周期而非 time quanta -- init_controller() 检查这一前提,
+        // 不满足的数据段速率判为解不出。
+        config.enable_tdc = true;
+    }
+
+    // 两个相位都把采样点钉在 87.5%, 因为总线上其他板子实际就是这么跑的。
+    //
+    // 硬规则是同段所有节点必须在同一点采样 (两个相位之间不必彼此一致 --
+    // 这里恰好一致)。参照 CubeMX 板 (mc02、c_board): 两相位均
+    // tseg1/tseg2 = 13/2 = 87.5%, 标称相位分频 5 (16 TQ), 数据相位分频 1。
+    // 注意这不是厂商表格对 1 Mbit 仲裁相位给出的 ">800 kbit/s 用 75%" 指导
+    // -- 实测按指导而非按总线来配会失败: 标称相位留在 SDK 的 75%
+    // (59/20, 80 TQ)、只钉数据相位时, 本板的 FD 下行掉到 0/40000,
+    // PSR.DLEC = bit1 error。
+    //
+    // SDK 自己不会到 87.5%: 其窗口是 [750, 875], 求解器爬过 MINIMUM 就停,
+    // 永远落在 75.0%, 875 用不到。数据段一位 200 ns, 12.5 个点的分歧让两端
+    // 差 25 ns, 接收方锁错位 -- 最初表现为 mc02 不 ACK 本板的 FD 帧
+    // (PSR.DLEC = ACK error, TEC 升入 error-passive), 而经典 CAN 与反方向
+    // 正常。
+    //
+    // 经典与 FD 的标称相位在 SDK 里是同一组 TQ 上限(can2_0 与 canfd_nominal),
+    // 同一钉死窗口解出同一 NBTP, 切模式不动仲裁段。
+    config.can20_samplepoint_min = kNominalSamplePointPerMille;
+    config.can20_samplepoint_max = kNominalSamplePointPerMille;
+    config.canfd_samplepoint_min = kDataSamplePointPerMille;
+    config.canfd_samplepoint_max = kDataSamplePointPerMille;
+    apply_message_ram_layout(config);
+    config.disable_auto_retransmission = true;
+    apply_timestamping(config);
+    return config;
+}
+
+bool Can::init_controller(const BusSetting& setting, uint32_t clock_hz) {
+    mcan_config_t config = libhcs_config(setting);
+    if (mcan_init(can_base_, &config, clock_hz) != status_success)
+        return false;
+
+    // 上面的自动 TDCO 以 DTSEG1 为单位推导, 但按 mtq 编程, 只有数据段分频
+    // 为 1 时才落在采样点上。80 MHz / 5 Mbit 下 SDK 求解器选的正是
+    // brp=1 tseg1=13 tseg2=2 (-Dlibhcs_CAN_DIAG=ON 可打印), 但换一个数据段
+    // 速率求解器可以另选 -- 二级采样点悄悄错位与完全没补偿看起来一样。速率
+    // 现由 host 下发, 这里判失败(调用方救回原设置)而不是停机。
+    const bool fd = setting.mode == CanMode::kCanFd;
+    canfd_ = fd; // mcan_init 已成功, 控制器确实跑在这个帧型上
+    if (fd && MCAN_DBTP_DBRP_GET(can_base_->DBTP) != 0U)
+        return false;
+    // SDK 求解器用 src_clk / baudrate 的整除结果, 除不尽时会落在近似速率上; 回读必须精确等于所求。
+    return timing_identity() == timing_of(setting);
+}
+
+bool Can::reinit(const BusSetting& setting) {
+    // 消息 RAM 属性与 PTPC 时基不受 mcan_deinit 影响, 重下发是幂等的。
     mcan_deinit(can_base_);
     const mcan_msg_buf_attr_t attr = board::can_message_ram(can_index_);
     (void)mcan_set_msg_buf_attr(can_base_, &attr);
-    const bool applied =
-        mcan_init(can_base_, &config, can_clock_mhz_ * 1'000'000U) == status_success;
-    if (applied) [[likely]]
-        canfd_ = port_fd_;
+    const bool applied = init_controller(setting, can_clock_mhz_ * 1'000'000U);
     mcan_enable_interrupts(can_base_, kEnabledInterrupts);
     return applied;
+}
+
+bool Can::restore_default_timing() {
+    if (transmit_buffer_.readable() != 0)
+        return false;
+    return reinit(libhcs_setting_);
+}
+
+// 不进 .fast: 只在 EP0 配置请求时运行。
+bool Can::apply_setting(const BusSetting& setting) {
+    if (mode() == setting.mode && timing_identity() == timing_of(setting)) {
+        libhcs_setting_ = setting;
+        return true;
+    }
+    // 旧设置下排队的帧已过期(libhcs 丢弃策略: 过期控制帧重发不如丢), mcan_deinit 也会清硬件 FIFO。
+    (void)transmit_buffer_.clear();
+    if (reinit(setting)) {
+        libhcs_setting_ = setting;
+        return true;
+    }
+    // 救回上一份 libhcs 设置: 它此前应用成功过, 或是上电默认值。
+    (void)reinit(libhcs_setting_);
+    return false;
 }
 
 ATTR_PLACE_AT(".fast")

@@ -33,9 +33,9 @@ bool usb_use_high_speed();
 //   CAN1 = MCAN1  TX PB05 / RX PB04
 //   CAN2 = MCAN2  TX PD08 / RX PD09
 //   CAN3 = MCAN3  TX PD15 / RX PD14
-// 四路都跑 CAN-FD(仲裁 1 Mbps / 数据 5 Mbps, BRS 开)。接收是严格超集 -- 对端
-// 的经典帧照常解码; 而本板发送的每帧都是 FD: 帧类型跟随总线, 且是 CANFD 回环
-// 压力测试(跳线 CAN0<->CAN1、CAN2<->CAN3)所要求的。
+// 上电默认四路都跑 CAN-FD(仲裁 1 Mbps / 数据 5 Mbps, BRS 开), 是 CANFD 回环压力
+// 测试(跳线 CAN0<->CAN1、CAN2<->CAN3)所要求的。帧类型跟随总线; 主机可经 EP0
+// kSetCanConfig 把某路切成经典 2.0(控制器重初始化并关 FD, 见 can.cpp libhcs_config)。
 constexpr CanPort kCanPorts[] = {
     {.base = HPM_MCAN0_BASE,
      .irq_num = IRQn_MCAN0,

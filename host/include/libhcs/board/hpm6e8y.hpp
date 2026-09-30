@@ -21,7 +21,7 @@ namespace libhcs::board {
 // EtherCAT slave. It exposes all four physical CAN buses (CAN0..CAN3 =
 // MCAN0..MCAN3) and one UART (UART0 = UART1); it has no IMU, GPIO channels or
 // DBUS, so those callbacks are intentionally absent.
-class Hpm6e8y final {
+class Hpm6e8y final : public hcs::Reconfigurable {
 public:
     class Callback : public data::DataCallback {
     public:
@@ -118,6 +118,7 @@ public:
         , handler_(
               0xA511, 0x6E84, serial_filter, options, callback,
               [this](host::protocol::Handler& handler) {
+                  const std::scoped_lock guard{reconfigure_mutex_};
                   interface_.store(hcs::apply(handler, configuration_), std::memory_order_release);
               }) {}
 
@@ -188,16 +189,26 @@ public:
     // throws if it refused. They are NOT ordered against queued data -- bytes
     // already handed to the board go out at whichever rate the port reaches
     // them at, so quiesce the link before switching.
-    void configure_uart0(uint32_t baudrate) { hcs::configure_uart(handler_, 0, baudrate); }
+    void configure_uart0(uint32_t baudrate) {
+        const std::scoped_lock guard{reconfigure_mutex_};
+        hcs::reconfigure_uart(handler_, configuration_, 0, {.baudrate = baudrate});
+    }
 
     // What UART0 is really running, reconstructed on the board from the
     // divisor actually programmed -- not the value that was last requested.
     uint32_t uart0_baudrate() { return hcs::read_uart_baudrate(handler_, 0); }
 
-    // Frame type of each CAN bus, as the board reported it during construction.
-    // It is a property of the bus, not of a frame: the wire protocol carries no
-    // per-frame type flag any more, and this board's firmware sends every frame
-    // in its bus's compiled mode. Read this instead of assuming.
+    // 运行期改 CAN 总线设置(帧型 + 速率), 语义同 Hpm5321::configure_canN(): 经典即控制器关 FD,
+    // 先静默链路。丝印 CAN0..CAN3 即 EP0 下标 0..3。
+    void configure_can0(const hcs::CanSetting& setting) { configure_can(0, setting); }
+    void configure_can1(const hcs::CanSetting& setting) { configure_can(1, setting); }
+    void configure_can2(const hcs::CanSetting& setting) { configure_can(2, setting); }
+    void configure_can3(const hcs::CanSetting& setting) { configure_can(3, setting); }
+
+    // Frame type of each CAN bus: seeded by the construction handshake, kept in
+    // step by configure_canN(). It is a property of the bus, not of a frame --
+    // the wire protocol carries no per-frame type flag. Read this instead of
+    // assuming.
     [[nodiscard]] bool can0_is_fd() const {
         return interface_.load(std::memory_order_relaxed).can_fd(0);
     }
@@ -221,10 +232,11 @@ public:
         return hcs::read_can_status(handler_, static_cast<std::size_t>(port));
     }
 
-    // One CAN bus's full timing identity over EP0: the TX mode in force (this
-    // board applies nothing -- the capability bit is clear), the rates and
-    // sample points the controller is actually timed for (1 Mbit/s / 5 Mbit/s /
-    // 875 per mille), and the capability bits.
+    // One CAN bus's full timing identity over EP0: the TX mode in force, and the
+    // rates and sample points reconstructed from the controller's registers
+    // (the rates the host configured, sample points pinned at 875 per mille;
+    // classic reports the data phase as 0 because the controller runs with FD
+    // off). Read-only -- configure_canN() changes the setting.
     [[nodiscard]] hcs::vc::CanConfigPayload can_config(hcs::CanPort port) {
         return hcs::read_can_config(handler_, static_cast<std::size_t>(port));
     }
@@ -245,6 +257,12 @@ public:
     }
 
 private:
+    // configure_canN() 的共用体: 整个 EP0 往返持重配锁, 与重连钩子的 apply() 互斥。
+    void configure_can(std::size_t bus, const hcs::CanSetting& setting) {
+        const std::scoped_lock guard{reconfigure_mutex_};
+        hcs::reconfigure_can(handler_, configuration_, interface_, bus, setting);
+    }
+
     static inline Callback default_callback_{};
     // Both declared BEFORE handler_ on purpose. The before-session hook runs
     // while handler_ is still being constructed and touches both, so their

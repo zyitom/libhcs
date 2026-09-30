@@ -182,10 +182,8 @@ App::App() {
     MX_SPI2_Init();
 #endif
     MX_UART5_Init();
-#ifdef libhcs_APP_RS485_ENABLE
     MX_USART2_UART_Init();
     MX_USART3_UART_Init();
-#endif
     MX_TIM1_Init();
     MX_TIM2_Init();
     MX_TIM5_Init();
@@ -209,10 +207,8 @@ App::App() {
     uart::uart7.init();
     uart::uart10.init();
     uart::uart_dbus.init();
-#ifdef libhcs_APP_RS485_ENABLE
     uart::uart2.init();
     uart::uart3.init();
-#endif
 #ifdef libhcs_APP_IMU_ENABLE
     spi::bmi088::accelerometer.init();
     spi::bmi088::gyroscope.init();
@@ -324,12 +320,10 @@ App::App() {
         usb::vendor->try_transmit();
         diag::profile::mark(diag::profile::Section::kUart);
         uart::uart_dbus->try_transmit();
-#ifdef libhcs_APP_RS485_ENABLE
         usb::vendor->try_transmit();
         uart::uart2->try_transmit();
         usb::vendor->try_transmit();
         uart::uart3->try_transmit();
-#endif
 
         diag::profile::end_pass();
 

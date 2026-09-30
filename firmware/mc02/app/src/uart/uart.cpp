@@ -34,7 +34,6 @@ UartRxOnly& get_dbus_instance_from_dma(DMA_HandleTypeDef* hal_dma_handle) {
     return *uart_dbus;
 }
 
-#ifdef libhcs_APP_RS485_ENABLE
 UartRs485& get_rs485_instance(UART_HandleTypeDef* hal_uart_handle) {
     if (hal_uart_handle == &huart2)
         return *uart2;
@@ -46,7 +45,6 @@ UartRs485& get_rs485_instance(UART_HandleTypeDef* hal_uart_handle) {
 UartRs485& get_rs485_instance_from_dma(DMA_HandleTypeDef* hal_dma_handle) {
     return get_rs485_instance(static_cast<UART_HandleTypeDef*>(hal_dma_handle->Parent));
 }
-#endif
 
 } // namespace
 
@@ -66,7 +64,6 @@ void UartRxOnly::hal_rx_dma_error_callback(DMA_HandleTypeDef* hal_dma_handle) {
     get_dbus_instance_from_dma(hal_dma_handle).rx_dma_error_callback();
 }
 
-#ifdef libhcs_APP_RS485_ENABLE
 void UartRs485::hal_rx_dma_error_callback(DMA_HandleTypeDef* hal_dma_handle) {
     get_rs485_instance_from_dma(hal_dma_handle).rx_dma_error_callback();
 }
@@ -78,7 +75,6 @@ void UartRs485::hal_tx_dma_complete_callback(DMA_HandleTypeDef* hal_dma_handle) 
 void UartRs485::hal_tx_dma_error_callback(DMA_HandleTypeDef* hal_dma_handle) {
     get_rs485_instance_from_dma(hal_dma_handle).tx_dma_error_callback();
 }
-#endif
 
 // NOLINTNEXTLINE(readability-inconsistent-declaration-parameter-name)
 extern "C" void HAL_UART_ErrorCallback(UART_HandleTypeDef* hal_uart_handle) {
@@ -87,12 +83,10 @@ extern "C" void HAL_UART_ErrorCallback(UART_HandleTypeDef* hal_uart_handle) {
         return;
     }
 
-#ifdef libhcs_APP_RS485_ENABLE
     if (hal_uart_handle == &huart2 || hal_uart_handle == &huart3) {
         get_rs485_instance(hal_uart_handle).uart_error_callback();
         return;
     }
-#endif
 
     get_uart_instance(hal_uart_handle).uart_error_callback();
 }
@@ -111,12 +105,10 @@ extern "C" void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef* hal_uart_handle, 
         return;
     }
 
-#ifdef libhcs_APP_RS485_ENABLE
     if (hal_uart_handle == &huart2 || hal_uart_handle == &huart3) {
         get_rs485_instance(hal_uart_handle).rx_event_callback();
         return;
     }
-#endif
 
     get_uart_instance(hal_uart_handle).rx_event_callback();
 }

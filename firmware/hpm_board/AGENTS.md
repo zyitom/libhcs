@@ -79,15 +79,16 @@ config.canfd_samplepoint_min = 875U;   config.canfd_samplepoint_max = 875U;
 
 **更一般的硬约束**：本板 CAN 的协议（classic / FD）、仲裁与数据段速率、采样点，上限
 全部由总线对端的**电机硬件**决定（DJI、达妙 MIT、瓴控的电机固件在仓库之外，无法
-修改）`[硬件事实，用户确认 2026-09-12]`。吞吐/延迟优化**不要**以「升级 CAN-FD /
+修改）`[硬件事实，用户确认 2026-09-12]`。所以帧型与速率是接线事实，写在 host 代码里经 EP0
+下发（见下「EP0 配置通道」约束 1），固件只保留采样点与 TDC 策略。吞吐/延迟优化**不要**以「升级 CAN-FD /
 提高波特率 / 改采样点」为建议方向——总线参数没有可动的余地；可行杠杆在主机侧协议、
 成帧与软件路径，见 [USB_OPTIMIZATION_LOG.md](USB_OPTIMIZATION_LOG.md) 与
 [HOST_TUNING.md](../../HOST_TUNING.md)。
 
 ## CAN 消息 RAM：只在一处改 [2026-09-21 上板运行正常；burst 过载门槛未测]
 
-四处 `mcan_init` 配置（构造、DMTool 重配 `reconfigure_timing`、其失败救援、libhcs 会话
-还原 `restore_default_timing`）共用 `Can::apply_message_ram_layout()`，深度常量与预算
+三处 `mcan_init` 配置（libhcs 的 `Can::libhcs_config()`——构造、会话还原、EP0 应用设置共用；
+DMTool 重配 `reconfigure_timing`；其失败救援）共用 `Can::apply_message_ram_layout()`，深度常量与预算
 `static_assert` 都在 `can.hpp`。**不要在某一处单独改 `ram_config`**：超出每控制器 640 词
 `mcan_init` 静默失败、两路一起死，而四处不一致又会让一次 DMTool 会话之后 libhcs 跑在另一套
 深度上——两种错此前都真实存在过。现行 RX 16 / TX 12 / TX event 12 / 过滤器 16+16 =
@@ -110,29 +111,51 @@ init 和 `abort_transmit()` 之后采样，遥测只读快照；`uart_set_baudra
 
 | bRequest | 方向 | wIndex | 载荷 | 语义 |
 |---|---|---|---|---|
-| `0x40 kGetInterface` | IN | 0 | `InterfacePayload` | 版本（v2）、CAN/UART 路数、实时 FD 掩码、能力位 |
-| `0x41 kGetCanConfig` | IN | 总线号 | `CanConfigPayload` | 硬件事实：当前 TX 模式 + 实际速率与采样点 |
-| `0x42 kSetCanConfig` | OUT | 总线号 | `CanConfigPayload` | 本板无 `kCapCanModeSettable` 位：apply 位无语义，模式与固件不符即 STALL；速率/采样点字段是非零即核对的断言 |
-| `0x43 kGetUartConfig` | IN | 端口号 | `UartConfigPayload` | 硬件事实：**实际生效**的波特率（由分频器反推）+ 活寄存器解码的帧格式 |
-| `0x44 kSetUartConfig` | OUT | 端口号 | `UartConfigPayload` | 稀疏 patch（波特率 + 字长/校验/停止位，0=不动）：先全量校验后统一提交，STALL 严格等于寄存器不动 |
+| `0x40 kGetInterface` | IN | 0 | `InterfacePayload` | 线格式指纹 `kVersion`（编译期折叠，禁止手改）、CAN/UART 路数、实时 FD 掩码、能力位 |
+| `0x41 kGetCanConfig` | IN | 总线号 | `CanConfigPayload` | 硬件事实：当前帧型 + 由 `NBTP`/`DBTP` 重构的速率与采样点；经典模式控制器关 FD，数据段报 0 |
+| `0x42 kSetCanConfig` | OUT | 总线号 | `CanConfigPayload` | 本板置 `kCapCanModeSettable` + `kCapCanRateSettable`：`kCanConfigApply` 切帧型，`kCanConfigApplyTiming` 按 host 下发的速率（非零即新值，零即沿用）重解位时序，二者都重初始化控制器（见约束 1）；不带时对应字段是核对。采样点永远是核对。板端应用后自己回读，帧型/速率/采样点不符即 `kConfigErrorVerifyFailed`，解不出即 `kConfigErrorRateUnrepresentable` 且救回原设置 |
+| `0x43 kGetUartConfig` | IN | 端口号 | `UartConfigPayload`（12 字节） | 硬件事实：**实际写入**的分频器 `DLM:DLL` 与过采样倍数（OSCR 解码，0→32）+ 由二者反推的波特率 + 活寄存器解码的帧格式 |
+| `0x44 kSetUartConfig` | OUT | 端口号 | `UartConfigPayload`（12 字节） | 稀疏 patch（波特率 + 字长/校验/停止位，0=不动）；`divisor`/`oversample` 非零即**断言**。求解与断言全部前置，STALL 严格等于寄存器不动；写入后回读分频器不符报 `kConfigErrorVerifyFailed`(7) |
 | `0x45 kGetCanStatus` | IN | 丝印编号 | — | 控制器错误寄存器回读，判读表见 [PITFALLS.md](PITFALLS.md) 第 5 节 |
 | `0x47 kGetLatencyBreakdown` | IN | — | — | 延迟拆解埋点，恒开（见下） |
+| `0x48 kGetLastConfigError` | IN | 0 | `LastConfigErrorPayload` | 最近一次 STALL 的请求码、下标、原因（`ConfigErrorReason`）、值；粘滞到下次拒绝或复位。每条 STALL 路径都先记再返回 |
 
 > 曾用于分端点协商的 `0x46 kSetEndpointMode` 已随分端点拆除（2026-09-05），
 > **编号空出不复用**——老主机来问会拿到 STALL，而不是被当成某个后加的请求重新解释。
 
 三条必须知道的约束：
 
-1. **`kSetCanConfig` 不会重配控制器（本板未设 `kCapCanModeSettable`）。** `mcan_init()`
-   那一整块（87.5% 采样点、TDC、外部 PTPC 时基喂 TSU、sync 滤波器）是逐条实测调出来的，
-   运行时重跑等于把它们全部重新置于风险中，还要断总线；且 classic 化意味着控制器收不到
-   任何 FD 帧（实测 0/50）。所以板端保留编译期的 `CanPort::mode`，`SET` 只做
-   "主机的预期和我一致吗"这一件事（mc02 设了能力位，那边模式真的可切——差别由能力位
-   表达，协议同一套）。**推论：每帧 `IsFdCan` 头部位已在协议中废弃（2026-09-12）**，
-   FD 总线一律发 FD 帧；要知道某条总线是什么模式，读 `canN_is_fd()`。
-2. **回读永远不等于请求值。** `effective_baudrate()` 由实际写进去的分频器反推，
-   115200 读回 114942，921600 读回 909090。**用容差比，不要用相等比**——相等比会在
-   几乎所有 80 MHz 除不尽的速率上误报失败。
+1. **libhcs 的 CAN 帧型与速率由 host 下发，应用 = 重初始化控制器，经典模式关掉 FD
+   （2026-09-30 起本板置 `kCapCanModeSettable` + `kCapCanRateSettable`）。** 帧型与速率是
+   接线事实，host 代码写死（`hcs::kClassic1M` / `hcs::kFd1M5M`，放进 `Configuration::can`
+   或 `configure_canN()`），固件的 `kArbitrationBaudrate`/`kCanFdDataBaudrate` 只是上电默认值。
+   经典总线只支持 2.0，任何 FD 位上线都会让总线崩溃，所以不学 mc02 只翻 Tx 元素的
+   FDF/BRS，而是让控制器 `CCCR.FDOE=0`，由硬件保证。代价是经典模式收不到 FD 帧（实测
+   0/50），纯 2.0 总线上正合适 `[用户确认 2026-09-30]`。
+   - libhcs 的设置存在 `Can::libhcs_setting_`（帧型 + 两段速率），会话建立时的
+     `restore_default_timing()` 按它还原，**不会**把 EP0 的选择冲回上电默认值。
+   - 速率在钉死的 87.5% 采样点上由 SDK 求解；求解器按 `src_clk / baudrate` 整除，除不尽会
+     落在近似速率，所以 `init_controller()` 要求寄存器回读**精确**等于所求，数据段分频还必须
+     为 1（TDC 自动 TDCO 的前提），否则判解不出、救回原设置。80 MHz 下 FD 数据段实际可用的
+     只有 80M/(8k) 一类速率（5M、2.5M…）`[推断，由求解器约束推出；未上板]`。
+   - 87.5% 采样点、TDC、PTPC 喂 TSU、sync 过滤器这整套实测配置在 libhcs 路径只有一份：
+     `Can::libhcs_config()`。**不要**在 libhcs 路径另抄一份 `mcan_config_t`；DMTool 的
+     `reconfigure_timing` 是另一条路径，保持原样。
+   - 经典与 FD 的仲裁段由同一钉死窗口解出同一 `NBTP`，只切帧型不动仲裁段 `[推断，SDK 两组
+     TQ 上限相同；未上板]`。
+   - 应用设置会丢弃该路软件发送队列（旧设置下的过期帧）。与已排队数据不定序，主机先静默链路。
+   - **推论：每帧 `IsFdCan` 头部位已在协议中废弃（2026-09-12）**，帧型跟随总线；要知道
+     某条总线是什么模式，读 `canN_is_fd()`，改设置用 `configure_canN(hcs::CanSetting)`。
+2. **速率一致性比分频器整数，不比波特率。** `effective_baudrate()` 由实际写进去的分频器
+   反推，115200 读回 114942，921600 读回 909090；主机不知道板端内核时钟，无法复算。
+   所以判据是 `kGetUartConfig` 回报的 `divisor`/`oversample`（SET 时回显即断言），
+   百分比只作宽松兜底（10%，抓离谱值，板端写入前检查）。来龙去脉见
+   [UART_EP0_MIGRATION.md](../../UART_EP0_MIGRATION.md) 第 2 节。
+4. **一次 SET 就是全部：ACK = 已生效，STALL = 拒绝。** 主机成功路径不回读——板端先全量
+   校验再写，写后自己回读（UART 分频器与帧格式、CAN 帧型与仲裁段时序），不符即 STALL
+   `kConfigErrorVerifyFailed`。只有 STALL 时主机才读一次 `0x48` 取原因。所以**每条 SET 的
+   STALL 路径都必须先记锁存**：锁存是粘滞的，漏记会让主机把更早那次的原因当成本次原因。
+   构造期实测：`0x40` 握手 + 每路一个 SET，无任何读 `[实测 2026-09-30，UART_EP0_MIGRATION.md 3.6]`。
 3. **EP0 通道不受 session 门控。** 主机在板对象构造期就下发，那时 keepalive 线程还
    没开出 session；session 掉线后回读也必须继续可用。
 
@@ -290,7 +313,7 @@ RTT p50 124.8us，板端整条路径不到 3%。完整论证与"哪些板端优�
 |---|---|---|
 | CAN 转发是否在走：ISR 进入计数、MCAN `IR`/`RXF0S`/`PSR`/`ECR`、PLIC pending/enable/trigger | `-Dlibhcs_CAN_DIAG=ON` | `host/examples/can_stall_probe.cpp`（边压测边解码，转发停摆时打印前后快照） |
 | 主循环周期（板端 CPU 余量的直接读数） | `-Dlibhcs_CAN_DIAG=ON` | `host/examples/hpm5321_loop_probe.cpp` |
-| USB SOF 时间轴是否可信：相邻 FRINDEX 差值直方图、ISR 间隔、端口状态、跨板一致性 | `-Dlibhcs_SOF_DIAG=ON` | `host/examples/sof_probe.cpp`（见 [SOF_TIMEBASE.md](SOF_TIMEBASE.md)） |
+| USB SOF 时间轴是否可信：相邻 FRINDEX 差值直方图、ISR 间隔、端口状态、跨板一致性 | `-Dlibhcs_SOF_DIAG=ON` | 主机解码工具 `sof_probe.cpp` 已于 2026-09-30 删除，需要时从 git `cf404b7` 取回（见 [SOF_TIMEBASE.md](SOF_TIMEBASE.md)） |
 | 跨板共享时间轴本身：各板状态、拟合出的晶振偏差、绝对微帧是否一致、到 Unix 时间的映射 | `-Dlibhcs_TIME_SYNC=ON` | `host/examples/time_sync_test.cpp`（主机侧还要 `AdvancedOptions::set_enable_time_sync(true)`） |
 | 跨板 skew 直接实测：两块板在同一微帧各发一个硬件脉冲，互相硬件捕获 | `-Dlibhcs_PULSE_TEST=ON`（**要和 `TIME_SYNC` 一起开**） | `host/examples/pulse_skew_test.cpp`（见 [SOF_TIMEBASE.md](SOF_TIMEBASE.md) 5.5 / 7.1） |
 

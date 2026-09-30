@@ -69,16 +69,19 @@ if(libhcs_APP_IMU_ENABLE)
     target_compile_definitions(mc02_app PRIVATE libhcs_APP_IMU_ENABLE=1)
 endif()
 
-# Enclosure UART2 / UART3 (USART2 / USART3 RS-485). Same shape as the IMU
-# switch: the ports exist on the board, so the default image brings them up.
-# Set OFF when a build will never talk on those buses -- skips MX_USARTx_UART_Init,
-# the two D2 SRAM objects (~1.8 KB), and the per-pass NDTR polls. DataIds stay
-# kUart2 / kUart3 either way; an OFF image just rejects those fields.
-option(libhcs_APP_RS485_ENABLE "Enable USART2/USART3 RS-485 (silkscreen UART2/UART3)" OFF)
-if(libhcs_APP_RS485_ENABLE)
-    target_compile_definitions(mc02_app PRIVATE libhcs_APP_RS485_ENABLE=1)
-endif()
-
+# Enclosure UART2 / UART3 (USART2 / USART3 RS-485) are ALWAYS compiled in.
+#
+# There used to be a libhcs_APP_RS485_ENABLE switch here. It was removed
+# [2026-09-30, UART_EP0_MIGRATION.md phase 7]: the ports exist on every board of
+# this type and are the enclosure's UART2/UART3, so a build that leaves them out
+# only produces an image whose EP0 index space has two holes -- a host cannot
+# tell "this board has no UART2" from "this image compiled UART2 out", and the
+# port index has to keep meaning the same physical port across images.
+#
+# The cost is ~1.8 KB of D2 SRAM resident regardless of whether the ports are
+# used (the Lazy<T> objects and their DMA rings are placed at link time, not at
+# init()), plus two NDTR reads per main-loop pass. Accepted deliberately.
+#
 # Bytes one bulk OUT transfer requests. The endpoint stays a 64-byte Full-Speed
 # bulk endpoint either way; this only asks DWC2 to accept N packets back to back
 # before the device has to re-arm. 64 is the old behaviour exactly. See the

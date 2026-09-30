@@ -28,6 +28,22 @@ cmake --build firmware/c_board/build --target c_board_app c_board_bootloader
 - preset：`debug` / `debug-outside` / `release`。`debug-outside` 置 `HOST_DEBUGGER=ON`（外部调试器场景）。
 - target：`c_board_app`、`c_board_bootloader`。
 
+## EP0 配置通道 [2026-09-30 接入，未上板]
+
+协议与其他板同一套（`core/include/libhcs/protocol/vendor_control.hpp`），板端在
+`app/src/usb/vendor_control.cpp`，契约表见 [hpm_board/AGENTS.md](../hpm_board/AGENTS.md)「EP0 配置通道」。
+本板差异只有三条：
+
+- **UART 下标**：DBUS=0（huart3）、UART1=1（huart6）、UART2=2（huart1）；`uart_count=3`。
+  速率一致性比 `BRR` 整数，USART1/USART6 走 APB2 84 MHz、其余 APB1 42 MHz。
+- **CAN 能力位全清**：bxCAN 无 FD，`kSetCanConfig` 只接受 classic 且速率/采样点字段须为 0。
+- **没做 EP0 握手的主机开不了 session**（与 hpm/mc02 同一道门）：主机 `CBoard` 在重连钩子里
+  读 `kGetInterface`；旧版 SDK 连新固件会在 `SESSION_ACK` 超时。
+
+带内 `kUart1Config` / `kUart2Config` / `kUartDbusConfig` 仍由 `Uart::handle_config()` 处理
+（只写、不回报），等 EP0 上板实测后按 [UART_EP0_MIGRATION.md](../../UART_EP0_MIGRATION.md)
+阶段 6 删除。新代码用主机 `CBoard::configure_uartN()`。
+
 ## 目录结构
 - `app/`、`bootloader/`：两套独立镜像（C++ libhcs 层）。
 - `bsp/cubemx/`：CubeMX 生成产物（含链接脚本/时钟/外设初始化）。

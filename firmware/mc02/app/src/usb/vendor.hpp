@@ -173,10 +173,8 @@ private:
             return true;
         switch (id) {
         case data::DataId::kUart1: uart::uart1->handle_downlink(data); return true;
-#ifdef libhcs_APP_RS485_ENABLE
         case data::DataId::kUart2: uart::uart2->handle_downlink(data); return true;
         case data::DataId::kUart3: uart::uart3->handle_downlink(data); return true;
-#endif
         case data::DataId::kUart7: uart::uart7->handle_downlink(data); return true;
         case data::DataId::kUart10: uart::uart10->handle_downlink(data); return true;
         default: return false;

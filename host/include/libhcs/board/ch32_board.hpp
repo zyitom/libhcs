@@ -1,10 +1,13 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 #include <libhcs/board/common.hpp>
+#include <libhcs/board/hcs_can_port.hpp>
 #include <libhcs/board/hcs_config.hpp>
 #include <libhcs/data/datas.hpp>
 #include <libhcs/protocol/handler.hpp>
@@ -131,16 +134,22 @@ public:
         friend class Ch32Board;
 
     public:
-        PacketBuilder& can1_transmit(const libhcs::data::CanDataView& data) {
-            hcs::reject_long_payload(data.can_data, "CAN1");
-            if (!builder_.write_can(data::DataId::kCan1, data)) [[unlikely]]
-                throw std::invalid_argument{"CAN1 transmission failed: Invalid CAN data"};
-            return *this;
-        }
-        PacketBuilder& can2_transmit(const libhcs::data::CanDataView& data) {
-            hcs::reject_long_payload(data.can_data, "CAN2");
-            if (!builder_.write_can(data::DataId::kCan2, data)) [[unlikely]]
-                throw std::invalid_argument{"CAN2 transmission failed: Invalid CAN data"};
+        // Transmits on the CAN port named as the enclosure labels it.
+        // Ports on this board: CanPort::kCan1, CanPort::kCan2 (silkscreen
+        // CAN1..CAN2). Same entry point as every other board's, so a caller
+        // that does not know which board it holds can still address a port.
+        //
+        // The part has no CAN-FD, so every payload must fit a classic 8-byte
+        // frame; reject_long_payload() enforces that here.
+        PacketBuilder& can_transmit(hcs::CanPort port, const libhcs::data::CanDataView& data) {
+            // kCanN == DataId::kCanN on this board (silkscreen CAN1..CAN2).
+            const auto index = std::to_underlying(port);
+            if (index < 1 || index > spec::ch32_board::kCanIds.size()) [[unlikely]]
+                throw std::out_of_range{
+                    "Ch32Board: CAN port out of range (this board has CAN1..CAN2)"};
+            hcs::reject_long_payload(data.can_data, spec::ch32_board::kCanNames[index - 1]);
+            if (!builder_.write_can(spec::ch32_board::kCanIds[index - 1], data)) [[unlikely]]
+                throw std::invalid_argument{"CAN transmission failed: Invalid CAN data"};
             return *this;
         }
 

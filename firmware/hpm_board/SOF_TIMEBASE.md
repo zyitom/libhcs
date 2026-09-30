@@ -3,7 +3,7 @@
 > **文档类型**：过程记录（实测验证）
 > **适用范围**：`firmware/hpm_board/`，HPM5321 / HPM6E8Y 的 USB 数据固件；多块板挂同一个 USB 主机控制器的场景
 > **状态**：现行有效（第 1 步验证、第 2 步共享时间轴、第六条直接实测均已上板；"在第 k 微帧执行"的动作层未实现）
-> **相关文档**：[AGENTS.md](AGENTS.md)（板级现行规范） · [CONTROL_TIMING.md](CONTROL_TIMING.md)（这条轴在控制环里到底用不用得上） · [../../HOST_TUNING.md](../../HOST_TUNING.md)（主机侧调优） · 固件 `app/src/sync/sof_probe.hpp` · 主机工具 `host/examples/sof_probe.cpp`
+> **相关文档**：[AGENTS.md](AGENTS.md)（板级现行规范） · [CONTROL_TIMING.md](CONTROL_TIMING.md)（这条轴在控制环里到底用不用得上） · [../../HOST_TUNING.md](../../HOST_TUNING.md)（主机侧调优） · 固件 `app/src/sync/sof_probe.hpp` · 主机工具 `host/examples/sof_probe.cpp`（2026-09-30 已删除，git `cf404b7` 可取回）
 
 ## 摘要
 
@@ -45,6 +45,7 @@ SRI 标志在钩子里就被消费掉，所以 TinyUSB 完全看不到 SOF，不
 `DCD_EVENT_SOF`——**开着这个探针的固件，其 USB 行为与不开时一致**。
 
 主机侧 `host/examples/sof_probe.cpp` 同时打开所有在线板子解码遥测，并做跨板比对。
+（该工具已于 2026-09-30 随 SOF→PTPC 路径的退役一并删除，复现本节需从 git `cf404b7` 取回。）
 
 ## 2. 结论与数据 [实测 2026-08-19，两块 HPM5321，同一 xHCI（Bus 003 port 1/2）]
 
@@ -128,6 +129,7 @@ IMG=firmware/hpm_board/build_5321_sof/app/output/hpm_board_app_hpm5321.dfu
 dfu-util -p 3-1 -a 0 -D $IMG
 dfu-util -p 3-2 -a 0 -D $IMG
 
+# sof_probe 已于 2026-09-30 删除, 复现前先从 git cf404b7 取回 host/examples/sof_probe.cpp
 cmake --preset linux-release -S host -DBUILD_EXAMPLES=ON
 cmake --build host/build --target sof_probe
 ./host/build/examples/sof_probe 60           # 空载
@@ -808,7 +810,7 @@ cmake --build host/build --target pulse_skew_test
 > **协议改了一个字节，所以固件与主机必须同版本**。旧固件配新主机会在这条 session 字段上
 > 丢帧——这正是 4.1 节说的"带载荷的 SessionType 不能被跳过"。
 
-> **`topo_probe.cpp` 是一次性探测工具**（确认四口一总线的接收关系），已完成使命，可以删。
+> **`topo_probe.cpp` 是一次性探测工具**（确认四口一总线的接收关系），已完成使命，已于 2026-09-30 删除。
 
 > **本机没装 clang-format / clang-tidy**，两个 lint 门禁未跑。已手工核过 100 列上限与 ASCII 限制，
 > 但格式化本身未验证，合入前需补跑。

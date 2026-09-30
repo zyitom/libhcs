@@ -60,15 +60,22 @@ void tud_suspend_cb(bool remote_wakeup_en) {
     (void)remote_wakeup_en;
     usb::vendor->deactivate_session();
     usb::vendor->finish_downlink_transfer();
+    // 新主机必须自己完成 EP0 握手。
+    usb::vendor->set_ep0_handshake_done(false);
 }
 
 void tud_resume_cb() {}
 
-void tud_mount_cb() {}
+void tud_mount_cb() {
+    // 新主机必须自己完成 EP0 握手。
+    usb::vendor->set_ep0_handshake_done(false);
+}
 
 void tud_umount_cb() {
     usb::vendor->deactivate_session();
     usb::vendor->finish_downlink_transfer();
+    // 新主机必须自己完成 EP0 握手。
+    usb::vendor->set_ep0_handshake_done(false);
 }
 
 } // extern "C"

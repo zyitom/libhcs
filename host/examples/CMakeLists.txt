@@ -73,24 +73,11 @@ target_link_libraries(can_stall_probe PRIVATE libhcs-sdk)
 add_executable(hpm5321_loop_probe hpm5321_loop_probe.cpp)
 target_link_libraries(hpm5321_loop_probe PRIVATE libhcs-sdk)
 
-# USB SOF / FRINDEX validation: reads every attached HPM5321 at once and decodes
-# the telemetry a -Dlibhcs_SOF_DIAG=ON firmware emits. Step 1 of the cross-board
-# time base -- it has to pass before any of the timeline code is written.
-add_executable(sof_probe sof_probe.cpp)
-target_link_libraries(sof_probe PRIVATE libhcs-sdk)
-
 # Shared time base across every attached board: proves the boards resolve the
 # same ABSOLUTE microframe (the wrap that a single board cannot check on its
 # own), and exercises the Unix mapping. Needs -Dlibhcs_TIME_SYNC=ON firmware.
 add_executable(time_sync_test time_sync_test.cpp)
 target_link_libraries(time_sync_test PRIVATE libhcs-sdk)
-
-# The same time base on mc02, which is full speed and has no PTPC: reports the
-# board's own out-of-sample fit residual and, separately, how tightly this host
-# can place a reported microframe on its own clock. Needs mc02 firmware built
-# with -Dlibhcs_APP_TIME_SYNC=ON.
-add_executable(mc02_time_sync_test mc02_time_sync_test.cpp)
-target_link_libraries(mc02_time_sync_test PRIVATE libhcs-sdk)
 
 # Smallest complete recipe for putting a board timestamp on the host's
 # CLOCK_MONOTONIC -- the clock journald stamps its entries with -- and a
@@ -142,8 +129,8 @@ target_link_libraries(uart_cross_test PRIVATE libhcs-sdk)
 
 # Two mc02 boards wired A-A / B-B on an enclosure RS-485 port (UART2 / UART3).
 # Separate from uart_cross_test because that suite is TTL TX<->RX; this one
-# owns half-duplex turnaround and talks to Mc02 directly. Firmware must be built
-# with libhcs_APP_RS485_ENABLE=ON (the default) or uart2/uart3 are rejected.
+# owns half-duplex turnaround and talks to Mc02 directly. uart2/uart3 are
+# always compiled into the mc02 image (the RS-485 switch was removed 2026-09-30).
 add_executable(rs485_cross_test rs485_cross_test.cpp)
 target_link_libraries(rs485_cross_test PRIVATE libhcs-sdk)
 
@@ -152,9 +139,6 @@ target_link_libraries(rs485_cross_test PRIVATE libhcs-sdk)
 # A/B throughput against main-loop period.
 add_executable(mc02_packet_rate mc02_packet_rate.cpp)
 target_link_libraries(mc02_packet_rate PRIVATE libhcs-sdk)
-
-add_executable(topo_probe topo_probe.cpp)
-target_link_libraries(topo_probe PRIVATE libhcs-sdk)
 
 # Does the phase of a downlink flush inside the 125 us USB microframe change
 # end-to-end latency? Needs both boards on the shared SOF time base.
@@ -203,25 +187,6 @@ target_link_libraries(can_bus_diag PRIVATE libhcs-sdk)
 add_executable(microframe_source_test microframe_source_test.cpp)
 target_link_libraries(microframe_source_test PRIVATE libhcs-sdk)
 
-# Whether edge hunting disturbs the USB data path on the same controller -- the
-# one cost of the microframe time source that cannot be computed. Interleaved
-# A/B blocks, because this rig's own throughput drifts more between runs than
-# the effect being looked for.
-add_executable(microframe_interference_test microframe_interference_test.cpp)
-target_link_libraries(microframe_interference_test PRIVATE libhcs-sdk)
-
-# End to end: Timeline routed through the host's own microframe counter. Uses
-# the better path as the reference for the worse one, so section 4 measures what
-# the USB round trip was actually worth. Needs root and one board.
-add_executable(microframe_timebase_test microframe_timebase_test.cpp)
-target_link_libraries(microframe_timebase_test PRIVATE libhcs-sdk)
-
-# All three time-alignment questions in one run, with every attached board --
-# mc02 and hpm5321 together -- on a single Timeline: board<->x86, boards<->x86,
-# board<->board, including the 2.048 s wrap check that only a multi-board run
-# can make.
-add_executable(time_sync_matrix time_sync_matrix.cpp)
-target_link_libraries(time_sync_matrix PRIVATE libhcs-sdk)
 add_executable(rtt_split rtt_split.cpp)
 target_link_libraries(rtt_split PRIVATE libhcs-sdk)
 
