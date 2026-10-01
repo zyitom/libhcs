@@ -220,7 +220,7 @@ bool handle_setup(uint8_t rhport, const tusb_control_request_t* request) {
                 .parity = static_cast<uint8_t>(port->parity()),
                 .stop_bits = static_cast<uint8_t>(port->stop_bits()),
                 .control = 0,
-                .reserved = 0,
+                .rx_polarity = static_cast<uint8_t>(port->rx_polarity()),
             });
     }
 
@@ -365,7 +365,8 @@ bool handle_data(const tusb_control_request_t* request) {
         // 身份 —— 与 kSetCanConfig 的时间字段同一性质。波特率不再用百分比容差
         // 比对: 请求值本就不是求解器的不动点(921600 在本板上也除不尽), 只有
         // BRR 整数是可比的事实。见 UartDivisor。
-        if (!port->check_framing(payload.word_length, payload.parity, payload.stop_bits)) {
+        if (!port->check_framing(
+                payload.word_length, payload.parity, payload.stop_bits, payload.rx_polarity)) {
             record_config_error(
                 vc::Request::kSetUartConfig, index,
                 vc::ConfigErrorReason::kConfigErrorFramingUnsupported);
@@ -428,10 +429,12 @@ bool handle_data(const tusb_control_request_t* request) {
                     return false;
                 }
             }
-            port->commit_framing(payload.word_length, payload.parity, payload.stop_bits);
+            port->commit_framing(
+                payload.word_length, payload.parity, payload.stop_bits, payload.rx_polarity);
             // 写后回读帧格式: 主机不再回读, ACK 必须等于已生效。
-            if (!framing_matches(*port, payload.word_length, payload.parity, payload.stop_bits))
-                [[unlikely]] {
+            if (!framing_matches(
+                    *port, payload.word_length, payload.parity, payload.stop_bits,
+                    payload.rx_polarity)) [[unlikely]] {
                 record_config_error(
                     vc::Request::kSetUartConfig, index,
                     vc::ConfigErrorReason::kConfigErrorVerifyFailed);
@@ -465,7 +468,9 @@ bool handle_data(const tusb_control_request_t* request) {
                 payload.oversample);
             return false;
         }
-        if (!framing_matches(*port, payload.word_length, payload.parity, payload.stop_bits)) {
+        if (!framing_matches(
+                *port, payload.word_length, payload.parity, payload.stop_bits,
+                payload.rx_polarity)) {
             record_config_error(
                 vc::Request::kSetUartConfig, index,
                 vc::ConfigErrorReason::kConfigErrorFramingUnsupported);

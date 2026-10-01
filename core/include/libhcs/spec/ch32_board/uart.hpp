@@ -56,6 +56,12 @@ public:
 
     static constexpr const UartDescriptor* end() noexcept { return std::end(kArray); }
 
+    /// Position in this table. ch32_board has no EP0 configuration channel (its UARTs are
+    /// configured in the data stream), so unlike the other boards this is not an EP0 index.
+    static constexpr std::size_t index_of(const UartDescriptor& descriptor) noexcept {
+        return static_cast<std::size_t>(&descriptor - std::begin(kArray));
+    }
+
     static constexpr const UartDescriptor* find(data::DataId data_id) noexcept {
         for (const auto& descriptor : kArray) {
             if (descriptor.data_id == data_id)

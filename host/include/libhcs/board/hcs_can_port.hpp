@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <utility>
+
+#include <libhcs/data/datas.hpp>
 
 // CAN port naming for the hpm_board family.
 //
@@ -28,5 +31,12 @@ enum class CanPort : uint8_t {
     kCan2 = 2,
     kCan3 = 3,
 };
+
+/// The port a CAN descriptor (Spec::Can::data_id) names: DataId::kCanN is CanPort::kCanN.
+[[nodiscard]] constexpr CanPort can_port(data::DataId data_id) noexcept {
+    return static_cast<CanPort>(
+        std::to_underlying(data_id) - std::to_underlying(data::DataId::kCan0));
+}
+static_assert(can_port(data::DataId::kCan3) == CanPort::kCan3);
 
 } // namespace libhcs::board::hcs

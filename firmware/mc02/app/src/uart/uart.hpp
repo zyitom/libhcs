@@ -72,8 +72,10 @@ public:
     // 应用帧格式前的**纯校验**, 不碰任何寄存器。EP0 处理器先调它排除非法组合,
     // 于是"帧格式非法"这条路一个寄存器都没动 —— 与波特率的 solve_brr() 对称,
     // 二者合起来使 STALL 严格等于"什么都没改"。编码见 commit_framing() 上方。
-    [[nodiscard]] bool
-        check_framing(uint32_t word_length, uint32_t parity, uint32_t stop_bits) const {
+    [[nodiscard]] bool check_framing(
+        uint32_t word_length, uint32_t parity, uint32_t stop_bits, uint32_t rx_polarity) const {
+        if (rx_polarity > 2U)
+            return false;
         if (word_length != 0U && word_length != 7U && word_length != 8U)
             return false;
         if (parity != 0U && (parity < 1U || parity > 3U))
@@ -92,43 +94,60 @@ public:
     // 本函数无失败路径 —— 校验已在 check_framing() 完成, 这正是拆开的目的: 旧
     // 的 set_framing() 把校验与写入揉在一起, 校验失败时虽已提前 return, 但
     // 一旦有人在这中间插入一次寄存器写, "STALL 即未改"就悄悄失效了。
-    void commit_framing(uint32_t word_length, uint32_t parity, uint32_t stop_bits) {
-        uint32_t m_bits = 0;
-        if (word_length == 7U)
-            m_bits = USART_CR1_M1;
+    //
+    // 接收极性(0 = 保持; 1 = 正常; 2 = 反相)是 MCU 引脚上的极性: DBUS 口板上
+    // 已有硬件反相器, DBUS/SBUS 用正常, iBUS 用反相把反相器抵消掉。RXINV 在
+    // CR2, 与 STOP 同样只能在 UE=0 时写, 所以放进同一个窗口。
+    void commit_framing(
+        uint32_t word_length, uint32_t parity, uint32_t stop_bits, uint32_t rx_polarity) {
+        // M 管的是整帧位数(数据位 + 校验位), 不是数据位: 8 数据位加偶校验要 9 位帧
+        // (M0), 这正是 CubeMX 给 DBUS 的 WORDLENGTH_9B + PARITY_EVEN。所以字长与
+        // 校验必须合起来算: 先把没请求的那一半补成当前值, 再换算成 M。
+        const uint32_t data_bits = word_length != 0U ? word_length : this->word_length();
+        const uint32_t parity_code = parity != 0U ? parity : this->parity();
         uint32_t parity_bits = 0;
-        switch (parity) {
-        case 1U: parity_bits = 0U; break;                           // 无校验
+        switch (parity_code) {
         case 2U: parity_bits = USART_CR1_PCE; break;                // 偶
         case 3U: parity_bits = USART_CR1_PCE | USART_CR1_PS; break; // 奇
-        default: break;
+        default: break;                                             // 无校验
         }
+        const uint32_t frame_bits = data_bits + (parity_bits != 0U ? 1U : 0U);
+        uint32_t m_bits = 0; // 8 位帧
+        if (frame_bits == 7U)
+            m_bits = USART_CR1_M1;
+        else if (frame_bits == 9U)
+            m_bits = USART_CR1_M0;
         uint32_t stop_reg = 0;
         if (stop_bits == 2U)
             stop_reg = USART_CR2_STOP_1;
 
         auto* instance = hal_uart_handle_->Instance;
         const uint32_t cr1 = instance->CR1;
-        uint32_t new_cr1 = cr1 & ~(USART_CR1_UE | USART_CR1_M | USART_CR1_PCE | USART_CR1_PS);
-        if (word_length != 0U)
-            new_cr1 |= m_bits;
-        if (parity != 0U)
-            new_cr1 |= parity_bits;
+        const uint32_t new_cr1 =
+            (cr1 & ~(USART_CR1_UE | USART_CR1_M | USART_CR1_PCE | USART_CR1_PS)) | m_bits
+            | parity_bits;
 
         instance->CR1 = new_cr1 & ~USART_CR1_UE; // UE=0, 帧格式字段可写
+        uint32_t cr2 = instance->CR2;
         if (stop_bits != 0U)
-            instance->CR2 = (instance->CR2 & ~USART_CR2_STOP) | stop_reg;
+            cr2 = (cr2 & ~USART_CR2_STOP) | stop_reg;
+        if (rx_polarity != 0U)
+            cr2 = rx_polarity == 2U ? (cr2 | USART_CR2_RXINV) : (cr2 & ~USART_CR2_RXINV);
+        instance->CR2 = cr2;
         instance->CR1 = new_cr1; // UE 恢复
     }
 
     // ---- 帧格式读回: 从活寄存器解码, 编码同上, 永不返回 0(0 只表示"跳过") ----
 
+    // 数据位 = M 给出的帧位数 - 校验位。DBUS 的 9 位帧 + 偶校验读回 8。
     [[nodiscard]] uint32_t word_length() const {
-        const uint32_t m = hal_uart_handle_->Instance->CR1 & USART_CR1_M;
-        // M0(9 位)不会由本驱动写出; 万一出现, 如实上报。
-        if ((m & USART_CR1_M0) != 0U)
-            return 9U;
-        return (m & USART_CR1_M1) != 0U ? 7U : 8U;
+        const uint32_t cr1 = hal_uart_handle_->Instance->CR1;
+        uint32_t frame_bits = 8U;
+        if ((cr1 & USART_CR1_M0) != 0U)
+            frame_bits = 9U;
+        else if ((cr1 & USART_CR1_M1) != 0U)
+            frame_bits = 7U;
+        return frame_bits - ((cr1 & USART_CR1_PCE) != 0U ? 1U : 0U);
     }
 
     [[nodiscard]] uint32_t parity() const {
@@ -142,6 +161,11 @@ public:
         // 1.5 停止位的编码不会由本驱动写出(见 check_framing); 万一出现, 如实上报
         // 协议中无此编码的原始值没有意义, 按最近的 2 处理并注释于此。
         return (hal_uart_handle_->Instance->CR2 & USART_CR2_STOP) == USART_CR2_STOP_1 ? 2U : 1U;
+    }
+
+    // 1 = 正常, 2 = 反相(CR2.RXINV)。
+    [[nodiscard]] uint32_t rx_polarity() const {
+        return (hal_uart_handle_->Instance->CR2 & USART_CR2_RXINV) != 0U ? 2U : 1U;
     }
 
     // 实际编程的波特率, 从 BRR 反推而非 Init.BaudRate: 后者只是最近一次请求

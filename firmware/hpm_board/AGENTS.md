@@ -114,8 +114,8 @@ init 和 `abort_transmit()` 之后采样，遥测只读快照；`uart_set_baudra
 | `0x40 kGetInterface` | IN | 0 | `InterfacePayload` | 线格式指纹 `kVersion`（编译期折叠，禁止手改）、CAN/UART 路数、实时 FD 掩码、能力位 |
 | `0x41 kGetCanConfig` | IN | 总线号 | `CanConfigPayload` | 硬件事实：当前帧型 + 由 `NBTP`/`DBTP` 重构的速率与采样点；经典模式控制器关 FD，数据段报 0 |
 | `0x42 kSetCanConfig` | OUT | 总线号 | `CanConfigPayload` | 本板置 `kCapCanModeSettable` + `kCapCanRateSettable`：`kCanConfigApply` 切帧型，`kCanConfigApplyTiming` 按 host 下发的速率（非零即新值，零即沿用）重解位时序，二者都重初始化控制器（见约束 1）；不带时对应字段是核对。采样点永远是核对。板端应用后自己回读，帧型/速率/采样点不符即 `kConfigErrorVerifyFailed`，解不出即 `kConfigErrorRateUnrepresentable` 且救回原设置 |
-| `0x43 kGetUartConfig` | IN | 端口号 | `UartConfigPayload`（12 字节） | 硬件事实：**实际写入**的分频器 `DLM:DLL` 与过采样倍数（OSCR 解码，0→32）+ 由二者反推的波特率 + 活寄存器解码的帧格式 |
-| `0x44 kSetUartConfig` | OUT | 端口号 | `UartConfigPayload`（12 字节） | 稀疏 patch（波特率 + 字长/校验/停止位，0=不动）；`divisor`/`oversample` 非零即**断言**。求解与断言全部前置，STALL 严格等于寄存器不动；写入后回读分频器不符报 `kConfigErrorVerifyFailed`(7) |
+| `0x43 kGetUartConfig` | IN | 端口号 | `UartConfigPayload`（12 字节） | 硬件事实：**实际写入**的分频器 `DLM:DLL` 与过采样倍数（OSCR 解码，0→32）+ 由二者反推的波特率 + 活寄存器解码的帧格式 + 接收极性（`rx_polarity`，本板恒报 1=正常） |
+| `0x44 kSetUartConfig` | OUT | 端口号 | `UartConfigPayload`（12 字节） | 稀疏 patch（波特率 + 字长/校验/停止位/接收极性，0=不动）；接收极性 2=反相只有 mc02 接受，本板与 c_board 无 RX 反相硬件，报 `kConfigErrorFramingUnsupported`；`divisor`/`oversample` 非零即**断言**。求解与断言全部前置，STALL 严格等于寄存器不动；写入后回读分频器不符报 `kConfigErrorVerifyFailed`(7) |
 | `0x45 kGetCanStatus` | IN | 丝印编号 | — | 控制器错误寄存器回读，判读表见 [PITFALLS.md](PITFALLS.md) 第 5 节 |
 | `0x47 kGetLatencyBreakdown` | IN | — | — | 延迟拆解埋点，恒开（见下） |
 | `0x48 kGetLastConfigError` | IN | 0 | `LastConfigErrorPayload` | 最近一次 STALL 的请求码、下标、原因（`ConfigErrorReason`）、值；粘滞到下次拒绝或复位。每条 STALL 路径都先记再返回 |

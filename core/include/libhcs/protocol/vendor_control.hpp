@@ -68,6 +68,12 @@ namespace libhcs::core::protocol::vendor_control {
 //   solves its bit timing for them. Both are new enum values no payload
 //   layout observes, so they are folded in by hand (see the maintenance rule).
 //
+//   v5 -> v6 (2026-09-30, automatic): UartConfigPayload's trailing reserved
+//   byte became `rx_polarity` (UartRxPolarity), so one DBUS port can take DBUS,
+//   SBUS and iBUS receivers: mc02 flips STM32H7 RXINV to cancel its on-board
+//   inverter for iBUS. Same payload size; the fingerprint moves on the new
+//   field's offset and the enum codings.
+//
 // The fingerprint itself lives at the bottom of this file, after every payload
 // it folds over.
 
@@ -241,6 +247,18 @@ enum UartStopBits : uint8_t {
     // this repo only realize it for 5-bit words, where the wire looks like
     // what kUartStopBits2 means everywhere else -- an offered alias would lie.
 };
+// RX line polarity AT THE MCU PIN, not at the connector: a port with an
+// on-board inverter (mc02's DBUS) receives an inverted protocol (DBUS, SBUS)
+// with kUartRxPolarityNormal, and a non-inverted one (iBUS) only with
+// kUartRxPolarityInverted, which cancels the inverter. Only controllers with
+// an RX-inversion bit accept kUartRxPolarityInverted (mc02's STM32H7 RXINV);
+// hpm_board and c_board have none and refuse it with
+// kConfigErrorFramingUnsupported.
+enum UartRxPolarity : uint8_t {
+    kUartRxPolaritySkip = 0,
+    kUartRxPolarityNormal = 1,
+    kUartRxPolarityInverted = 2,
+};
 enum UartConfigControl : uint8_t {
     // Apply every non-zero field of the payload. Without this bit the SET is
     // a pure assertion: it ACKs only if the port already runs exactly what
@@ -308,7 +326,7 @@ struct UartConfigPayload {
     uint8_t parity;      // UartParity
     uint8_t stop_bits;   // UartStopBits
     uint8_t control;     // UartConfigControl, SET only; GET returns 0
-    uint8_t reserved;
+    uint8_t rx_polarity; // UartRxPolarity
 };
 static_assert(sizeof(UartConfigPayload) == 12);
 
@@ -451,6 +469,7 @@ constexpr uint16_t layout_fingerprint() {
     fold(__builtin_offsetof(UartConfigPayload, control));
     fold(__builtin_offsetof(UartConfigPayload, divisor));
     fold(__builtin_offsetof(UartConfigPayload, oversample));
+    fold(__builtin_offsetof(UartConfigPayload, rx_polarity));
     fold(__builtin_offsetof(CanStatusPayload, tx_occurred));
     fold(__builtin_offsetof(LatencyBreakdownPayload, cpu_hz));
 
@@ -480,6 +499,8 @@ constexpr uint16_t layout_fingerprint() {
     fold(static_cast<uint32_t>(UartParity::kUartParityOdd));
     fold(static_cast<uint32_t>(UartStopBits::kUartStopBits1));
     fold(static_cast<uint32_t>(UartStopBits::kUartStopBits2));
+    fold(static_cast<uint32_t>(UartRxPolarity::kUartRxPolarityNormal));
+    fold(static_cast<uint32_t>(UartRxPolarity::kUartRxPolarityInverted));
     fold(static_cast<uint32_t>(ConfigErrorReason::kConfigErrorFramingUnsupported));
     fold(static_cast<uint32_t>(ConfigErrorReason::kConfigErrorVerifyFailed));
     // UartDivisor is folded whole, not through UartConfigPayload: it is

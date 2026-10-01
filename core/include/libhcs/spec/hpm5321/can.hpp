@@ -54,6 +54,12 @@ public:
 
     static constexpr const CanDescriptor* end() noexcept { return std::end(kArray); }
 
+    /// Position in this table, which is also the port's index on the EP0 configuration channel
+    /// (hcs::Configuration::can[] / uart[]).
+    static constexpr std::size_t index_of(const CanDescriptor& descriptor) noexcept {
+        return static_cast<std::size_t>(&descriptor - std::begin(kArray));
+    }
+
     static constexpr const CanDescriptor* find(data::DataId data_id) noexcept {
         for (const auto& descriptor : kArray) {
             if (descriptor.data_id == data_id)

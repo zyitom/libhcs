@@ -26,6 +26,8 @@
 //   8. UART framing (stop bits here) applies, reads back from the live
 //      registers, and restores -- the same apply-then-verify contract the
 //      baudrate checks above exercise.
+//   9. RX inversion (UartRxPolarity) is refused -- this controller has none --
+//      and the refusal takes the rest of the request with it.
 //
 // Needs one HPM5321 dual-CAN-FD board (PID 0x5322). No CAN or UART wiring: every
 // check is a control transfer plus the board's own read-back. Pass a serial
@@ -331,16 +333,55 @@ int main(int argc, char** argv) {
             applied.parity == hcs::vc::UartParity::kUartParityNone,
             "untouched fields stay as they were (no parity)");
 
-        // Restore 1 stop bit so a peer on this port is not left behind. The
-        // rate-only form cannot do it BY DESIGN (sparse patch: zero fields are
-        // left untouched), so the restore is an explicit full setting.
+        // Restore 1 stop bit and kDefaultBaudrate so a peer on this port is not
+        // left behind. The rate-only form cannot restore the stop bits BY DESIGN
+        // (sparse patch: zero fields are left untouched), so the restore is an
+        // explicit full setting.
         hcs::UartSetting restore;
-        restore.baudrate = kBaseBaudrate;
+        restore.baudrate = kDefaultBaudrate;
         restore.stop_bits = hcs::vc::UartStopBits::kUartStopBits1;
         board.configure_uart0(restore);
+        const auto restored = board.read_uart_setting(0);
         check(
-            board.read_uart_setting(0).stop_bits == hcs::vc::UartStopBits::kUartStopBits1,
+            restored.stop_bits == hcs::vc::UartStopBits::kUartStopBits1,
             "explicit full setting restores the default framing");
+        check(
+            within_tolerance(kDefaultBaudrate, restored.baudrate),
+            "and puts the port back at 921600");
+    } catch (const std::exception& error) {
+        std::printf("  [FAIL] unexpected exception: %s\n", error.what());
+        ++g_failures;
+    }
+
+    std::printf("9. RX inversion is refused on a controller without it\n");
+    try {
+        AdvancedOptions options;
+        options.set_dangerously_skip_version_checks(true);
+        Hpm5321 board{callback, filter, options};
+        const auto before = board.read_uart_setting(0);
+        check(
+            before.rx_polarity == hcs::vc::kUartRxPolarityNormal,
+            "the port reads back normal RX polarity");
+        board.configure_uart0(hcs::UartSetting{.rx_polarity = hcs::vc::kUartRxPolarityNormal});
+        check(true, "asking for normal polarity is accepted");
+
+        bool refused = false;
+        try {
+            board.configure_uart0(
+                hcs::UartSetting{
+                    .baudrate = 115200, .rx_polarity = hcs::vc::kUartRxPolarityInverted});
+        } catch (const std::exception& error) {
+            refused = true;
+            std::printf("   threw: %s\n", error.what());
+        }
+        check(refused, "asking for inverted polarity is refused (HPM5300 has no RX inversion)");
+        check(
+            board.last_config_error().reason
+                == std::to_underlying(hcs::vc::ConfigErrorReason::kConfigErrorFramingUnsupported),
+            "and the board latched kConfigErrorFramingUnsupported");
+        check(
+            board.read_uart_setting(0).divisor == before.divisor,
+            "and the rate in the same request was not applied either");
     } catch (const std::exception& error) {
         std::printf("  [FAIL] unexpected exception: %s\n", error.what());
         ++g_failures;

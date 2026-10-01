@@ -74,6 +74,25 @@ uart::Uart* uart_by_index(uint16_t index) {
     }
 }
 
+const can::Can* can_by_index(uint16_t index) {
+    switch (index) {
+    case 0: return can::can1.try_get();
+    case 1: return can::can2.try_get();
+    default: return nullptr;
+    }
+}
+
+// 端口未初始化时报 0: GET 如实说"不知道", SET 的非零核对随之不符而 STALL。
+uint32_t can_arbitration_baudrate(uint16_t index) {
+    const can::Can* port = can_by_index(index);
+    return port != nullptr ? port->arbitration_baudrate() : 0U;
+}
+
+uint32_t can_arbitration_sample_point(uint16_t index) {
+    const can::Can* port = can_by_index(index);
+    return port != nullptr ? port->arbitration_sample_point() : 0U;
+}
+
 // 本板所有总线恒为 classic: 没有可切换的模式, 也没有第二个真相源可问。保留成
 // 函数而非常量, 是为了让 kGetCanConfig 的写法与其它板一致(将来换控制器时只改这里)。
 vc::CanMode can_mode(uint16_t index) {
@@ -105,17 +124,17 @@ bool handle_setup(uint8_t rhport, const tusb_control_request_t* request) {
             return false;
         }
         // 硬件事实而非"上次请求"。bxCAN 的位时序由 CubeMX 生成的波特率预设决定,
-        // 运行期不可改(改要进 INIT 重配, CubeMX 预设钉死), 因此这里
-        // 报的是端口表的编译期常量。数据段速率与采样点对本板无意义, 恒 0。
+        // 运行期不可改(改要进 INIT 重配, CubeMX 预设钉死), 这里报的是从 BTR 反推的
+        // 实际值。数据段速率与采样点对本板无意义, 恒 0。
         return reply(
             rhport, request,
             vc::CanConfigPayload{
                 .mode = static_cast<uint8_t>(can_mode(index)),
                 .control = 0,
                 .reserved0 = 0,
-                .arbitration_baudrate = 0,
+                .arbitration_baudrate = can_arbitration_baudrate(index),
                 .data_baudrate = 0,
-                .nominal_sample_point = 0,
+                .nominal_sample_point = static_cast<uint16_t>(can_arbitration_sample_point(index)),
                 .data_sample_point = 0,
                 .reserved1 = 0,
             });
@@ -146,7 +165,7 @@ bool handle_setup(uint8_t rhport, const tusb_control_request_t* request) {
                 .parity = static_cast<uint8_t>(port->parity()),
                 .stop_bits = static_cast<uint8_t>(port->stop_bits()),
                 .control = 0,
-                .reserved = 0,
+                .rx_polarity = static_cast<uint8_t>(port->rx_polarity()),
             });
     }
 
@@ -218,16 +237,21 @@ bool handle_data(const tusb_control_request_t* request) {
             return false;
         }
         // 速率与采样点是核对不是配置: 本板 bxCAN 的位时序由 CubeMX 预设钉死,
-        // 运行期改不了。非零即核对, 但本板恒为 classic 且报 0, 因此只要主机报了
-        // 非零值就一定不符 —— 这正是要让它 STALL 的情形。
-        if (payload.arbitration_baudrate != 0 || payload.data_baudrate != 0
-            || payload.nominal_sample_point != 0 || payload.data_sample_point != 0) {
+        // 运行期改不了。非零就必须与 GET 报的实际值一致, 否则 STALL; 本板没有数据段,
+        // 所以非零的数据段字段一定不符。
+        const auto asserted_ok = [&](uint32_t asserted, uint32_t actual) {
+            if (asserted == 0U || asserted == actual)
+                return true;
             record_config_error(
                 vc::Request::kSetCanConfig, index,
-                vc::ConfigErrorReason::kConfigErrorRateUnrepresentable,
-                payload.arbitration_baudrate);
+                vc::ConfigErrorReason::kConfigErrorRateUnrepresentable, asserted);
             return false;
-        }
+        };
+        if (!asserted_ok(payload.arbitration_baudrate, can_arbitration_baudrate(index))
+            || !asserted_ok(payload.data_baudrate, 0U)
+            || !asserted_ok(payload.nominal_sample_point, can_arbitration_sample_point(index))
+            || !asserted_ok(payload.data_sample_point, 0U))
+            return false;
         // 本板不设 kCapCanModeSettable, 且硬件无 FD 能力: 请求 classic 才 ACK,
         // 请求 FD 一律 STALL(apply 位在本板无语义: 没有可切的模式)。
         if (static_cast<vc::CanMode>(payload.mode) != can_mode(index)) {
@@ -257,7 +281,8 @@ bool handle_data(const tusb_control_request_t* request) {
         // 先全量校验后统一提交: 帧格式先纯校验(check_framing 不碰寄存器), 波特率
         // 先解不写(solve_brr 不碰寄存器), 断言字段也全部前置, 提交放最后。因此
         // STALL 严格等于"什么都没改"。
-        if (!port->check_framing(payload.word_length, payload.parity, payload.stop_bits)) {
+        if (!port->check_framing(
+                payload.word_length, payload.parity, payload.stop_bits, payload.rx_polarity)) {
             record_config_error(
                 vc::Request::kSetUartConfig, index,
                 vc::ConfigErrorReason::kConfigErrorFramingUnsupported);
@@ -322,8 +347,9 @@ bool handle_data(const tusb_control_request_t* request) {
             }
             port->commit_framing(payload.word_length, payload.parity, payload.stop_bits);
             // 写后回读帧格式: 主机不再回读, ACK 必须等于已生效。
-            if (!framing_matches(*port, payload.word_length, payload.parity, payload.stop_bits))
-                [[unlikely]] {
+            if (!framing_matches(
+                    *port, payload.word_length, payload.parity, payload.stop_bits,
+                    payload.rx_polarity)) [[unlikely]] {
                 record_config_error(
                     vc::Request::kSetUartConfig, index,
                     vc::ConfigErrorReason::kConfigErrorVerifyFailed);
@@ -357,7 +383,9 @@ bool handle_data(const tusb_control_request_t* request) {
                 payload.oversample);
             return false;
         }
-        if (!framing_matches(*port, payload.word_length, payload.parity, payload.stop_bits)) {
+        if (!framing_matches(
+                *port, payload.word_length, payload.parity, payload.stop_bits,
+                payload.rx_polarity)) {
             record_config_error(
                 vc::Request::kSetUartConfig, index,
                 vc::ConfigErrorReason::kConfigErrorFramingUnsupported);

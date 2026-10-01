@@ -85,20 +85,40 @@ public:
         }
 
     public:
+        // One entry per kind with the port as its descriptor, like the GPIO callbacks: what code
+        // written for every board model overrides. The default fans out to the per-port
+        // callbacks above, which stay for code that handles one port by name.
+        virtual void can_receive_callback(const Spec::Can& can, const View::Can& data) {
+            switch (can.data_id) {
+            case data::DataId::kCan1: can1_receive_callback(data); break;
+            case data::DataId::kCan2: can2_receive_callback(data); break;
+            default: break;
+            }
+        }
+
         bool can_receive_callback(data::DataId id, const data::CanDataView& data) final {
-            switch (id) {
-            case data::DataId::kCan1: can1_receive_callback(data); return true;
-            case data::DataId::kCan2: can2_receive_callback(data); return true;
-            default: return false;
+            const auto* can = Spec::kCans.find(id);
+            if (can == nullptr)
+                return false;
+            can_receive_callback(*can, data);
+            return true;
+        }
+
+        // Same shape as can_receive_callback(const Spec::Can&, ...).
+        virtual void uart_receive_callback(const Spec::Uart& uart, const View::Uart& data) {
+            switch (uart.data_id) {
+            case data::DataId::kUart1: uart1_receive_callback(data); break;
+            case data::DataId::kUart2: uart2_receive_callback(data); break;
+            default: break;
             }
         }
 
         bool uart_receive_callback(data::DataId id, const data::UartDataView& data) final {
-            switch (id) {
-            case data::DataId::kUart1: uart1_receive_callback(data); return true;
-            case data::DataId::kUart2: uart2_receive_callback(data); return true;
-            default: return false;
-            }
+            const auto* uart = Spec::kUarts.find(id);
+            if (uart == nullptr)
+                return false;
+            uart_receive_callback(*uart, data);
+            return true;
         }
 
         bool gpio_digital_read_result_callback(
@@ -134,6 +154,20 @@ public:
         friend class Ch32Board;
 
     public:
+        // Any port by its descriptor (Callback::Spec): the form code written for every board
+        // model uses.
+        PacketBuilder& can_transmit(
+            const Callback::Spec::Can& can, const libhcs::data::CanDataView& data) {
+            return can_transmit(hcs::can_port(can.data_id), data);
+        }
+
+        PacketBuilder& uart_transmit(
+            const Callback::Spec::Uart& uart, const libhcs::data::UartDataView& data) {
+            if (!builder_.write_uart(uart.data_id, data)) [[unlikely]]
+                throw std::invalid_argument{"UART transmission failed: Invalid UART data"};
+            return *this;
+        }
+
         // Transmits on the CAN port named as the enclosure labels it.
         // Ports on this board: CanPort::kCan1, CanPort::kCan2 (silkscreen
         // CAN1..CAN2). Same entry point as every other board's, so a caller

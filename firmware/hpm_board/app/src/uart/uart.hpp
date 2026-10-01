@@ -124,8 +124,13 @@ public:
 
     // 纯校验, 不碰寄存器: 供 EP0 处理器在 set_baudrate() 之前排除非法组合,
     // 保证任一字段非法时 STALL 严格等于"什么都没改"。
-    [[nodiscard]] bool
-        check_framing(uint32_t word_length, uint32_t parity, uint32_t stop_bits) const {
+    //
+    // 接收极性只接受 0(跳过)与 1(正常): HPM5300 的 UART 没有 RX 反相位, 请求
+    // 反相必须 STALL 而不是假装生效。
+    [[nodiscard]] bool check_framing(
+        uint32_t word_length, uint32_t parity, uint32_t stop_bits, uint32_t rx_polarity) const {
+        if (rx_polarity > 1U)
+            return false;
         if (word_length != 0U && word_length != 7U && word_length != 8U)
             return false;
         if (parity != 0U && (parity < 1U || parity > 3U))
@@ -182,6 +187,9 @@ public:
         // 写出(见 check_framing)。
         return (uart_base_->LCR & UART_LCR_STB_MASK) != 0U ? 2U : 1U;
     }
+
+    // 无 RX 反相硬件, 恒为正常(1)。
+    [[nodiscard]] static uint32_t rx_polarity() { return 1U; }
 
     ATTR_PLACE_AT(".fast")
     void handle_downlink(const data::UartDataView& data) {

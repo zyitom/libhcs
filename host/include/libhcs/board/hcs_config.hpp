@@ -108,13 +108,18 @@ struct UartSetting {
     vc::UartWordLength word_length = static_cast<vc::UartWordLength>(0);
     vc::UartParity parity = static_cast<vc::UartParity>(0);
     vc::UartStopBits stop_bits = static_cast<vc::UartStopBits>(0);
+    // Polarity at the MCU pin (see vc::UartRxPolarity). mc02 only: on its DBUS
+    // port, kUartRxPolarityInverted is what lets an iBUS receiver through the
+    // on-board inverter; every other board refuses it.
+    vc::UartRxPolarity rx_polarity = vc::kUartRxPolaritySkip;
 };
 
 // 一路 CAN 总线的设置: 帧型与两段速率都是接线事实(由总线对端电机决定), 写死在 host 代码里,
 // 经 EP0 握手下发。速率 0 = 沿用板子当前值。采样点(87.5%)与 TDC 是板端实测策略, 不在此。
 //
 // 速率可设的板(hpm_board)按它解位时序, 解不出即构造失败; 速率写死的板(mc02)把非零速率
-// 当核对, 不符即构造失败。c_board 报不出速率(bxCAN 时序未上报), 在它上面速率须留 0。
+// 当核对, 不符即构造失败。c_board 同为核对(速率从 bxCAN BTR 反推), 经典总线无数据段,
+// data_baudrate 须为 0。
 struct CanSetting {
     bool fd = false;
     uint32_t arbitration_baudrate = 0;
@@ -297,6 +302,7 @@ inline UartSetting read_uart_setting(host::protocol::Handler& handler, std::size
         .word_length = static_cast<vc::UartWordLength>(payload.word_length),
         .parity = static_cast<vc::UartParity>(payload.parity),
         .stop_bits = static_cast<vc::UartStopBits>(payload.stop_bits),
+        .rx_polarity = static_cast<vc::UartRxPolarity>(payload.rx_polarity),
     };
 }
 
@@ -324,7 +330,7 @@ inline void
         .parity = std::to_underlying(setting.parity),
         .stop_bits = std::to_underlying(setting.stop_bits),
         .control = vc::kUartConfigApply,
-        .reserved = 0};
+        .rx_polarity = std::to_underlying(setting.rx_polarity)};
     if (!handler.vendor_control_out(
             std::to_underlying(vc::Request::kSetUartConfig), static_cast<uint16_t>(port), &payload,
             sizeof(payload)))
@@ -359,6 +365,8 @@ inline void reconfigure_uart(
         stored.parity = setting.parity;
     if (std::to_underlying(setting.stop_bits) != 0)
         stored.stop_bits = setting.stop_bits;
+    if (std::to_underlying(setting.rx_polarity) != 0)
+        stored.rx_polarity = setting.rx_polarity;
     configuration.uart[port] = stored;
 }
 
@@ -498,8 +506,9 @@ inline Interface apply(host::protocol::Handler& handler, const Configuration& co
             continue;
         if (bus >= interface.can_count) {
             throw std::runtime_error{std::format(
-                "CAN{} was configured but this board reports only {} CAN bus(es).", bus + 1,
-                interface.can_count)};
+                "CAN bus #{} (index in the board's CAN table, not a silkscreen number) was "
+                "configured but this board reports only {} CAN bus(es).",
+                bus, interface.can_count)};
         }
         request_can_setting(handler, bus, *setting, interface);
         // The mask above was read before this request. On a settable board
@@ -516,8 +525,9 @@ inline Interface apply(host::protocol::Handler& handler, const Configuration& co
             continue;
         if (port >= interface.uart_count) {
             throw std::runtime_error{std::format(
-                "UART{} was configured but this board reports only {} UART port(s).", port,
-                interface.uart_count)};
+                "UART port #{} (index in the board's UART table, not a silkscreen number) was "
+                "configured but this board reports only {} UART port(s).",
+                port, interface.uart_count)};
         }
         configure_uart(handler, port, *setting);
     }

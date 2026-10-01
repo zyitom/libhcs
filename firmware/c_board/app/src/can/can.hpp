@@ -10,6 +10,7 @@
 #include <stm32f407xx.h>
 #include <stm32f4xx_hal_can.h>
 #include <stm32f4xx_hal_def.h>
+#include <stm32f4xx_hal_rcc.h>
 
 #include "core/include/libhcs/data/datas.hpp"
 #include "core/include/libhcs/spec/c_board/can.hpp"
@@ -135,7 +136,37 @@ public:
             free_mailbox_count);
     }
 
+    // 仲裁段速率与采样点(千分比), 从 BTR 寄存器反推 -- 寄存器才是硬件事实, CubeMX
+    // 的 Init 只是初始化时的请求。BRP/TS1/TS2 都是"值减 1"编码, 同步段恒 1 TQ;
+    // bxCAN 挂在 APB1 上。42 MHz / (3 * (1+10+3)) = 1 Mbit/s, 采样点 (1+10)/14 = 785‰
+    // (截断, 与 mc02 同一算法)。本控制器没有数据段。
+    [[nodiscard]] uint32_t arbitration_baudrate() const {
+        const BitTiming timing = bit_timing();
+        return HAL_RCC_GetPCLK1Freq() / (timing.prescaler * timing.total());
+    }
+
+    [[nodiscard]] uint32_t arbitration_sample_point() const {
+        const BitTiming timing = bit_timing();
+        return (1U + timing.seg1) * 1000U / timing.total();
+    }
+
 private:
+    struct BitTiming {
+        uint32_t prescaler;
+        uint32_t seg1;
+        uint32_t seg2;
+        [[nodiscard]] uint32_t total() const { return 1U + seg1 + seg2; }
+    };
+
+    [[nodiscard]] BitTiming bit_timing() const {
+        const uint32_t btr = hal_can_handle_->Instance->BTR;
+        return {
+            .prescaler = ((btr & CAN_BTR_BRP) >> CAN_BTR_BRP_Pos) + 1U,
+            .seg1 = ((btr & CAN_BTR_TS1) >> CAN_BTR_TS1_Pos) + 1U,
+            .seg2 = ((btr & CAN_BTR_TS2) >> CAN_BTR_TS2_Pos) + 1U,
+        };
+    }
+
     void config_can(uint32_t hal_filter_bank, uint32_t hal_slave_start_filter_bank) {
         CAN_FilterTypeDef filter_config;
 

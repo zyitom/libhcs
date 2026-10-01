@@ -23,7 +23,7 @@ c_board 的上板。
 - **第 2 节** 实测结论：主机不能复算分频器；921600 处处非精确（2.2 含 2026-09-30 更正）；
   CDC 会在会话外改 UART；`kUart0` 实物逐板不同；`DataId` 不进指纹。
 - **第 3 节** 已完成：阶段 0（3.1）、examples 清理（3.2）、台架（3.3）、阶段 1-5/7/8 与复查修复（3.4）、
-  hpm5321 台架实测（3.5，含 D2 与重连重放）、一次 SET 即全部（3.6）。
+  hpm5321 台架实测（3.5，含 D2 与重连重放）、一次 SET 即全部（3.6）、接收极性（3.7）。
 - **第 4 节** 各阶段原始计划；只剩 4.6（阶段 6）未执行。
 - **第 5 节** 构建、格式检查口径、台架实测命令。**第 6 节** 盲区与纪律。
 
@@ -259,8 +259,10 @@ hpm 的 ILM 链接期断言通过；改动文件 clang-format 干净（口径见
    注意：USB 复位（`libusb_reset_device`）不能用来做这个测试——传输层把它当 `NO_DEVICE`
    判为永久故障（`kFaulted`），不走重连钩子。
 
-**已知小瑕疵**：`ep0_config_test` 第 8 段结束时把 UART0 留在 115200，与其开头"每条路径都还原
-921600"的注释不符（改动前即如此）。台架测完已手动恢复 921600。
+**已知小瑕疵（已修，2026-09-30 第二轮）**：`ep0_config_test` 第 8 段结束时把 UART0 留在 115200，
+与其开头"每条路径都还原 921600"的注释不符。现在第 8 段的还原设置直接用 921600 并核对回读。
+`[实测 2026-09-30：两板刷至 v3.3.1-0.dev.7.gcd35994 后 ep0_config_test 全过，第 8 段读回 909090（921600
+的 divisor 11）；随后 dual_board_test link 六链路 PASS、uart 100 6400/6400 零错]`
 
 ### 3.6 一次 SET 即全部：去掉主机回读（2026-09-30，用户要求）
 
@@ -286,6 +288,35 @@ USB 控制传输一次只能单向带数据，SET（OUT）只能回 ACK/STALL，
   板端核对通过；CAN1 classic↔FD 各 1 个 `0x42`，另行显式回读确认已切换；重连钩子 =
   `0x40` + `0x44`。`ep0_config_test` 两板全过，`dual_board_test link`/`uart`、D2 流测试、
   重连重放复测全过。
+
+### 3.7 接收极性 `rx_polarity`：一个 DBUS 口接三种接收机（2026-09-30，用户要求）
+
+**动机**：mc02 的遥控只能接 DBUS 口，用户要用的接收机覆盖 DBUS（DT7/DR16）、SBUS（天地飞
+W.BUS）与 iBUS（富斯 i6X）。前两者线上反相，iBUS 不反相；DBUS 口有板载反相器，所以 iBUS 需要
+在 MCU 侧再反一次。
+
+- **wire**：`UartConfigPayload` 末尾的 `reserved` 字节改为 `rx_polarity`（`UartRxPolarity`：
+  0=不动、1=正常、2=反相，指 MCU 引脚极性）。尺寸仍 12 字节；`kVersion` 因新字段偏移与枚举
+  自动移动（v5→v6），**全部板须同批重刷**。
+- **板端**：接收极性算帧格式的一部分，走同一条"先 `check_framing` 后 `commit_framing`、写后
+  `framing_matches` 回读"路径。mc02 写 CR2.RXINV（与 STOP 同在 UE=0 窗口）；hpm（HPM5300 UART
+  无 RX 极性位）与 c_board（F407 无）`rx_polarity()` 恒报 1，请求 2 即 STALL
+  `kConfigErrorFramingUnsupported`。
+- **主机**：`UartSetting::rx_polarity`，参与读回与重连写回；`Mc02::DbusReceiver` 三个预设
+  （`kDbus`/`kSbus` = 100000 8E1 正常，`kIbus` = 115200 8N1 反相），每个字段写满。
+- **验证**：四个目标编译通过，改动行 clang-format 20 干净。台架两块 hpm5321 重刷后
+  `ep0_config_test` 全过，含新增第 9 段（读回正常极性、请求反相被拒并锁存 FramingUnsupported、
+  同一请求里的速率也未应用）；`dual_board_test link`/`uart 100` 全过 `[实测 2026-09-30]`。
+  **mc02 的 RXINV 路径只有编译验证**；接上 mc02 后跑 `mc02_ep0_config_test` 第 7 段，再实接
+  iBUS 接收机确认能收。
+- **顺带修的既存 bug（STM32 字长把校验位算在内）**：协议的 `word_length` 是**数据位**，但
+  STM32 的 CR1.M 是**整帧位数（数据 + 校验）**。mc02 与 c_board 原先把 8 数据位直接写成 8 位帧，
+  于是 8E（DBUS/SBUS）被写成 7 数据位 + 校验；读回用同一错误算法，写后核对照样通过，**静默收乱码**。
+  c_board 还把 F4 的 M=1（9 位帧）读成 7。固件默认值（CubeMX `WORDLENGTH_9B + PARITY_EVEN`）
+  本身是对的，只有主机显式配帧格式才触发——`Mc02::DbusReceiver::kDbus/kSbus` 正会触发。
+  修法：字长与校验合起来算（未请求的一半取当前值），帧位 = 数据位 + 校验位，再换算 M；读回反算。
+  F4 没有 7 位帧，7N 在 `check_framing` 拒绝。hpm 的 LCR 数据位与校验本就分开，不受影响。
+  `[仅编译验证]`：`mc02_ep0_config_test` 第 7 段已加"开机读回 8E""DBUS 预设仍是 8 数据位"两项。
 
 ## 4. 各阶段计划（阶段 0-5、7、8 已完成，见 3.4；阶段 6 待做）
 
@@ -472,12 +503,18 @@ $CF --dry-run <改动的 .hpp/.cpp>
 ## 7. 遗留待办（2026-09-30 记录）
 
 1. **阶段 6**（4.6）：等 c_board 上板实测后再删数据流配置路径。
-2. **c_board 不报 CAN 速率**：`kGetCanConfig` 的速率/采样点恒报 0，`kSetCanConfig` 见非零时序字段即
-   STALL，所以 `CanSetting{kClassic1M}` 在 `CBoard` 上构造会失败，只能传速率 0。改法：固件从 bxCAN
-   `BTR` 反推实际速率与采样点上报，并据此核对非零字段；线格式不变。
+2. ~~**c_board 不报 CAN 速率**~~ **已修（2026-09-30 第二轮，仅编译验证）**：`kGetCanConfig` 从
+   bxCAN `BTR`（BRP/TS1/TS2 + APB1 频率）反推仲裁段速率与采样点上报；`kSetCanConfig` 对非零字段
+   做与 mc02 同形的相等核对，数据段字段必须为 0。线格式不变，`kVersion` 不动。按 CubeMX 现值
+   应报 1000000 / 785‰，所以 `CanSetting{kClassic1M}` 在 `CBoard` 上可以构造了。
+   `hcs_config.hpp` 的 `CanSetting` 注释与 `c_board/AGENTS.md` 已同步。
 3. **c_board CAN 采样点 78.6%**（CubeMX：`Prescaler=3`、`BS1=10TQ`、`BS2=3TQ`，42 MHz → 1 Mbit/s），
    其余板与电机是 87.5%。42 MHz 下凑不出 87.5%，最近 85.7%：`.ioc` 里 `CAN1/CAN2.BS1=CAN_BS1_11TQ`、
    `BS2=CAN_BS2_2TQ`，由人工改后 Generate。经典 CAN 一般能容忍，优先级低。
 4. **`CanConfigPayload::reserved1`**：不是对齐需要（前面正好 16 字节），在指纹版本机制下留空位不省任何
    兼容性。可删（payload 变 16 字节、`kVersion` 自动变、全板重刷），宜与下一次线格式改动合并。
-5. **mc02 / c_board 的本轮固件改动只有编译验证**，未上板。
+5. **mc02 / c_board 的本轮固件改动只有编译验证**，未上板（含 3.7 的 mc02 RXINV）。
+6. ~~台架固件落后于 SDK~~ **已解决（2026-09-30）**：两块 hpm5321 已同批刷至
+   `v3.3.1-0.dev.7.gcd35994`。注意 `tools/flash.sh hpm5321` 见到两块板同时枚举会拒绝；台架上改为按
+   USB 口路径逐块刷：`dfu-util -p <3-3|3-4> -d 0x34b7:0x6632,0xa511:* -a 0 -D <.dfu>`（路径在
+   detach 重枚举后不变）。

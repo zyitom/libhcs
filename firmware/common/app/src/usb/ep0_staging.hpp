@@ -108,11 +108,15 @@ inline bool rate_plausible(uint32_t requested, uint32_t achieved) {
 }
 
 // 帧格式判据: 每个非零字段都等于端口活寄存器的解码值(0 = 不关心)。
+// 接收极性算帧格式的一部分: 不能反相的端口 rx_polarity() 恒报正常。
 template <typename Port>
-bool framing_matches(const Port& port, uint32_t word_length, uint32_t parity, uint32_t stop_bits) {
+bool framing_matches(
+    const Port& port, uint32_t word_length, uint32_t parity, uint32_t stop_bits,
+    uint32_t rx_polarity) {
     return (word_length == 0U || word_length == port.word_length())
         && (parity == 0U || parity == port.parity())
-        && (stop_bits == 0U || stop_bits == port.stop_bits());
+        && (stop_bits == 0U || stop_bits == port.stop_bits())
+        && (rx_polarity == 0U || rx_polarity == port.rx_polarity());
 }
 
 } // namespace libhcs::firmware::usb::ep0

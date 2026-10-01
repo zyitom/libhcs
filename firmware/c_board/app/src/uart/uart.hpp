@@ -64,16 +64,27 @@ public:
     // bit count (7/8; 9 is not offered -- the RX path is a byte-wide DMA ring
     // and a ninth bit would be silently truncated). 1.5 stop bits is not
     // offered: STM32 realizes it only for a 5-bit word, where it is
-    // indistinguishable from 2 -- an offered alias would lie.
-    [[nodiscard]] bool
-        check_framing(uint32_t word_length, uint32_t parity, uint32_t stop_bits) const {
+    // indistinguishable from 2 -- an offered alias would lie. RX polarity only
+    // accepts 0 (skip) and 1 (normal): the F4 USART has no RX inversion bit, so
+    // an inverted request must stall rather than pretend to apply.
+    //
+    // The F4 frame (M) is 8 or 9 bits INCLUDING the parity bit, so 7 data bits
+    // exist only with parity (7E/7O = 8-bit frame); 7N1 would need a 7-bit
+    // frame this USART does not have. Checked on the resolved pair (a zero
+    // field stands for the port's current value), same as commit_framing().
+    [[nodiscard]] bool check_framing(
+        uint32_t word_length, uint32_t parity, uint32_t stop_bits, uint32_t rx_polarity) const {
+        if (rx_polarity > 1U)
+            return false;
         if (word_length != 0U && word_length != 7U && word_length != 8U)
             return false;
         if (parity != 0U && (parity < 1U || parity > 3U))
             return false;
         if (stop_bits != 0U && stop_bits != 1U && stop_bits != 2U)
             return false;
-        return true;
+        const uint32_t data_bits = word_length != 0U ? word_length : this->word_length();
+        const uint32_t parity_code = parity != 0U ? parity : this->parity();
+        return data_bits != 7U || parity_code != 1U;
     }
 
     // Commits a framing that check_framing() already accepted -- so there is no
@@ -81,28 +92,30 @@ public:
     // mechanical. M/PCE/PS/STOP are only writable with UE=0, so the write is
     // one down-then-up window; bytes arriving inside it are lost, and the host
     // is expected to quiesce the link first (same convention as the rate).
+    //
+    // M counts the whole frame (data + parity), so 8 data bits with even parity
+    // is a 9-bit frame (M=1) -- the WORDLENGTH_9B + PARITY_EVEN CubeMX gives
+    // DBUS. Word length and parity are therefore resolved together: a zero
+    // field stands for the port's current value.
     void commit_framing(uint32_t word_length, uint32_t parity, uint32_t stop_bits) {
-        uint32_t m_bits = 0;
-        if (word_length == 7U)
-            m_bits = USART_CR1_M;
+        const uint32_t data_bits = word_length != 0U ? word_length : this->word_length();
+        const uint32_t parity_code = parity != 0U ? parity : this->parity();
         uint32_t parity_bits = 0;
-        switch (parity) {
-        case 1U: parity_bits = 0U; break;                           // none
+        switch (parity_code) {
         case 2U: parity_bits = USART_CR1_PCE; break;                // even
         case 3U: parity_bits = USART_CR1_PCE | USART_CR1_PS; break; // odd
-        default: break;
+        default: break;                                             // none
         }
+        const uint32_t frame_bits = data_bits + (parity_bits != 0U ? 1U : 0U);
+        const uint32_t m_bits = frame_bits == 9U ? USART_CR1_M : 0U;
         uint32_t stop_reg = 0;
         if (stop_bits == 2U)
             stop_reg = USART_CR2_STOP_1;
 
         auto* instance = hal_uart_handle_->Instance;
-        uint32_t new_cr1 =
-            instance->CR1 & ~(USART_CR1_UE | USART_CR1_M | USART_CR1_PCE | USART_CR1_PS);
-        if (word_length != 0U)
-            new_cr1 |= m_bits;
-        if (parity != 0U)
-            new_cr1 |= parity_bits;
+        const uint32_t new_cr1 =
+            (instance->CR1 & ~(USART_CR1_UE | USART_CR1_M | USART_CR1_PCE | USART_CR1_PS)) | m_bits
+            | parity_bits;
 
         instance->CR1 = new_cr1 & ~USART_CR1_UE; // UE=0: framing fields writable
         if (stop_bits != 0U)
@@ -112,10 +125,12 @@ public:
 
     // ---- Read-back: decoded from the live registers, never the last request ----
 
+    // Data bits = the frame M gives (8 or 9) minus the parity bit. DBUS's 9-bit
+    // frame with even parity reads back as 8.
     [[nodiscard]] uint32_t word_length() const {
-        // F4 has a single M bit (7 = set, 8 = clear); 9-bit words are not
-        // reachable from this driver.
-        return (hal_uart_handle_->Instance->CR1 & USART_CR1_M) != 0U ? 7U : 8U;
+        const uint32_t cr1 = hal_uart_handle_->Instance->CR1;
+        const uint32_t frame_bits = (cr1 & USART_CR1_M) != 0U ? 9U : 8U;
+        return frame_bits - ((cr1 & USART_CR1_PCE) != 0U ? 1U : 0U);
     }
 
     [[nodiscard]] uint32_t parity() const {
@@ -128,6 +143,9 @@ public:
     [[nodiscard]] uint32_t stop_bits() const {
         return (hal_uart_handle_->Instance->CR2 & USART_CR2_STOP) == USART_CR2_STOP_1 ? 2U : 1U;
     }
+
+    // No RX inversion hardware: always normal (1).
+    [[nodiscard]] static uint32_t rx_polarity() { return 1U; }
 
     // The rate the port is ACTUALLY running, reconstructed from BRR rather than
     // from Init.BaudRate: the latter is only the last requested value, and a

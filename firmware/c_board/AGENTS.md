@@ -36,7 +36,11 @@ cmake --build firmware/c_board/build --target c_board_app c_board_bootloader
 
 - **UART 下标**：DBUS=0（huart3）、UART1=1（huart6）、UART2=2（huart1）；`uart_count=3`。
   速率一致性比 `BRR` 整数，USART1/USART6 走 APB2 84 MHz、其余 APB1 42 MHz。
-- **CAN 能力位全清**：bxCAN 无 FD，`kSetCanConfig` 只接受 classic 且速率/采样点字段须为 0。
+  F407 的 USART 没有 RX 反相位：`rx_polarity` 恒报 1（正常），请求 2（反相）即 STALL
+  `kConfigErrorFramingUnsupported`。DBUS 口只能接线上反相的 DBUS/SBUS，iBUS 要接 UART1/UART2。
+- **CAN 能力位全清**：bxCAN 无 FD，`kSetCanConfig` 只接受 classic。仲裁段速率/采样点由
+  `kGetCanConfig` 从 `BTR` 反推上报（1 Mbit/s、785‰），SET 中非零即核对、不符 STALL；
+  数据段字段恒报 0，SET 中须为 0。
 - **没做 EP0 握手的主机开不了 session**（与 hpm/mc02 同一道门）：主机 `CBoard` 在重连钩子里
   读 `kGetInterface`；旧版 SDK 连新固件会在 `SESSION_ACK` 超时。
 

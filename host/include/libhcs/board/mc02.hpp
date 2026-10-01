@@ -124,31 +124,54 @@ public:
         }
 
     public:
+        // One entry per kind with the port as its descriptor, like the GPIO callbacks: what code
+        // written for every board model overrides. The default fans out to the per-port
+        // callbacks above, which stay for code that handles one port by name.
+        virtual void can_receive_callback(const Spec::Can& can, const View::Can& data) {
+            switch (can.data_id) {
+            case data::DataId::kCan1: can1_receive_callback(data); break;
+            case data::DataId::kCan2: can2_receive_callback(data); break;
+            case data::DataId::kCan3: can3_receive_callback(data); break;
+            default: break;
+            }
+        }
+
         bool can_receive_callback(data::DataId id, const data::CanDataView& data) final {
-            switch (id) {
-            case data::DataId::kCan1: can1_receive_callback(data); return true;
-            case data::DataId::kCan2: can2_receive_callback(data); return true;
-            case data::DataId::kCan3: can3_receive_callback(data); return true;
-            default: return false;
+            const auto* can = Spec::kCans.find(id);
+            if (can == nullptr)
+                return false;
+            can_receive_callback(*can, data);
+            return true;
+        }
+
+        // Same shape as can_receive_callback(const Spec::Can&, ...).
+        virtual void uart_receive_callback(const Spec::Uart& uart, const View::Uart& data) {
+            switch (uart.data_id) {
+            case data::DataId::kUartDbus: dbus_receive_callback(data); break;
+            case data::DataId::kUart1: uart1_receive_callback(data); break;
+            case data::DataId::kUart2: uart2_receive_callback(data); break;
+            case data::DataId::kUart3: uart3_receive_callback(data); break;
+            case data::DataId::kUart7: uart7_receive_callback(data); break;
+            case data::DataId::kUart10: uart10_receive_callback(data); break;
+            default: break;
             }
         }
 
         bool uart_receive_callback(data::DataId id, const data::UartDataView& data) final {
-            switch (id) {
-            case data::DataId::kUartDbus: dbus_receive_callback(data); return true;
-            case data::DataId::kUart1: uart1_receive_callback(data); return true;
-            case data::DataId::kUart2: uart2_receive_callback(data); return true;
-            case data::DataId::kUart3: uart3_receive_callback(data); return true;
-            case data::DataId::kUart7: uart7_receive_callback(data); return true;
-            case data::DataId::kUart10: uart10_receive_callback(data); return true;
             // kUart0 is not a silkscreen UART on this board. Diagnostic builds
             // emit on it; accepting it matters because returning false makes the
             // deserializer treat the frame as a protocol error and tear the
             // session down, so a diagnostic build would kill the link it is meant
             // to be diagnosing.
-            case data::DataId::kUart0: diagnostic_receive_callback(data); return true;
-            default: return false;
+            if (id == data::DataId::kUart0) {
+                diagnostic_receive_callback(data);
+                return true;
             }
+            const auto* uart = Spec::kUarts.find(id);
+            if (uart == nullptr)
+                return false;
+            uart_receive_callback(*uart, data);
+            return true;
         }
 
         bool gpio_digital_read_result_callback(
@@ -197,6 +220,20 @@ public:
         friend class Mc02;
 
     public:
+        // Any port by its descriptor (Callback::Spec): the form code written for every board
+        // model uses.
+        PacketBuilder& can_transmit(
+            const Callback::Spec::Can& can, const libhcs::data::CanDataView& data) {
+            return can_transmit(hcs::can_port(can.data_id), data);
+        }
+
+        PacketBuilder& uart_transmit(
+            const Callback::Spec::Uart& uart, const libhcs::data::UartDataView& data) {
+            if (!builder_.write_uart(uart.data_id, data)) [[unlikely]]
+                throw std::invalid_argument{"UART transmission failed: Invalid UART data"};
+            return *this;
+        }
+
         // Transmits on the CAN port named as the enclosure labels it.
         // Ports on this board: CanPort::kCan1, CanPort::kCan2, CanPort::kCan3
         // (silkscreen CAN1..CAN3). Same entry point as every other board's, so
@@ -329,6 +366,44 @@ public:
     void configure_uart7(const hcs::UartSetting& setting) { configure_uart(4, setting); }
     void configure_uart10(const hcs::UartSetting& setting) { configure_uart(5, setting); }
     void configure_dbus(const hcs::UartSetting& setting) { configure_uart(0, setting); }
+
+    // The receivers the DBUS port takes. The port has an on-board inverter, so
+    // the inverted protocols (DBUS, SBUS) run at normal polarity at the MCU pin,
+    // and iBUS -- not inverted on the wire -- needs RXINV to cancel the
+    // inverter. Each preset sets every field, so switching receivers never
+    // inherits a field from the previous one.
+    enum class DbusReceiver : uint8_t {
+        kDbus, // DJI DR16 (DT7): 100000 8E1, inverted on the wire
+        kSbus, // S.BUS / WFLY W.BUS: 100000 8E2 on the wire, received as 8E1
+        kIbus, // FlySky iBUS: 115200 8N1, not inverted on the wire
+    };
+    static constexpr hcs::UartSetting dbus_receiver_setting(DbusReceiver receiver) {
+        // SBUS sends a second stop bit; the receiver only checks the first, so
+        // one preset serves both 100 kbaud protocols.
+        constexpr hcs::UartSetting k100kEven1{
+            .baudrate = 100000,
+            .word_length = hcs::vc::kUartWordLength8,
+            .parity = hcs::vc::kUartParityEven,
+            .stop_bits = hcs::vc::kUartStopBits1,
+            .rx_polarity = hcs::vc::kUartRxPolarityNormal,
+        };
+        switch (receiver) {
+        case DbusReceiver::kDbus:
+        case DbusReceiver::kSbus: return k100kEven1;
+        case DbusReceiver::kIbus:
+            return {
+                .baudrate = 115200,
+                .word_length = hcs::vc::kUartWordLength8,
+                .parity = hcs::vc::kUartParityNone,
+                .stop_bits = hcs::vc::kUartStopBits1,
+                .rx_polarity = hcs::vc::kUartRxPolarityInverted,
+            };
+        }
+        return k100kEven1;
+    }
+    void configure_dbus(DbusReceiver receiver) {
+        configure_uart(0, dbus_receiver_setting(receiver));
+    }
 
     // What each port is really running, reconstructed on the board from the
     // divisor actually programmed -- not the value that was last requested.

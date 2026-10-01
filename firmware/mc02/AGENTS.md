@@ -96,6 +96,12 @@ arm-none-eabi-nm firmware/mc02/build/app/mc02_app.elf | grep -c bmi088   # IMU: 
   先全量校验后统一提交，STALL 严格等于零改动；9 位字长不提供——RX 环是字节 DMA）。
   速率一致性比 `BRR` 整数（`divisor`，GET 回报、SET 回显即断言），不比波特率；写入后
   回读 `BRR` 不符报 `kConfigErrorVerifyFailed`。
+  **接收极性**（`rx_polarity`，指 MCU 引脚上的极性）走 CR2.RXINV，是四块板里唯一能反相的：
+  DBUS 口板上已有硬件反相器，所以 DBUS/SBUS（线上反相）用正常，iBUS（线上不反相）用反相
+  把反相器抵消掉。host 侧用 `Mc02::configure_dbus(Mc02::DbusReceiver::kDbus/kSbus/kIbus)`，
+  预设把每个字段都写满，换接收机不会继承上一个的设置 `[仅编译验证，未上板 2026-09-30]`。
+  「DBUS 口有板载反相器」是推断：固件从未开 RXINV，而开源 MC02 框架用同样的
+  `NO_INIT` 配置接收 DT7。
   payload 里的 CAN 仲裁/数据段速率与采样点字段是**核对不是配置**（位时序是本板
   实测整定值、速率由对端电机硬件决定，只能断言）。请求码与 payload 见
   [core vendor_control.hpp](../../core/include/libhcs/protocol/vendor_control.hpp)。

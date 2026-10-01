@@ -23,6 +23,10 @@
 //      restore path leans on.
 //   5. A rate the divisor solver cannot represent is rejected with the port
 //      untouched.
+//   6. CAN controller status is readable over EP0.
+//   7. The DBUS receiver presets switch RX polarity: iBUS sets RXINV (to cancel
+//      the port's on-board inverter), DBUS clears it again and leaves the port
+//      back at its firmware default (100000 8E1). Uses no wiring either.
 //
 // Needs one mc02 board (PID 0x0723). No CAN or UART wiring: every check is a
 // control transfer plus the board's own read-back. Pass a serial filter as
@@ -167,6 +171,42 @@ int main(int argc, char** argv) {
         // No CAN traffic ran here; what matters is that the request completes and
         // the counters are coherent (TEC/REC sane, rx counter present).
         check(status.rec <= 127U && status.tec <= 255U, "error counters read back in range");
+
+        std::printf("7. DBUS receiver presets switch RX polarity\n");
+        using hcs::vc::UartRxPolarity;
+        // Firmware default is CubeMX's WORDLENGTH_9B + PARITY_EVEN: a 9-bit frame
+        // that is 8 DATA bits plus parity. The protocol counts data bits.
+        const auto boot = board.read_uart_setting(0);
+        check(
+            boot.word_length == hcs::vc::UartWordLength::kUartWordLength8
+                && boot.parity == hcs::vc::UartParity::kUartParityEven,
+            "DBUS boots as 8 data bits + even parity (9-bit frame read back as 8E)");
+        board.configure_dbus(Mc02::DbusReceiver::kIbus);
+        const auto ibus = board.read_uart_setting(0); // EP0 index 0 = DBUS
+        std::printf(
+            "   iBUS: rate=%u parity=%u stop=%u rx_polarity=%u\n", ibus.baudrate,
+            std::to_underlying(ibus.parity), std::to_underlying(ibus.stop_bits),
+            std::to_underlying(ibus.rx_polarity));
+        check(
+            ibus.rx_polarity == UartRxPolarity::kUartRxPolarityInverted,
+            "iBUS preset sets RXINV (cancels the on-board inverter)");
+        check(within_tolerance(115200U, ibus.baudrate), "iBUS preset runs 115200");
+        check(ibus.parity == hcs::vc::UartParity::kUartParityNone, "iBUS preset has no parity");
+
+        board.configure_dbus(Mc02::DbusReceiver::kDbus);
+        const auto dbus = board.read_uart_setting(0);
+        std::printf(
+            "   DBUS: rate=%u parity=%u stop=%u rx_polarity=%u\n", dbus.baudrate,
+            std::to_underlying(dbus.parity), std::to_underlying(dbus.stop_bits),
+            std::to_underlying(dbus.rx_polarity));
+        check(
+            dbus.rx_polarity == UartRxPolarity::kUartRxPolarityNormal,
+            "DBUS preset clears RXINV again");
+        check(within_tolerance(100000U, dbus.baudrate), "DBUS preset runs 100000");
+        check(dbus.parity == hcs::vc::UartParity::kUartParityEven, "DBUS preset has even parity");
+        check(
+            dbus.word_length == hcs::vc::UartWordLength::kUartWordLength8,
+            "DBUS preset keeps 8 data bits (not 7 + parity)");
 
         std::printf("%s (%d failure%s)\n", g_failures == 0 ? "ALL PASSED" : "FAILED", g_failures,
                     g_failures == 1 ? "" : "s");
