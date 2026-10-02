@@ -168,6 +168,14 @@ public:
     virtual bool try_recover_link() { return false; }
 
     /**
+     * @brief Serial number of the device on the other end, or empty if it has none.
+     *
+     * Fixed for the lifetime of the transport: a reconnect only ever re-opens the
+     * same device. Used to tell the log lines of several boards apart.
+     */
+    virtual std::string_view serial() const noexcept { return {}; }
+
+    /**
      * @brief Whether the link has failed beyond local repair.
      *
      * A faulted transport accepts no further traffic: transmits are dropped and

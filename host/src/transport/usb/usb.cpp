@@ -76,8 +76,7 @@ public:
     explicit Usb(
         uint16_t usb_vid, std::span<const uint16_t> usb_pids, std::string_view serial_filter,
         const ConnectionOptions& options)
-        : logger_(logging::get_logger())
-        , free_transmit_transfers_(kTransmitTransferCount) {
+        : free_transmit_transfers_(kTransmitTransferCount) {
 
         usb_init(usb_vid, usb_pids, serial_filter, options);
         utility::FinalAction rollback_on_failure{[this]() noexcept {
@@ -528,6 +527,8 @@ public:
         return link_faulted_.load(std::memory_order::relaxed);
     }
 
+    std::string_view serial() const noexcept override { return serial_; }
+
 private:
     // Bring every outstanding transfer home and let the device go, WITHOUT
     // touching the libusb context or the event thread polling it. That is the
@@ -897,6 +898,9 @@ private:
         }
 
         serial_ = read_serial(libusb_device_handle_);
+        // Still single-threaded here: the event thread is started by the
+        // constructor only after usb_init() returns.
+        logger_.set_source(serial_);
 
         // Control plane on its own libusb context. EP0 exchanges (the
         // construction-time channel configuration, the before-session hook on
@@ -1715,7 +1719,9 @@ private:
     // Harmless for FS/HS boards (just a little more pinned buffer memory).
     static constexpr size_t kReceiveTransferCount = 16;
 
-    logging::Logger& logger_;
+    // Untagged until usb_init() has read the serial number; every line after
+    // that names the board it is about.
+    logging::Logger logger_;
 
     // Null unless libhcs_USB_RX_HISTOGRAM=1; indexed by completion length.
     std::unique_ptr<std::atomic<uint32_t>[]> rx_length_histogram_;

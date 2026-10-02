@@ -87,7 +87,8 @@ public:
         , expected_session_nonce_(generate_session_nonce())
         , time_sync_enabled_(enable_time_sync)
         , expected_session_start_ack_(make_session_start_ack(expected_session_nonce_))
-        , transport_(std::move(transport)) {
+        , transport_(std::move(transport))
+        , logger_(transport_->serial()) {
         // USB bulk completions are arbitrary slices of one reliable byte
         // stream, not protocol-field boundaries.
         transport_->receive([this](std::span<const std::byte> buffer) { receive_stream(buffer); });
@@ -206,7 +207,7 @@ public:
         if (!session_established())
             return true;
         if (!guard_callback([&] { return callback_.can_receive_callback(id, data); })) {
-            logging::get_logger().error("Unexpected can field id: ", static_cast<int>(id));
+            logger_.error("Unexpected can field id: {}", static_cast<int>(id));
             return false;
         }
         return true;
@@ -217,7 +218,7 @@ public:
         if (!session_established())
             return true;
         if (!guard_callback([&] { return callback_.uart_receive_callback(id, data); })) {
-            logging::get_logger().error("Unexpected uart field id: ", static_cast<int>(id));
+            logger_.error("Unexpected uart field id: {}", static_cast<int>(id));
             return false;
         }
         return true;
@@ -231,8 +232,7 @@ public:
         (void)data;
         if (!session_established())
             return true;
-        logging::get_logger().error(
-            "Unexpected uart config field on uplink: ", static_cast<int>(id));
+        logger_.error("Unexpected uart config field on uplink: {}", static_cast<int>(id));
         return false;
     }
 
@@ -242,8 +242,7 @@ public:
             return true;
         if (!guard_callback(
                 [&] { return callback_.gpio_digital_read_result_callback(channel_index, data); })) {
-            logging::get_logger().error(
-                "Unexpected gpio channel index: ", static_cast<int>(channel_index));
+            logger_.error("Unexpected gpio channel index: {}", static_cast<int>(channel_index));
             return false;
         }
         return true;
@@ -255,8 +254,7 @@ public:
             return true;
         if (!guard_callback(
                 [&] { return callback_.gpio_analog_read_result_callback(channel_index, data); })) {
-            logging::get_logger().error(
-                "Unexpected gpio channel index: ", static_cast<int>(channel_index));
+            logger_.error("Unexpected gpio channel index: {}", static_cast<int>(channel_index));
             return false;
         }
         return true;
@@ -268,7 +266,7 @@ public:
             return true;
         (void)channel_index;
         (void)data;
-        logging::get_logger().error("Unexpected gpio digital read config field in uplink");
+        logger_.error("Unexpected gpio digital read config field in uplink");
         return false;
     }
 
@@ -278,7 +276,7 @@ public:
             return true;
         (void)channel_index;
         (void)data;
-        logging::get_logger().error("Unexpected gpio analog read config field in uplink");
+        logger_.error("Unexpected gpio analog read config field in uplink");
         return false;
     }
 
@@ -354,7 +352,7 @@ public:
     }
 
     void error_callback() override {
-        logging::get_logger().error("Deserializer encountered an error while parsing input");
+        logger_.error("Deserializer encountered an error while parsing input");
     }
 
 private:
@@ -586,7 +584,7 @@ private:
         // Deliberately not fatal, unlike the keepalive: a dropped anchor costs
         // one period of timeline convergence, never the session.
         if (result == core::protocol::Serializer::SerializeResult::kBadAlloc) [[unlikely]] {
-            logging::get_logger().error("Failed to transmit Time Anchor: transmit buffer full");
+            logger_.error("Failed to transmit Time Anchor: transmit buffer full");
             return;
         }
         // Stored only after the anchor actually went out. A kTimeStatus that
@@ -654,7 +652,7 @@ private:
         // The 1st, 2nd, 4th, 8th ... failure. A board that is simply unplugged
         // fails every attempt forever, and that must not bury the log.
         if (logging::should_log_occurrence(consecutive_session_failures_))
-            logging::get_logger().error(
+            logger_.error(
                 "Failed to refresh session ({} in a row): {}. Link recovery {}; retrying.",
                 consecutive_session_failures_, exception.what(),
                 recovered ? "attempted" : "not available");
@@ -670,7 +668,7 @@ private:
         // A function-try-block, because this one runs on the catch path of a
         // thread whose escaping exception used to be the std::terminate() this
         // whole change removes. Nothing here may throw its way out.
-        logging::get_logger().error("While handling a session failure: {}", nested.what());
+        logger_.error("While handling a session failure: {}", nested.what());
     }
 
     static uint32_t generate_session_nonce() {
@@ -700,6 +698,10 @@ private:
 
     std::function<void()> before_session_;
     std::unique_ptr<transport::Transport> transport_;
+
+    // Declared after transport_, which it is built from: every line this
+    // handler logs carries the serial number of its own board.
+    logging::Logger logger_;
 
     // Keepalive thread only; reset by the first pass that gets through cleanly.
     uint64_t consecutive_session_failures_ = 0;

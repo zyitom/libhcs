@@ -1,27 +1,32 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
-#include <chrono>
+#include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <format>
 #include <string_view>
 #include <utility>
+
+#include <libhcs/logging.hpp>
 
 #include "core/src/utility/assert.hpp"
 
 namespace libhcs::host::logging {
 
-enum class Level : std::uint8_t {
-    kTrace = 0,
-    kDebug = 1,
-    kInfo = 2,
-    kWarn = 3,
-    kErr = 4,
-    kCritical = 5,
-    kOff = 6,
-};
+namespace detail {
+
+// The application's sink, or nullptr for the built-in stderr output. Written by
+// set_sink(), read on every log line. One pointer, so installing and reading it
+// are each a single atomic access with nothing to tear against.
+inline constinit std::atomic<Sink*> active_sink{nullptr};
+
+// Hands one finished line (prefix and newline included) to stderr without ever
+// waiting for it; see logging.cpp.
+void write_stderr_line(std::string_view line) noexcept;
+
+} // namespace detail
 
 #ifndef libhcs_LOGGING_LEVEL
 # define libhcs_LOGGING_LEVEL kInfo
@@ -41,100 +46,113 @@ constexpr bool should_log_occurrence(std::uint64_t count) noexcept {
     return count != 0 && (count & (count - 1U)) == 0U;
 }
 
+/**
+ * @brief Formats log lines and hands them to whichever output is current.
+ *
+ * A small value, not a singleton: each transport owns one that carries its
+ * board's serial number, so that with several boards in a process a line says
+ * which of them it is about. Code with no board to speak for uses get_logger().
+ *
+ * Logging is const and keeps no state between lines, so one Logger may be used
+ * from any number of threads at once. set_source() is the exception: call it
+ * before the object is shared.
+ */
 class Logger {
 public:
     static constexpr Level kLoggingLevel = Level::libhcs_LOGGING_LEVEL;
 
-    Logger(const Logger&) = delete;
-    Logger& operator=(const Logger&) = delete;
-    Logger(Logger&&) = delete;
-    Logger& operator=(Logger&&) = delete;
-    ~Logger() = default;
+    // Long enough for the serial numbers these boards report; a longer one is
+    // cut, which still tells boards apart.
+    static constexpr std::size_t kSourceCapacity = 32;
 
-public: // Singleton
-    static Logger& get_instance() noexcept {
-        static Logger logger{};
-        return logger;
+    constexpr Logger() noexcept = default;
+
+    explicit constexpr Logger(std::string_view source) noexcept { set_source(source); }
+
+    constexpr void set_source(std::string_view source) noexcept {
+        source_size_ = static_cast<std::uint8_t>(std::min(source.size(), source_.size()));
+        std::copy_n(source.data(), source_size_, source_.data());
     }
 
-public: // Logging
-    static constexpr bool should_log(Level level) { return level >= kLoggingLevel; }
+    [[nodiscard]] constexpr std::string_view source() const noexcept {
+        return {source_.data(), source_size_};
+    }
+
+    static constexpr bool should_log(Level level) noexcept { return level >= kLoggingLevel; }
 
 public: // Logging.Formatted
     template <typename... Args>
-    void trace(std::format_string<Args...> fmt, Args&&... args) {
+    void trace(std::format_string<Args...> fmt, Args&&... args) const {
         log_internal(Level::kTrace, fmt, std::forward<Args>(args)...);
     }
 
     template <typename... Args>
-    void debug(std::format_string<Args...> fmt, Args&&... args) {
+    void debug(std::format_string<Args...> fmt, Args&&... args) const {
         log_internal(Level::kDebug, fmt, std::forward<Args>(args)...);
     }
 
     template <typename... Args>
-    void info(std::format_string<Args...> fmt, Args&&... args) {
+    void info(std::format_string<Args...> fmt, Args&&... args) const {
         log_internal(Level::kInfo, fmt, std::forward<Args>(args)...);
     }
 
     template <typename... Args>
-    void warn(std::format_string<Args...> fmt, Args&&... args) {
+    void warn(std::format_string<Args...> fmt, Args&&... args) const {
         log_internal(Level::kWarn, fmt, std::forward<Args>(args)...);
     }
 
     template <typename... Args>
-    void error(std::format_string<Args...> fmt, Args&&... args) {
+    void error(std::format_string<Args...> fmt, Args&&... args) const {
         log_internal(Level::kErr, fmt, std::forward<Args>(args)...);
     }
 
     template <typename... Args>
-    void critical(std::format_string<Args...> fmt, Args&&... args) {
+    void critical(std::format_string<Args...> fmt, Args&&... args) const {
         log_internal(Level::kCritical, fmt, std::forward<Args>(args)...);
     }
 
     template <typename... Args>
-    void log(Level level, std::format_string<Args...> fmt, Args&&... args) {
+    void log(Level level, std::format_string<Args...> fmt, Args&&... args) const {
         log_internal(level, fmt, std::forward<Args>(args)...);
     }
 
 public: // Logging.Raw
     template <typename T>
-    void trace(const T& msg) {
+    void trace(const T& msg) const {
         log_internal(Level::kTrace, msg);
     }
 
     template <typename T>
-    void debug(const T& msg) {
+    void debug(const T& msg) const {
         log_internal(Level::kDebug, msg);
     }
 
     template <typename T>
-    void info(const T& msg) {
+    void info(const T& msg) const {
         log_internal(Level::kInfo, msg);
     }
 
     template <typename T>
-    void warn(const T& msg) {
+    void warn(const T& msg) const {
         log_internal(Level::kWarn, msg);
     }
 
     template <typename T>
-    void error(const T& msg) {
+    void error(const T& msg) const {
         log_internal(Level::kErr, msg);
     }
 
     template <typename T>
-    void critical(const T& msg) {
+    void critical(const T& msg) const {
         log_internal(Level::kCritical, msg);
     }
 
     template <typename T>
-    void log(Level level, const T& msg) {
+    void log(Level level, const T& msg) const {
         log_internal(level, msg);
     }
 
 private:
-    constexpr Logger() noexcept = default;
-
     static constexpr std::string_view level_name(Level level) {
         if (level == Level::kTrace)
             return "trace";
@@ -151,15 +169,16 @@ private:
         core::utility::assert_failed_debug();
     }
 
-    // One line, one write. stderr is unbuffered, so the previous prefix-write
-    // plus println-write pair was two write(2) syscalls per line, and two
-    // threads logging concurrently tore each other's lines apart mid-line.
-    // Formatting into a single stack buffer and emitting it with one fwrite
-    // costs no lock and no allocation on the caller, and the kernel delivers
-    // each write() whole. Longer messages truncate: a log line is not a
-    // storage format.
+    // The line is formatted here, on the caller's thread, into a stack buffer:
+    // no lock, no allocation, and whoever receives it gets it in one piece.
+    // Longer messages truncate: a log line is not a storage format.
+    //
+    // Formatting is all this template does. Where the line goes is decided by
+    // the two branches below, and neither of them may make this thread wait --
+    // a sink by contract (libhcs/logging.hpp), stderr by construction
+    // (write_stderr_line).
     template <typename... Args>
-    void log_internal(Level level, std::format_string<Args...> fmt, Args&&... args) {
+    void log_internal(Level level, std::format_string<Args...> fmt, Args&&... args) const {
         if (!should_log(level))
             return;
 
@@ -167,53 +186,45 @@ private:
         // are emitted, so a zero-fill would be a 1 KiB memset per log line
         // bought for nothing.
         std::array<char, 1024> line;
-        const auto prefix =
-            std::format_to_n(line.data(), line.size() - 1, "[libhcs] [{}] ", level_name(level));
-        const auto remaining = static_cast<std::size_t>(line.data() + line.size() - 1 - prefix.out);
-        const auto message =
-            std::format_to_n(prefix.out, remaining, fmt, std::forward<Args>(args)...);
-        *message.out = '\n';
-        // A failed write to stderr has nowhere left to be reported.
-        const auto started = std::chrono::steady_clock::now();
-        (void)std::fwrite(
-            line.data(), 1, static_cast<std::size_t>(message.out - line.data()) + 1, stderr);
-        note_slow_stderr_write(std::chrono::steady_clock::now() - started);
+        char* const end = line.data() + line.size() - 1; // room for the newline
+
+        // Loaded once: a set_sink() racing with this line must not make it
+        // format for one destination and deliver to the other.
+        if (Sink* const sink = detail::active_sink.load(std::memory_order::acquire)) {
+            const auto message =
+                std::format_to_n(line.data(), end - line.data(), fmt, std::forward<Args>(args)...);
+            sink->write(
+                Record{
+                    .level = level,
+                    .source = source(),
+                    .message = std::string_view{line.data(), message.out}
+            });
+            return;
+        }
+
+        char* out =
+            std::format_to_n(line.data(), end - line.data(), "[libhcs] [{}] ", level_name(level))
+                .out;
+        if (source_size_ != 0)
+            out = std::format_to_n(out, end - out, "[{}] ", source()).out;
+        out = std::format_to_n(out, end - out, fmt, std::forward<Args>(args)...).out;
+        *out++ = '\n';
+        detail::write_stderr_line(std::string_view{line.data(), out});
     }
 
     template <typename T>
-    void log_internal(Level level, const T& msg) {
+    void log_internal(Level level, const T& msg) const {
         log_internal(level, "{}", msg);
     }
 
-private:
-    // Best-effort evidence, not a fix. stderr pointed at a pipe whose reader is
-    // gone blocks write(2) forever, and the blocked thread is usually the libusb
-    // event thread -- the whole link dies silently behind it. Nothing logged
-    // from here can prevent that (this line's own fwrite blocks the same way),
-    // but the slow-but-alive cases -- a full disk, a throttled journald -- now
-    // leave a throttled line naming the delay instead of nothing at all.
-    static constexpr auto kSlowWriteThreshold = std::chrono::milliseconds{100};
-
-    static void note_slow_stderr_write(std::chrono::steady_clock::duration elapsed) noexcept {
-        if (elapsed < kSlowWriteThreshold)
-            return;
-        static std::atomic<std::uint64_t> occurrences{0};
-        const auto count = occurrences.fetch_add(1, std::memory_order::relaxed) + 1;
-        if (!should_log_occurrence(count))
-            return;
-        std::array<char, 160> line;
-        const auto result = std::format_to_n(
-            line.data(), line.size(),
-            "[libhcs] stderr write took {:.1f} ms (x{}); the logging thread is stalled by a "
-            "backed-up stderr\n",
-            std::chrono::duration<double, std::milli>(elapsed).count(), count);
-        // result.out, not result.size: size is the untruncated length, and a
-        // message longer than the buffer would make fwrite read past its end.
-        (void)std::fwrite(
-            line.data(), 1, static_cast<std::size_t>(result.out - line.data()), stderr);
-    }
+    std::array<char, kSourceCapacity> source_{};
+    std::uint8_t source_size_ = 0;
 };
 
-inline Logger& get_logger() { return Logger::get_instance(); }
+/// The logger for lines that are not about any one board.
+[[nodiscard]] inline const Logger& get_logger() noexcept {
+    static constinit const Logger logger{};
+    return logger;
+}
 
 } // namespace libhcs::host::logging
