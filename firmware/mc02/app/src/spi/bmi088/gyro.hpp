@@ -9,12 +9,12 @@
 
 #include "core/src/protocol/serializer.hpp"
 #include "core/src/utility/assert.hpp"
+#include "firmware/common/app/src/utility/interrupt_lock.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 #include "firmware/mc02/app/src/spi/bmi088/base.hpp"
 #include "firmware/mc02/app/src/spi/spi.hpp"
 #include "firmware/mc02/app/src/timer/timer.hpp"
 #include "firmware/mc02/app/src/usb/vendor.hpp"
-#include "firmware/mc02/app/src/utility/interrupt_lock.hpp"
-#include "firmware/mc02/app/src/utility/lazy.hpp"
 
 namespace libhcs::firmware::spi::bmi088 {
 
@@ -65,41 +65,47 @@ public:
         k100And32 = 0x07,
     };
 
-    explicit Gyroscope(
-        Spi::Lazy* spi, Range range = Range::k2000,
-        DataRateAndBandwidth rate = DataRateAndBandwidth::k2000And230)
-        : Bmi088Base(spi, CS1_GYRO_GPIO_Port, CS1_GYRO_Pin) {
+    // 构造不碰芯片: 传感器只在主机声明了板载 IMU 之后才初始化(configure(), 由
+    // service.hpp 的 start() 调用)。上电后的陀螺仪没开新数据中断, 不出数据就绪脉冲。
+    explicit Gyroscope(Spi::Lazy* spi)
+        : Bmi088Base(spi, CS1_GYRO_GPIO_Port, CS1_GYRO_Pin) {}
 
+    // 复位芯片、按给定量程与输出速率/带宽配置, 每个寄存器写后回读。阻塞约 35 ms
+    // (复位后要等 30 ms), 只在主循环调用(EP0 处理器)。任何一步对不上即返回 false。
+    [[nodiscard]] bool configure(Range range, DataRateAndBandwidth rate) {
         using namespace std::chrono_literals;
 
-        core::utility::assert_debug(spi_.try_lock());
+        if (!lock_bus())
+            return false;
 
         // 复位所有寄存器。
         write_register(RegisterAddress::kGyroSoftReset, 0xB6);
         timer::timer->spin_wait(30ms);
 
-        // "Who am I" 芯片 ID 校验。
-        core::utility::assert_always(read_and_confirm(RegisterAddress::kGyroChipId, 0x0F));
-
-        // 使能新数据中断。
-        core::utility::assert_always(write_and_confirm(RegisterAddress::kGyroIntCtrl, 0x80));
-
-        // INT3/INT4 均配为推挽, 低有效。
-        core::utility::assert_always(write_and_confirm(RegisterAddress::kInt3Int4IoConf, 0b0000));
-        // 数据就绪中断映射到 INT3。
-        core::utility::assert_always(write_and_confirm(RegisterAddress::kInt3Int4IoMap, 0x01));
-
-        // 设置 ODR 与滤波带宽。
-        core::utility::assert_always(
-            write_and_confirm(RegisterAddress::kGyroBandwidth, 0x80 | static_cast<uint8_t>(rate)));
-        // 设置量程。
-        core::utility::assert_always(
-            write_and_confirm(RegisterAddress::kGyroRange, static_cast<uint8_t>(range)));
-
-        // 切到 normal 模式。
-        core::utility::assert_always(write_and_confirm(RegisterAddress::kGyroLpm1, 0x00));
+        const bool configured =
+            // "Who am I" 芯片 ID 校验。
+            read_and_confirm(RegisterAddress::kGyroChipId, 0x0F)
+            // 使能新数据中断。
+            && write_and_confirm(RegisterAddress::kGyroIntCtrl, 0x80)
+            // INT3/INT4 均配为推挽, 低有效。
+            && write_and_confirm(RegisterAddress::kInt3Int4IoConf, 0b0000)
+            // 数据就绪中断映射到 INT3。
+            && write_and_confirm(RegisterAddress::kInt3Int4IoMap, 0x01)
+            // 设置 ODR 与滤波带宽。
+            && write_and_confirm(RegisterAddress::kGyroBandwidth, 0x80 | static_cast<uint8_t>(rate))
+            // 设置量程。
+            && write_and_confirm(RegisterAddress::kGyroRange, static_cast<uint8_t>(range))
+            // 切到 normal 模式。
+            && write_and_confirm(RegisterAddress::kGyroLpm1, 0x00);
 
         spi_.unlock();
+        return configured;
+    }
+
+    // 丢掉还没服务的数据就绪记录(停止时调用)。
+    void drop_pending() {
+        const utility::InterruptLockGuard guard;
+        has_pending_capture_timestamp_ = false;
     }
 
     void data_ready_callback(uint32_t capture_timestamp_quarter_us) {
@@ -109,6 +115,10 @@ public:
     }
 
     bool service_pending_read() {
+        // 先不关中断看一眼: 绝大多数趟主循环没有新样本, 不必为此关、开一次中断。
+        // 看的瞬间中断刚好置位也无妨, 下一趟就服务到了。
+        if (!has_pending_capture_timestamp_)
+            return false;
         const utility::InterruptLockGuard guard;
         if (!has_pending_capture_timestamp_)
             return false;
@@ -154,7 +164,9 @@ private:
 
     uint32_t pending_capture_timestamp_quarter_us_ = 0;
     std::atomic<uint32_t> active_capture_timestamp_quarter_us_{0};
-    bool has_pending_capture_timestamp_ = false;
+    // 数据就绪中断置位、主循环清除; 两边改它时都关着中断。volatile: 主循环不关中断的
+    // 那次预读必须每趟真的去读。
+    volatile bool has_pending_capture_timestamp_ = false;
     std::atomic<bool> has_active_capture_timestamp_{false};
 };
 

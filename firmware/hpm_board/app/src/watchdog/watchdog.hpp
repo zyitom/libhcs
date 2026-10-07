@@ -7,7 +7,7 @@
 #include <hpm_soc.h>
 
 #include "core/src/utility/assert.hpp"
-#include "firmware/hpm_board/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 
 namespace libhcs::firmware::watchdog {
 

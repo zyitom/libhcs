@@ -40,6 +40,16 @@ bool bootloader_check_bootloader_force_stay_requested() {
 int main() {
     HAL_Init();
     SystemClock_Config();
+
+    // ART 加速器(FLASH_ACR 的预取与指令缓存位复位后为 0, CubeMX 只写了 LATENCY):
+    // 168 MHz 下 5 WS 的取指等待全走缓存与预取, DFU 期间与镜像校验(SHA-256 全程读
+    // FLASH)都受益。不开数据缓存: flash 编程后回读会命中 D-cache 里的旧行, 而本镜像
+    // 没有 DMA 流量, 开它只有风险没有收益。跳转 app 前不需要清缓存 -- I-cache 里只有
+    // bootloader 自己的地址(0x08000000 段), 与 app 的 0x08010000 段不相交; 数据侧
+    // 本来就没缓存。app 侧自行再开缓存(app.cpp, 幂等)。
+    __HAL_FLASH_PREFETCH_BUFFER_ENABLE();
+    __HAL_FLASH_INSTRUCTION_CACHE_ENABLE();
+
     MX_GPIO_Init();
 
     const bool force_stay = bootloader_check_bootloader_force_stay_requested();

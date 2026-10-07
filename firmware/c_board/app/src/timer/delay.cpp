@@ -8,14 +8,12 @@
 
 namespace libhcs::firmware::timer {
 
-// Rewrite the Hal_Delay function to ensure that it works when interrupts are disabled,
-// while significantly improving accuracy.
+// 重写 HAL_Delay, 保证它在关中断时也能工作, 同时大幅提高精度。
 extern "C" void HAL_Delay(uint32_t delay) {
     timer::timer->spin_wait(timer::Timer::to_duration48_checked(std::chrono::milliseconds(delay)));
 }
 
-// Hack this useless function to perform regular low-priority tasks, eliminating the need for a
-// dedicated timer peripheral.
+// 把这个没有用处的函数改造成周期性执行低优先级任务的地方, 省下一个专用定时器外设。
 extern "C" void HAL_IncTick() {
     const uint32_t tick = uwTick + 1;
     uwTick = tick;

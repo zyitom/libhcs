@@ -1,5 +1,8 @@
 #include "firmware/mc02/app/src/app.hpp"
 
+#include <cstddef>
+#include <cstdint>
+
 #include <bdma.h>
 #include <device/usbd.h>
 #include <dma.h>
@@ -10,24 +13,29 @@
 #include <tim.h>
 #include <usart.h>
 
+#include "core/src/utility/assert.hpp"
+#include "firmware/common/app/src/utility/interrupt_lock.hpp"
+#include "firmware/mc02/app/src/buzzer/buzzer.hpp"
 #include "firmware/mc02/app/src/can/can.hpp"
 #include "firmware/mc02/app/src/diag/can_diag.hpp"
 #include "firmware/mc02/app/src/diag/loop_profile.hpp"
 #include "firmware/mc02/app/src/gpio/gpio.hpp"
 #include "firmware/mc02/app/src/key/key.hpp"
 #include "firmware/mc02/app/src/led/led.hpp"
+#include "firmware/mc02/app/src/ports.hpp"
 #include "firmware/mc02/app/src/power/power.hpp"
 #include "firmware/mc02/app/src/spi/bmi088/accel.hpp"
 #include "firmware/mc02/app/src/spi/bmi088/gyro.hpp"
 #include "firmware/mc02/app/src/spi/bmi088/service.hpp"
 #include "firmware/mc02/app/src/spi/bmi088/temperature.hpp"
 #include "firmware/mc02/app/src/sync/sof.hpp"
+#include "firmware/mc02/app/src/sync/sof_capture.hpp"
 #include "firmware/mc02/app/src/sync/timebase.hpp"
 #include "firmware/mc02/app/src/timer/timer.hpp"
 #include "firmware/mc02/app/src/uart/uart.hpp"
 #include "firmware/mc02/app/src/usb/vendor.hpp"
 #include "firmware/mc02/app/src/utility/boot_mailbox.hpp"
-#include "firmware/mc02/app/src/utility/interrupt_lock.hpp"
+#include "firmware/mc02/app/src/utility/loop_work.hpp"
 #include "firmware/mc02/app/src/watchdog/watchdog.hpp"
 
 int main() {
@@ -50,7 +58,7 @@ extern uint32_t _sid2sram, _sd2sram, _ed2sram;
 
 namespace {
 
-// 把存放 UART 端口对象的 D2 SRAM 区设为非缓存, 与 MPU_Config() 对 AXI SRAM 前
+// 把存放 UART 的 DMA 环形队列的 D2 SRAM 区设为非缓存, 与 MPU_Config() 对 AXI SRAM 前
 // 32 KB 的做法一致。
 //
 // 0x30000000 落在 Cortex-M7 默认内存映射的 SRAM 区, 属 Normal write-back
@@ -79,6 +87,31 @@ void configure_d2_sram_mpu_region() {
     HAL_MPU_Enable(MPU_HFNMI_PRIVDEF);
 }
 
+// ---- 中断向量表放在 DTCM ----
+//
+// 引导程序跳进来时向量表在 FLASH(main() 设的 VTOR = 0x08040000): 每次进中断先从
+// FLASH 取入口地址, 指令/数据缓存被 USB 流量挤掉后还要走 AXI 与 FLASH 等待周期, 中断
+// 入口的延迟随之抖动。表复制到零等待、CPU 私有的 DTCM 后, 取向量不再碰总线; FDCAN 的
+// 三条接收中断同时改指向 ITCM 里的处理器(can::install_interrupt_vectors)。
+//
+// 表长: 16 个系统异常 + 外设中断(TIM24_IRQn 是 H723 的最后一个)。VTOR 要求表按其长度
+// 向上取整到 2 的幂对齐: 179 项 716 字节, 对齐 1024。
+constexpr std::size_t kVectorCount = 16U + static_cast<std::size_t>(TIM24_IRQn) + 1U;
+static_assert(kVectorCount * sizeof(uint32_t) <= 1024U);
+// 子段 .dtcm.vectors: 链接脚本的 *(.dtcm*) 收进 DTCM; 与 .dtcm 里带初值的对象分开命名,
+// 免得零初始化的表与它们在同一个输入段里类型冲突。
+alignas(1024) [[gnu::section(".dtcm.vectors")]] uint32_t g_vectors[kVectorCount];
+
+void relocate_vector_table() {
+    const auto* flash_vectors = reinterpret_cast<const uint32_t*>(SCB->VTOR);
+    for (std::size_t i = 0; i < kVectorCount; ++i)
+        g_vectors[i] = flash_vectors[i];
+    can::install_interrupt_vectors(g_vectors);
+    SCB->VTOR = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(g_vectors));
+    __DSB();
+    __ISB();
+}
+
 } // namespace
 
 App::App() {
@@ -93,8 +126,11 @@ App::App() {
     // AXI 总线。必须在下方 usb/can 初始化之前执行。
     for (uint32_t *dst = &_sdtcm, *src = &_sidtcm; dst < &_edtcm;)
         *dst++ = *src++;
+    // 向量表搬进 DTCM。必须在上面的 DTCM 复制之后(那次复制会把表冲成零), 在任何中断
+    // 打开之前(本作用域关着中断, HAL_Init 的 SysTick 在后面)。
+    relocate_vector_table();
 
-    // UART 端口对象与其 DMA 环形队列放进 D2 SRAM, 紧邻驱动它们的 DMA1 流
+    // UART 的 DMA 环形队列放进 D2 SRAM, 紧邻驱动它们的 DMA1 流(端口对象本身在 DTCM)
     // (见 uart.hpp 与链接脚本的 .d2_sram 段)。先开时钟: 本芯片 RCC_AHB2ENR 复位值
     // 中 D2 SRAM 使能位为 0, 不先开时钟下面的复制会写进被门控的内存。趁缓存未开
     // 执行还意味着复制直达内存 -- configure_d2_sram_mpu_region() 尚未运行, 该区
@@ -118,10 +154,13 @@ App::App() {
     SCB_EnableDCache();
     HAL_Init();
     SystemClock_Config();
-    // 启用 PLL2(80 MHz)作 FDCAN 内核时钟, 支撑 1 Mbit/s 仲裁 + 5 Mbit/s 的
-    // CAN-FD 数据段; 启用 PLL3(96 MHz)作 USART2/3/4/5/7/8 组的内核时钟
-    // -- 96 MHz 可被 4.8 M、4 M、2 M 与 100 k 整除, 这些端口的所有波特率都落在
-    // 零误差的整数 BRR 上。由 .ioc 生成; app.cpp 取代了 CubeMX 的 main(), 必须在此调用。
+    // 外设内核时钟全部来自 24 MHz 晶振:
+    //   PLL2Q 80 MHz   FDCAN, 1 Mbit/s 仲裁 + 5 Mbit/s 数据段各 16 tq
+    //   PLL2P 120 MHz  SPI1/2/3(BMI088 在 SPI2, /16 = 7.5 MHz)与 ADC
+    //   PLL3Q 48 MHz   USB 与全部串口。48 MHz 整除 100 k / 1 M / 2 M / 4 M / 4.8 M / 6 M;
+    //                  16 倍过采样上限 3 Mbit/s, 默认 4.8 Mbit/s 的两个 RS-485 口
+    //                  (USART2/3)因此在 .ioc 里设为 8 倍过采样
+    // 由 .ioc 生成; app.cpp 取代了 CubeMX 的 main(), 必须在此调用。
     PeriphCommonClock_Config();
 
     utility::boot_mailbox.clear();
@@ -134,33 +173,13 @@ App::App() {
     DWT->CYCCNT = 0;
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
-    RCC_PeriphCLKInitTypeDef usb_clk = {};
-    usb_clk.PeriphClockSelection = RCC_PERIPHCLK_USB;
-    usb_clk.UsbClockSelection = RCC_USBCLKSOURCE_HSI48;
-    if (HAL_RCCEx_PeriphCLKConfig(&usb_clk) != HAL_OK)
-        Error_Handler();
+    // USB 内核时钟是 PLL3Q 48 MHz, 与全部串口同源, 来自 24 MHz 晶振; 选择由 .ioc 生成的
+    // PeriphCommonClock_Config() 完成。原先是自由振荡的 HSI48 加 CRS 锁到主机 SOF:
+    // HSI48 全温度范围误差 -4.5% .. +3.5%(DS13313 Table 35), USB 全速只容许 +-0.25%,
+    // 而 CRS 要先收到 SOF 才能校准 -- 板子热态下重新枚举没有保证。晶振给的时钟从
+    // 上电第一个包起就在精度内, CRS 也就不要了。
     HAL_PWREx_EnableUSBVoltageDetector();
     __HAL_RCC_USB_OTG_HS_CLK_ENABLE();
-
-    // 用主机的 SOF 包校准 HSI48。上面的 USB 时钟是自由振荡的 HSI48, DS13313
-    // Table 35 给出其精度 ACCHSI48_REL = -4.5% .. +3.5%(TJ = -40..125 C, 常温下
-    // 也有 47.5..48.5 MHz)。USB 2.0 full speed 允许 +-0.25%, 原始振荡器超差一个
-    // 数量级以上, 板子一热便不可靠 -- 台架上能稳定枚举只因出厂 trim 以 25 C 为中心。
-    // CRS 把 HSI48 锁到 1 kHz SOF 并拉到主机的精度, 这是 HSI48 能用作 USB 时钟的
-    // 前提。
-    //
-    // c_board 无 HSI48 也无 CRS, USB 时钟来自晶振 PLL, 天然精确, 无需恢复。
-    // 同步源选 USB1: H723 只有一个 OTG_HS 实例, 已在上方使能。
-    __HAL_RCC_CRS_CLK_ENABLE();
-    RCC_CRSInitTypeDef crs_init = {};
-    crs_init.Prescaler = RCC_CRS_SYNC_DIV1;
-    crs_init.Source = RCC_CRS_SYNC_SOURCE_USB1;
-    crs_init.Polarity = RCC_CRS_SYNC_POLARITY_RISING;
-    // 一个 1 kHz SOF 周期内数 48 MHz, 再减一。
-    crs_init.ReloadValue = __HAL_RCC_CRS_RELOADVALUE_CALCULATE(48000000U, 1000U);
-    crs_init.ErrorLimitValue = RCC_CRS_ERRORLIMIT_DEFAULT;
-    crs_init.HSI48CalibrationValue = RCC_CRS_HSI48CALIBRATION_DEFAULT;
-    HAL_RCCEx_CRSConfig(&crs_init);
 
     MX_GPIO_Init();
     MX_DMA_Init();
@@ -178,27 +197,31 @@ App::App() {
     MX_FDCAN2_Init();
     MX_FDCAN3_Init();
     MX_SPI6_Init();
-#ifdef libhcs_APP_IMU_ENABLE
     MX_SPI2_Init();
-#endif
     MX_UART5_Init();
     MX_USART2_UART_Init();
     MX_USART3_UART_Init();
     MX_TIM1_Init();
     MX_TIM2_Init();
+    // 板上 1/4 us 时间戳源(timer/timer.hpp)。2026-10-05 前是 TIM5。
+    MX_TIM23_Init();
+    // TIM3 与 TIM5 归共享时基: TIM5 锁 USB SOF(ITR7)并承载整条时间轴, TIM3 是 FDCAN 外部
+    // 时间戳的计数器(sync/sof_capture.hpp)。这里只写好 PSC/ARR, 不开中断、不开通道, 计数器
+    // 在主机的清单第一次要时间基准时才起走(sync::time_sync_start())。TIM3 CH4(PB1, IMU
+    // 加热)的输出通道不开。
+    MX_TIM3_Init();
     MX_TIM5_Init();
+    MX_TIM12_Init(); // 蜂鸣器: 引脚进复用功能, 通道不开 -- 主机声明了才启动(buzzer.hpp)
 
     // 先启动 1/4 微秒时间戳源, 再启动任何会为事件打时间戳的逻辑
     // (UART tx 超时、IMU data-ready EXTI、SPI 上行)。
     timer::timer.init();
 
     led::led.init();
+    // 四个 PWM 引脚: 对象就位, 引脚与定时器通道不碰 -- 主机声明了才启动(gpio/gpio.hpp)。
     gpio::gpio.init();
+    buzzer::buzzer.init();
     usb::vendor.init();
-
-    // 共享时基。必须位于 usb::vendor.init() 之后: 其 tusb_rhport_init() 整体赋值
-    // GINTMSK, 会清掉这里设置的 SOF 使能。不开 libhcs_APP_TIME_SYNC 时编译为空。
-    sync::sof_init();
 
     can::can1.init();
     can::can2.init();
@@ -209,11 +232,15 @@ App::App() {
     uart::uart_dbus.init();
     uart::uart2.init();
     uart::uart3.init();
-#ifdef libhcs_APP_IMU_ENABLE
+    // 板载 IMU: 对象就位, 芯片不碰, 数据就绪线先屏蔽掉 -- 主机声明了才初始化
+    // (spi/bmi088/service.hpp)。
     spi::bmi088::accelerometer.init();
     spi::bmi088::gyroscope.init();
     spi::bmi088::temperature.init();
-#endif
+    spi::bmi088::imu_port.suspend();
+    // 驱动自带的身份(数据流按它打标)与 EP0 绑定的身份是同一个口: 构造参数在编译期
+    // 看不到, 驱动就位后核对一次(ports.hpp)。
+    core::utility::assert_always(ports::Registry::identities_match());
 
     // 两个驱动参与编译但刻意不启动。包含它们是为了让代码参与类型检查、并把引脚宏
     // 持续对齐当前 .ioc; 二者都不改变板子的上电行为。
@@ -224,8 +251,18 @@ App::App() {
     //              之后只需 start(key::mc02_config()) 加上 run() 里的一次 poll()。
 }
 
+// 主循环。
+//
+// 每一趟固定要付的只有四样, 其余都挂在条件后面:
+//   1. USB 协议栈有没有事件(有才进 tud_task())
+//   2. 毫秒有没有翻(翻了才做杂务: 会话租约、DFU 重启、LED、CAN 发送卡死守护)
+//   3. 上行泵 usb::vendor->try_transmit()
+//   4. loop::active 是不是 0(主机声明过的 CAN / 串口 / IMU, 以及声明了周期采样的引脚)
+// 主机没声明的东西因此在这里不占一条指令; 声明了几样, 主循环就长出几样。
 // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
 [[noreturn]] void App::run() {
+    uint32_t last_tick_ms = HAL_GetTick();
+
     while (true) {
         diag::note_main_loop();
 
@@ -244,26 +281,27 @@ App::App() {
         }
 #endif
 
+        // USB 协议栈: 事件队列里有东西才进。tud_task() 自己取事件时要先关、后开 USB
+        // 中断, 队列空着也照做; 而它除了处理事件之外没有别的职责, 所以先看一眼队列
+        // (无锁读两个下标)。看的瞬间刚好有事件入队也无妨, 下一趟就处理了。
         diag::profile::mark(diag::profile::Section::kTudTask);
-        tud_task();
+        if (tud_task_event_ready())
+            tud_task();
 
-        // 每趟主循环一次, 而非每次 try_transmit() 一次; 见 Vendor::poll_session。
-        usb::vendor->poll_session();
-        usb::poll_dfu_runtime_reboot();
-
-        // 共享时基: 重新拟合微帧-周期计数直线, 并重设 SOF 使能, 让挂钩在控制器于
-        // 背后重新初始化后仍存活。不开 libhcs_APP_TIME_SYNC 时编译为空。
+        // 共享时基(主机的清单要了才开; 关着时只付这一次判断): 重新拟合微帧-周期计数直线,
+        // 并重设 SOF 使能, 让挂钩在控制器于背后重新初始化后仍存活。
         //
-        // 以 TIM5 而非循环趟数节流。本循环每秒运行数万次且周期随 USB 负载漂移,
+        // 以定时器而非循环趟数节流。本循环每秒运行数万次且周期随 USB 负载漂移,
         // "每 N 趟一次"的安排会让拟合周期悄悄变成流量的函数; 且如此频繁地重设
         // SOFM 不过是对外设寄存器无谓的读-改-写。
-        if constexpr (sync::timebase::kEnabled) {
+        if (sync::time_sync_on()) {
             static std::uint32_t last_sync_tick_ms = 0;
             const auto sync_tick_ms = static_cast<std::uint32_t>(
                 timer::timer->timepoint().time_since_epoch().count() / 4000U);
             if (sync_tick_ms != last_sync_tick_ms) {
                 last_sync_tick_ms = sync_tick_ms;
                 sync::timebase::poll(sync_tick_ms);
+                sync::sof_capture::refit();
                 sync::sof_rearm();
             }
         }
@@ -273,57 +311,67 @@ App::App() {
         diag::profile::mark(diag::profile::Section::kOther);
         diag::poll();
 
-        diag::profile::mark(diag::profile::Section::kGpio);
-        gpio::gpio->poll_periodic_input_samples();
+        // 毫秒杂务: 判据都是毫秒乃至秒级的事, 每毫秒看一次足够, 不必每趟主循环都付。
+        // HAL_GetTick() 读的是 RAM 里的计数, 所以没翻毫秒的那些趟只花一次比较。
+        if (const uint32_t tick_ms = HAL_GetTick(); tick_ms != last_tick_ms) [[unlikely]] {
+            last_tick_ms = tick_ms;
 
-#ifdef libhcs_APP_IMU_ENABLE
-        // 把到期的温度探针提升为 pending, 然后每趟至多处理一次 BMI088 SPI 读,
-        // 优先顺序为 gyro > accel > temperature。
-        diag::profile::mark(diag::profile::Section::kImu);
-        spi::bmi088::temperature->poll_pending_probe();
-        spi::bmi088::service_pending_reads();
-#endif
+            // 会话租约(4 s)与 DFU 重启(请求后 50 ms)。
+            usb::vendor->poll_session();
+            usb::poll_dfu_runtime_reboot();
 
-        // LED 动画; 仅颜色变化时阻塞(每次一帧 SPI, 按 WS2812 位率约 330 us)。
-        // 放在此处轮询, 确保没有任何 ISR 上下文触碰 SPI。上报的是主机会话状态
-        // (nonce 握手加 keepalive 租约), 不只是 USB 枚举 -- 常绿即代表数据确在转发。
-        diag::profile::mark(diag::profile::Section::kLed);
-        led::led->set_host_connected(usb::vendor->session_established());
-        led::led->poll();
+            // CAN 发送卡死守护(判据 20 ms): 只查声明过的总线。
+            if ((loop::active & loop::kCanBuses) != 0U)
+                can::Can::recover_all_stuck_transmits();
 
-        // usb->try_transmit() 的穿插是刻意的: CAN1 填好的 batch 在还没轮到看 UART1
-        // 之前就已开始向端点搬运。profiler 把 USB 开销记到 kUsb、每个数据源记到
-        // 各自的分区, 相对成本由此可见而非凭假设。
+            // 板载 IMU 的温度探针(1 Hz): 只在 IMU 被声明时。
+            if ((loop::active & loop::kImu) != 0U)
+                spi::bmi088::imu_port.poll_temperature_probe();
+
+            // LED 动画; 仅颜色变化时阻塞(每次一帧 SPI, 按 WS2812 位率约 330 us)。
+            // 放在主循环而非中断里, 确保没有任何 ISR 上下文触碰 SPI。上报的是主机会话
+            // 状态(nonce 握手加 keepalive 租约), 不只是 USB 枚举 -- 常绿即代表数据确在转发。
+            diag::profile::mark(diag::profile::Section::kLed);
+            led::led->set_host_connected(usb::vendor->session_established());
+            led::led->poll();
+        }
+
+        // 上行泵: 中断里序列化好的 batch(CAN 反馈、IMU 样本)从这里往端点搬。每次调用
+        // 最多搬一个 64 字节的包, 端点忙就直接返回。
         diag::profile::mark(diag::profile::Section::kUsb);
         usb::vendor->try_transmit();
-        diag::profile::mark(diag::profile::Section::kCan);
-        // 一次看全部三路 CAN 发送队列: 都没有帧排队时(几乎每趟如此)只需一次加载
-        // 加一次分支。两侧穿插的 usb->try_transmit() 次数与逐路轮询时保持一致。
-        can::Can::drain_pending_transmits();
-        diag::profile::mark(diag::profile::Section::kUsb);
-        usb::vendor->try_transmit();
-        diag::profile::mark(diag::profile::Section::kUsb);
-        usb::vendor->try_transmit();
-        diag::profile::mark(diag::profile::Section::kUsb);
-        usb::vendor->try_transmit();
-        diag::profile::mark(diag::profile::Section::kUart);
-        uart::uart1->try_transmit();
-        diag::profile::mark(diag::profile::Section::kUsb);
-        usb::vendor->try_transmit();
-        diag::profile::mark(diag::profile::Section::kUart);
-        uart::uart7->try_transmit();
-        diag::profile::mark(diag::profile::Section::kUsb);
-        usb::vendor->try_transmit();
-        diag::profile::mark(diag::profile::Section::kUart);
-        uart::uart10->try_transmit();
-        diag::profile::mark(diag::profile::Section::kUsb);
-        usb::vendor->try_transmit();
-        diag::profile::mark(diag::profile::Section::kUart);
-        uart::uart_dbus->try_transmit();
-        usb::vendor->try_transmit();
-        uart::uart2->try_transmit();
-        usb::vendor->try_transmit();
-        uart::uart3->try_transmit();
+
+        // 主机声明过的东西。位图为 0 时到此为止。
+        if (const uint32_t active = loop::active; active != 0U) {
+            // CAN: 一次看全部三路发送队列, 都没有帧排队时(几乎每趟如此)只需一次加载加
+            // 一次分支。这是下行方向(软件队列 -> 硬件 FIFO), 不产生上行数据, 后面不必泵 USB。
+            if ((active & loop::kCanBuses) != 0U) {
+                diag::profile::mark(diag::profile::Section::kCan);
+                can::Can::drain_pending_transmits();
+            }
+
+            if ((active & loop::kGpioSampling) != 0U) {
+                diag::profile::mark(diag::profile::Section::kGpio);
+                gpio::gpio->poll_periodic();
+            }
+
+            if ((active & loop::kImu) != 0U) {
+                diag::profile::mark(diag::profile::Section::kImu);
+                spi::bmi088::imu_port.poll();
+            }
+
+            // 串口: 每个口之后泵一次 USB, 它刚出队的字节在还没轮到下一个口之前就开始往
+            // 端点搬。所以一圈里 usb->try_transmit() 的次数是 1 + 声明的串口数。
+            //
+            // profiler(仅 libhcs_APP_LOOP_PROFILE 构建, 平时 mark() 编译为空)把 USB 开销
+            // 记到 kUsb、串口记到 kUart, 相对成本由此可见而非凭假设。
+            diag::profile::mark(diag::profile::Section::kUart);
+            ports::poll_uarts(active, [] {
+                diag::profile::mark(diag::profile::Section::kUsb);
+                usb::vendor->try_transmit();
+                diag::profile::mark(diag::profile::Section::kUart);
+            });
+        }
 
         diag::profile::end_pass();
 

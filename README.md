@@ -19,6 +19,7 @@ libhcs 是 [无下位机控制系统 HCS](https://github.com/zyitom/libhcs) 的�
 | 了解版本状态 | [libhcs v3](#libhcs-v3) |
 | **看它能跑多快**（延迟 / 吞吐实测） | **[性能实测速览](#性能实测速览)** |
 | 在 PC 上编 SDK | [Host SDK 编译](#host-sdk-编译) |
+| **在自己的工程里用 SDK** | **[在别的工程里用](#在别的工程里用)**（FetchContent 拉源码包） |
 | 编固件 | [固件编译与烧录](#固件编译与烧录) |
 | 第一次烧板子 | [烧录 Bootloader](#烧录-bootloader首次或更新引导) |
 | 日常更新固件 | [烧录 App（USB DFU）](#烧录-appusb-dfu) |
@@ -102,19 +103,42 @@ cmake --preset linux-debug -S host
 cmake --build host/build
 ```
 
-如需同时构建示例程序（`rx_monitor`、`uart_stress` 等），加上 `-DBUILD_EXAMPLES=ON`：
-
-```bash
-cmake --preset linux-debug -S host -DBUILD_EXAMPLES=ON
-cmake --build host/build --target rx_monitor
-```
+`host/examples/` 已于 2026-10-02 整体删除（连同 `BUILD_EXAMPLES` 选项）：SDK 的接口每个
+版本都在变，那些一次性的测量程序跟不上也不值得跟。它们量出的结论留在各文档里；文档中
+出现的 `host/examples/*.cpp` 只是当时用的工具名，不再存在。上板验证走 HCS 自己的组件
+（`hcs_link_probe`、`can_rtt_probe`）。
 
 如果系统默认 GCC 版本低于 14，需手动指定编译器：
 
 ```bash
-cmake --preset linux-debug -S host -DBUILD_EXAMPLES=ON \
+cmake --preset linux-debug -S host \
     -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14
 ```
+
+### 在别的工程里用
+
+SDK 以**源码包**发布：每个 Release 附一个 `libhcs-sdk-src-<版本>.zip`，使用方用 CMake 的
+`FetchContent` 拉下来、用自己的编译器编成静态库（与 RMCS 用 librmcs 的方式相同）。不发 `.deb` /
+预编译库：主机 SDK 必须与板子固件同一线格式版本，版本要跟着工程锁死，而不是装进系统、被一次
+升级换掉；C++ 二进制也绑死编译器与系统版本。
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(libhcs
+    URL https://github.com/zyitom/libhcs/releases/download/v<版本>/libhcs-sdk-src-<版本>.zip
+    URL_HASH SHA256=<该 zip 的 sha256>
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(libhcs)
+
+target_link_libraries(my_app PRIVATE libhcs::sdk)
+```
+
+- 使用方只需自己装 libusb（`sudo apt install libusb-1.0-0-dev`）和能编 C++23 的编译器（GCC ≥ 14 或
+  clang ≥ 18）；C++23 要求随 `libhcs::sdk` 传过去，不用自己设。
+- 默认不开 LTO，编出来的是普通目标文件，任何工具链都能链接。自己的工程整体做 LTO 时，在
+  `FetchContent_MakeAvailable` 之前 `set(LIBHCS_LTO ON)`（HCS 就是这样）。
+- 源码包由 `.scripts/package_sdk_source` 生成，版本号在打包时写进去，不需要 git。CI 每次都打一个包、
+  用 [host/tests/fetchcontent/](host/tests/fetchcontent/) 这个外部工程按上面的写法编一遍。
 
 ## 固件编译与烧录
 
@@ -122,7 +146,7 @@ cmake --preset linux-debug -S host -DBUILD_EXAMPLES=ON \
 
 见 [ENV.md](ENV.md)。
 
-> STM32 板（`c_board`、`mc02`）用 ARM GCC。RISC-V 板（`ch32_board`、`hpm_board`）
+> STM32 板（`c_board`、`mc02`）用 ARM GCC。RISC-V 板（`hpm_board`）
 > 用另一套工具链，见各自章节。
 
 ### 编译
@@ -172,7 +196,6 @@ App 镜像 `*.dfu` 已带好镜像哈希与 DFU 后缀。下面是脚本做的�
 > 上没有任何实体按键** `[实测 2026-09-09]`：force-stay 引脚只是引出的焊盘，要复位时
 > 短接到 GND（窗口约 1 ms），或改用 `-DBOARD_BOOTLOADER_MODE=manual` 的 bootloader。
 > 见 [firmware/hpm_board/boards/hpm6e8y/README.md](firmware/hpm_board/boards/hpm6e8y/README.md)。
-> `ch32_board` 也没有恢复按键，见其 README。
 
 2. **确认设备已枚举**（应能看到 `[a511:0723]`，接口为 alt 0 `Internal Flash`）：
 
@@ -196,7 +219,6 @@ App 镜像 `*.dfu` 已带好镜像哈希与 DFU 后缀。下面是脚本做的�
 | ---------- | ------------ | -------- | -------------------------- |
 | c_board    | STM32F407VG  | `0xF407` | `HCS DFU Bootloader`      |
 | mc02       | STM32H723VG  | `0x0723` | `HCS DFU Bootloader`      |
-| ch32_board | WCH CH32H417 | `0xD403` | `HCS Bootloader v<版本号>` |
 | hpm_board HPM5321 单 CAN 版 | HPM5321 | `0x6877`（VID `0x34B7`，见下）；bootloader `0x5321` | `HCS Agent v<版本号>` |
 | hpm_board HPM5321 双 CAN-FD 版 | HPM5321 | `0x6877`（VID `0x34B7`，见下）；bootloader `0x5322` | 同上 |
 | hpm_board `hpm6e8y` | HPM6E8Y | `0x6E84` | 同上 |
@@ -216,32 +238,12 @@ VID 除 HPM5321 应用外均为 `0xA511`。
 > **版本字符串区分不出构建类型和变体**——它来自 `git describe`，`debug` 和 `release` 完全一样。
 > 多块同型号板同时在线时用 `dfu-util -S <序列号>` 逐块烧（`dfu-util -l` 列序列号）。
 
-### ch32_board 的差异
-
-RISC-V 双核，工具链是 `riscv32-unknown-elf-gcc`（不是 `arm-none-eabi-gcc`），
-编译前需 `export GNURISCV_TOOLCHAIN_PATH=~/3rd_party/hpm`（`[前机路径]`，含义见
-[AGENTS.md 开发机环境路径约定](AGENTS.md#开发机环境路径约定重要先读这条再看任何路径)）：
-
-```bash
-cmake --preset debug -S firmware/ch32_board && cmake --build firmware/ch32_board/build
-```
-
-- **首次烧录**（含 bootloader）用 WCH-Link 烧 `build/ch32_board_merged.hex`，
-  之后 App 可走 DFU：`./flash-ch32.sh`。
-- Bootloader 就是 V3F 启动核镜像本身（`ch32_board_boot`），"启动 App" 是唤醒 V5F
-  而非跳转。
-- App 的 `.dfu` 只带 DFU 后缀、**不带** `ImageHash` 后缀：这块板的 bootloader 会
-  自己哈希烧进去的内容并写进独立的 metadata 记录。
-
-细节见 `firmware/ch32_board/README.md`。
-
 ## 各板文档索引
 
 | 板子 | 入口文档 | 深入阅读 |
 |---|---|---|
 | `c_board`（STM32F407） | [firmware/c_board/AGENTS.md](firmware/c_board/AGENTS.md) | — |
 | `mc02`（STM32H723） | [firmware/mc02/AGENTS.md](firmware/mc02/AGENTS.md) | [README.md](firmware/mc02/README.md)（外设与低延迟设计） · [PACKET_RATE_LOG.md](firmware/mc02/PACKET_RATE_LOG.md)（包率实测） |
-| `ch32_board`（CH32H417） | [firmware/ch32_board/AGENTS.md](firmware/ch32_board/AGENTS.md) | [README.md](firmware/ch32_board/README.md) · [PITFALLS.md](firmware/ch32_board/PITFALLS.md)（上板前必读） · [PROGRESS.md](firmware/ch32_board/PROGRESS.md) |
 | `hpm_board`（HPM6E8Y/5321） | [firmware/hpm_board/AGENTS.md](firmware/hpm_board/AGENTS.md) | [BUILD_ENVIRONMENT.md](firmware/hpm_board/BUILD_ENVIRONMENT.md) · [PITFALLS.md](firmware/hpm_board/PITFALLS.md)（选型与踩坑） · [USB_OPTIMIZATION_LOG.md](firmware/hpm_board/USB_OPTIMIZATION_LOG.md)（USB 调优） |
 
 完整文档清单见上表与各板 `AGENTS.md` 的「相关文档」一节。线协议（CAN 记录流

@@ -13,6 +13,7 @@
 #include <hpm_soc_irq.h>
 #include <hpm_uart_regs.h>
 
+#include "core/include/libhcs/spec/hpm6e8y/ports.hpp"
 #include "firmware/hpm_board/app/src/can/can_port.hpp"
 #include "firmware/hpm_board/app/src/gpio/gpio_pin.hpp"
 #include "firmware/hpm_board/app/src/uart/uart_port.hpp"
@@ -35,24 +36,24 @@ bool usb_use_high_speed();
 //   CAN3 = MCAN3  TX PD15 / RX PD14
 // 上电默认四路都跑 CAN-FD(仲裁 1 Mbps / 数据 5 Mbps, BRS 开), 是 CANFD 回环压力
 // 测试(跳线 CAN0<->CAN1、CAN2<->CAN3)所要求的。帧类型跟随总线; 主机可经 EP0
-// kSetCanConfig 把某路切成经典 2.0(控制器重初始化并关 FD, 见 can.cpp libhcs_config)。
+// 清单声明把某路切成经典 2.0(控制器重初始化并关 FD, 见 can.cpp libhcs_config)。
 constexpr CanPort kCanPorts[] = {
     {.base = HPM_MCAN0_BASE,
      .irq_num = IRQn_MCAN0,
      .mode = CanMode::kCanFd,
-     .data_id = data::DataId::kCan0},
+     .data_id = spec::hpm6e8y::Spec::Cans::kCan0.data_id},
     {.base = HPM_MCAN1_BASE,
      .irq_num = IRQn_MCAN1,
      .mode = CanMode::kCanFd,
-     .data_id = data::DataId::kCan1},
+     .data_id = spec::hpm6e8y::Spec::Cans::kCan1.data_id},
     {.base = HPM_MCAN2_BASE,
      .irq_num = IRQn_MCAN2,
      .mode = CanMode::kCanFd,
-     .data_id = data::DataId::kCan2},
+     .data_id = spec::hpm6e8y::Spec::Cans::kCan2.data_id},
     {.base = HPM_MCAN3_BASE,
      .irq_num = IRQn_MCAN3,
      .mode = CanMode::kCanFd,
-     .data_id = data::DataId::kCan3},
+     .data_id = spec::hpm6e8y::Spec::Cans::kCan3.data_id},
 };
 
 // 表容量与本板实际存在的控制器数。两者只在服务多块 PCB 的板目录
@@ -75,18 +76,13 @@ mcan_msg_buf_attr_t can_message_ram(size_t can_index);
 // 时钟树断言该值 -- board.c 若改 AHB0 分频, 这里同步更新。
 constexpr uint32_t kCanTimestampNsPerUs = 1000;
 
-// UART 口按逻辑序: 一个测试数据 UART(UART1, PY06/PY07 排针)。
-constexpr UartPort kUartPorts[] = {
-    {.base = HPM_UART1_BASE,
-     .irq_num = IRQn_UART1,
-     .dma_src_tx = HPM_DMA_SRC_UART1_TX,
-     .dma_src_rx = HPM_DMA_SRC_UART1_RX,
-     .data_id = data::DataId::kUart0,
-     .config_data_id = data::DataId::kUart0Config,
-     .baudrate = 921600,
-     .parity = parity_none},
-};
+// 本板没有数据 UART。板上的 UART1(PY06/PY07)是调试焊盘, 不是对外连接器, 生产镜像
+// 不带它的驱动: 共用 UART 层(uart/uart.hpp)按这张空表一个口都不构造, 中断不接,
+// 引脚不配, CDC 串口桥(dmtool/)没有可接的 UART 而永远不通。
+inline constexpr std::array<UartPort, 0> kUartPorts{};
 
+// 共用 UART 层对板子的接口。本板表为空, 两者都不会被调用: init_uart 不定义(用到它的
+// Uart 构造从不实例化), uart_irq_handler 由共用层定义、不挂任何中断。
 uint32_t init_uart(UART_Type* ptr);
 void uart_irq_handler(size_t board_uart_index);
 

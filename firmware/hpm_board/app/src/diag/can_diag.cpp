@@ -205,10 +205,14 @@ void poll(std::uint32_t tick) {
     // 主循环上运行, 与该 DMA 并发; 早先直接读寄存器的版本曾让窗口内传输的任意
     // 字节覆写除数锁存, 摧毁了它本要测量的波特率, 还回报覆盖前的旧值: 记录显示
     // 除数正确, 端口却已哑掉。OSCR 是普通寄存器, 不受 DLAB 影响, 仍直接读。
+    // 没有数据 UART 的板子(hpm6e8y)三项报 0, 记录长度不变。
     {
-        cursor = put_u32(cursor, uart::uart_array[0]->clock_hz());
-        cursor = put_u32(cursor, uart::uart_array[0]->oscr());
-        cursor = put_u32(cursor, uart::uart_array[0]->divisor());
+        const uart::Uart* port = nullptr;
+        if constexpr (uart::kUartCount != 0)
+            port = uart::uart_array[0].try_get();
+        cursor = put_u32(cursor, port != nullptr ? port->clock_hz() : 0U);
+        cursor = put_u32(cursor, port != nullptr ? port->oscr() : 0U);
+        cursor = put_u32(cursor, port != nullptr ? port->divisor() : 0U);
     }
 
     // USB bulk OUT 端点计时及其累加器清零。上报原始和值加样本数而非平均值, 除法

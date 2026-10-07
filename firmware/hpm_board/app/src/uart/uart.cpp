@@ -10,7 +10,9 @@ namespace libhcs::firmware::board {
 ATTR_PLACE_AT(".fast") void uart_irq_handler(size_t board_uart_index) {
     core::utility::assert_debug(board_uart_index < uart::kUartCount);
 
-    uart::uart_array[board_uart_index]->irq_handler();
+    // 没有数据 UART 的板子不挂这个中断, 函数只为满足共用接口而存在。
+    if constexpr (uart::kUartCount != 0)
+        uart::uart_array[board_uart_index]->irq_handler();
 }
 
 } // namespace libhcs::firmware::board

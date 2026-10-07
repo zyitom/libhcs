@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -10,250 +11,274 @@
 #include <tim.h>
 
 #include "core/include/libhcs/data/datas.hpp"
-#include "core/include/libhcs/spec/mc02/gpio.hpp"
+#include "core/include/libhcs/protocol/vendor_control.hpp"
+#include "core/include/libhcs/spec/mc02/ports.hpp"
+#include "core/src/link/port.hpp"
 #include "core/src/protocol/serializer.hpp"
 #include "core/src/utility/assert.hpp"
 #include "core/src/utility/immovable.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 #include "firmware/mc02/app/src/timer/timer.hpp"
 #include "firmware/mc02/app/src/usb/helper.hpp"
-#include "firmware/mc02/app/src/utility/lazy.hpp"
+#include "firmware/mc02/app/src/utility/loop_work.hpp"
 
 namespace libhcs::firmware::gpio {
 
-class Gpio : private core::utility::Immovable {
+namespace vc = libhcs::core::protocol::vendor_control;
+namespace link = libhcs::core::link;
+
+// 有没有引脚要主循环去周期采样: 引脚状态每次变化后重算, 结果记在 loop::active 的
+// kGpioSampling 位(定义在本文件末尾, 它要看全部引脚)。
+void refresh_sampling();
+
+// ---- GPIO 口 = PWM 排针, 一个引脚 = 口上的一根线 ----
+//
+// 排针是一路口(DataId::kGpio), 四个引脚是它的线(spec/mc02/ports.hpp 的 Spec::kGpios),
+// 逐线声明, 与 CAN/UART 同一条规矩: 清单声明了才动。没声明的线 -- 定时器通道不启动、
+// EXTI 线不武装、主循环里不采样 -- 不占一条指令。上电时什么都不碰: 引脚保持
+// MX_GPIO_Init / MX_TIMx_Init 给的样子(定时器复用, 通道输出没使能, 等于悬空)。
+//
+// 线的原语(core/src/link/port_ops.hpp 的 GpioLineDriver):
+//   configure()  写引脚寄存器: 输出 = 定时器复用推挽, 比较值 0, 第一次用到时启动该定时器
+//                通道; 输入 = 输入模式 + 上下拉 + 边沿选择(中断先屏蔽)。设置没变就什么
+//                都不写: 运行期改别的口会重放整份清单, 正在跑的 PWM 不能因此掉到 0。
+//   resume()     开工: 输入解除边沿屏蔽、开始周期采样; 输出开始接收写入。
+//   suspend()    停: 输出比较值归零, 引脚拉低而不是放成高阻(悬空的信号线会被电调读成
+//                杂波脉冲); 输入屏蔽边沿、停采样; 下行的写与读请求一律丢弃。
+//
+// 定时器通道启动后不再停: HAL_TIM_PWM_Stop 在最后一个通道关掉时连计数器一起停。当初是因为
+// TIM2 的计数器同时是 SOF 捕获的时基; 2026-10-05 起捕获挪到 TIM5(sync/sof.cpp), TIM2 只做
+// PWM, 不停的做法保留(无害)。比较值只写 CCR、不发 UG。
+//
+// 全部在主循环调用(EP0 处理器、下行回调、会话状态机都经 tud_task() 到达), 只有
+// handle_edge() 在 EXTI 中断里。
+class Pin : private core::utility::Immovable {
 public:
-    using Lazy = utility::Lazy<Gpio>;
-
-    Gpio() {
-        core::utility::assert_always(HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1) == HAL_OK);
-        core::utility::assert_always(HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3) == HAL_OK);
-        core::utility::assert_always(HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) == HAL_OK);
-        core::utility::assert_always(HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3) == HAL_OK);
-
-        // 通道 EXTI 线: PA0->EXTI0、PA2->EXTI2、PE9->EXTI9_5。EXTI15_10(PE13)
-        // 已由 MX_GPIO_Init 使能 -- 与 BMI088 数据就绪引脚共用, 故仅其 handler
-        // 放在 gpio.cpp。
-        HAL_NVIC_SetPriority(EXTI0_IRQn, 4, 0);
-        HAL_NVIC_EnableIRQ(EXTI0_IRQn);
-        HAL_NVIC_SetPriority(EXTI2_IRQn, 4, 0);
-        HAL_NVIC_EnableIRQ(EXTI2_IRQn);
-        HAL_NVIC_SetPriority(EXTI9_5_IRQn, 4, 0);
-        HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
-
-        constexpr data::GpioReadConfigView k_default_input_config{};
-        for (const auto& gpio : spec::mc02::kGpioDescriptors) {
-            set_pwm_compare(gpio.channel_index, 0);
-            configure_digital_input_mode(gpio.channel_index, k_default_input_config);
-        }
-    }
-
-    void handle_digital_write(uint8_t channel_index, const data::GpioDigitalDataView& data) {
-        configure_output_mode(channel_index);
-        set_pwm_compare(channel_index, data.high ? pwm_counter_period(channel_index) : 0);
-    }
-
-    void handle_analog_write(uint8_t channel_index, const data::GpioAnalogDataView& data) {
-        configure_output_mode(channel_index);
-        set_pwm_compare(channel_index, duty16_to_pwm_compare(channel_index, data.value));
-    }
-
-    // 会话结束(租约过期、USB 挂起或拔出、被新会话取代)时由 usb::Vendor 调用。写这些输出
-    // 的主机已经不在, 最后一个占空比不能无限期保持 -- 接电调或电机时那就是一直转。比较值
-    // 归零使输出通道恒低、不再有脉冲(数字输出同样拉低), 设备看到的是信号丢失而非一条仍然
-    // 有效的旧指令。不切回高阻输入: 悬空的信号线可能被读成杂波脉冲。输入通道的引脚不接
-    // 定时器, 写比较值对它们无影响。
-    //
-    // 只写比较寄存器, 新值在下一个 PWM 周期(50 Hz 下至多 20 ms)生效。刻意不用 UG 立即
-    // 更新: 那会复位整个定时器的计数器, 而 TIM2 的计数器同时是 SOF 捕获的时基
-    // (sync/sof.cpp)。
-    void stop_outputs() {
-        for (const auto& gpio : spec::mc02::kGpioDescriptors)
-            set_pwm_compare(gpio.channel_index, 0);
-    }
-
-    void handle_digital_read(uint8_t channel_index, const data::GpioReadConfigView& data) {
-        const bool reconfigured = configure_digital_input_mode(channel_index, data);
-
-        if (data.asap) {
-            if (reconfigured)
-                wait_pull_settle();
-            const auto& hardware = channel_hardware(channel_index);
-            const bool high =
-                HAL_GPIO_ReadPin(hardware.gpio_port, hardware.gpio_pin) == GPIO_PIN_SET;
-            const uint32_t timestamp_quarter_us = current_timestamp_quarter_us();
-            publish_digital_input_sample(channel_index, high, timestamp_quarter_us);
-        }
-    }
-
-    void poll_periodic_input_samples() {
-        const auto now = timer::timer->timepoint();
-
-        for (std::size_t channel_index = 0; channel_index < kChannelCount; ++channel_index) {
-            auto& state = channel_states_[channel_index];
-            if (state.mode != GpioMode::kDigitalInput || state.sample_period == kNoPeriod)
-                continue;
-            if (!timer::timer->check_reached(state.next_sample_deadline))
-                continue;
-
-            const auto& hardware = channel_hardware(static_cast<uint8_t>(channel_index));
-            const bool high =
-                HAL_GPIO_ReadPin(hardware.gpio_port, hardware.gpio_pin) == GPIO_PIN_SET;
-            const uint32_t timestamp_quarter_us = current_timestamp_quarter_us();
-            publish_digital_input_sample(
-                static_cast<uint8_t>(channel_index), high, timestamp_quarter_us);
-            state.next_sample_deadline = now + state.sample_period;
-        }
-    }
-
-    void handle_input_edge_interrupt(uint16_t gpio_pin) {
-        const uint8_t channel_index = channel_index_from_exti_line(exti_line_from_pin(gpio_pin));
-        if (channel_index == kInvalidChannelIndex)
-            return;
-
-        auto& state = channel_state(channel_index);
-        if (state.mode != GpioMode::kDigitalInput || (!state.rising_edge && !state.falling_edge))
-            return;
-
-        const uint32_t timestamp_quarter_us = current_timestamp_quarter_us();
-        const auto& hardware = channel_hardware(channel_index);
-        const bool high = HAL_GPIO_ReadPin(hardware.gpio_port, hardware.gpio_pin) == GPIO_PIN_SET;
-
-        publish_digital_input_sample(channel_index, high, timestamp_quarter_us);
-    }
-
-private:
-    enum class GpioMode : uint8_t { kOutput = 0, kDigitalInput = 1 };
-
-    struct ChannelState {
-        GpioMode mode = GpioMode::kOutput;
-        bool rising_edge = false;
-        bool falling_edge = false;
-        bool capture_timestamp = false;
-        data::GpioPull pull = data::GpioPull::kNone;
-        timer::Timer::Duration sample_period = timer::Timer::Duration::zero();
-        timer::Timer::TimePoint next_sample_deadline;
-    };
-
-    struct ChannelHardware {
+    struct Wiring {
         GPIO_TypeDef* gpio_port;
         uint16_t gpio_pin;
         uint8_t alternate_function;
-        volatile uint32_t* compare_register;
-        // 所属定时器的 ARR。运行时读取而非编译期常量: 这四个通道背后的两个定时器
-        // 不必再共用周期。TIM2 同时是 USB-SOF 捕获定时器(sync/sof.cpp), 要让
-        // 捕获精细到值得使用须跑 275 MHz、ARR 5499999; TIM1 保持 1 MHz、
-        // ARR 19999。两者仍都产生 50 Hz。只读不写: TIM2 的 ARR/PSC 只能在 .ioc 里改,
-        // 捕获在启动时缓存了二者, 运行时改写 PWM 频率会让 SOF 修正静默算错。
-        volatile uint32_t* autoreload_register;
+        TIM_HandleTypeDef* timer;
+        uint32_t timer_channel;
+        IRQn_Type exti_irq;
     };
-    static constexpr auto kNoPeriod = timer::Timer::Duration::zero();
-    static constexpr std::size_t kChannelCount = std::size(spec::mc02::kGpioDescriptors);
-    static constexpr uint8_t kInvalidChannelIndex = 0xFFU;
 
-    void configure_output_mode(uint8_t channel_index) {
-        auto& state = channel_state(channel_index);
-        if (state.mode == GpioMode::kOutput)
+    Pin(uint8_t line, const Wiring& wiring)
+        : line_(line)
+        , wiring_(wiring)
+        // CCR1..CCR4 连续排列, 通道号(0/4/8/12)右移两位即偏移 -- 与 __HAL_TIM_SET_COMPARE
+        // 同一算法, 只是只算一次。
+        , compare_register_(&wiring.timer->Instance->CCR1 + (wiring.timer_channel >> 2U)) {}
+
+    // 在 GPIO 口上的线号: 记录流里的引脚身份。
+    [[nodiscard]] uint8_t line() const { return line_; }
+    [[nodiscard]] uint16_t gpio_pin() const { return wiring_.gpio_pin; }
+
+    // ---- EP0 口 ----
+
+    [[nodiscard]] bool running() const { return running_; }
+
+    void suspend() {
+        running_ = false;
+        if (setting_.mode == vc::kGpioModeOutput)
+            *compare_register_ = 0;
+        disarm_edges();
+        refresh_sampling();
+    }
+
+    void resume() {
+        if (setting_.mode == vc::kGpioModeOff)
+            return; // 从没声明过: 没有可恢复的
+        if (setting_.mode == vc::kGpioModeInput) {
+            next_sample_ = timer::timer->timepoint();
+            arm_edges();
+        }
+        running_ = true;
+        refresh_sampling();
+    }
+
+    void configure(const vc::GpioConfigPayload& setting) {
+        if (setting.mode == setting_.mode && setting.pull == setting_.pull
+            && setting.input_flags == setting_.input_flags
+            && setting.period_ms == setting_.period_ms)
             return;
 
-        state.mode = GpioMode::kOutput;
-        configure_hal_gpio_output(channel_index);
-    }
-
-    // 返回 true 表示硬件被重新配置过(电平/边沿/上拉/采样周期任一变化)。调用方
-    // 若要立刻采样, 需先 wait_pull_settle()。
-    bool configure_digital_input_mode(uint8_t channel_index, const data::GpioReadConfigView& data) {
-        auto& state = channel_state(channel_index);
-
-        auto rising_edge = data.rising_edge;
-        auto falling_edge = data.falling_edge;
-        const auto pull = data.pull;
-        const auto sample_period =
-            (data.period_ms == 0)
+        // 改方向的窗口里不接收写入, 也不响应边沿。
+        running_ = false;
+        disarm_edges();
+        if (setting.mode == vc::kGpioModeOutput)
+            configure_output();
+        else
+            configure_input(setting);
+        setting_ = setting;
+        sample_period_ =
+            setting.period_ms == 0U
                 ? kNoPeriod
-                : timer::Timer::to_duration_checked(std::chrono::milliseconds{data.period_ms});
-
-        if (state.mode != GpioMode::kDigitalInput //
-            || state.rising_edge != rising_edge || state.falling_edge != falling_edge
-            || state.capture_timestamp != data.capture_timestamp || state.pull != pull
-            || state.sample_period != sample_period) {
-
-            state.mode = GpioMode::kDigitalInput;
-            state.rising_edge = rising_edge;
-            state.falling_edge = falling_edge;
-            state.capture_timestamp = data.capture_timestamp;
-            state.pull = pull;
-            state.sample_period = sample_period;
-            state.next_sample_deadline = timer::timer->timepoint();
-
-            configure_hal_gpio_input(channel_index, rising_edge, falling_edge, pull);
-            return true;
-        }
-        return false;
+                : timer::Timer::to_duration_checked(std::chrono::milliseconds{setting.period_ms});
+        refresh_sampling();
     }
 
-    // 上拉/下拉翻转后, 内部 ~40 kOhm 拉阻给走线电容充放电需要数微秒; 重配后立即
-    // 采样读到的是翻转前的电平(实测 2026-09-18: 上拉重配后的 asap 采样稳定读回
-    // 旧的低电平)。只在重配后的 asap 路径上等待, 周期采样与边沿捕获不在重配
-    // 瞬间读引脚, 不受影响。主循环上下文, 100 us 一次性的代价可忽略。
-    static void wait_pull_settle() {
-        const auto deadline = timer::timer->timepoint()
-                            + timer::Timer::to_duration_checked(std::chrono::microseconds{100});
-        while (!timer::timer->check_reached(deadline)) {}
+    // 写后回读: 方向(MODER)与上下拉(PUPDR)。上下拉的寄存器编码与 vc::GpioPull 相同
+    // (00 无、01 上拉、10 下拉)。
+    [[nodiscard]] bool matches(const vc::GpioConfigPayload& setting) const {
+        const uint32_t shift = 2U * pin_number();
+        const uint32_t mode = (wiring_.gpio_port->MODER >> shift) & 0x3U;
+        const uint32_t pull = (wiring_.gpio_port->PUPDR >> shift) & 0x3U;
+        if (setting.mode == vc::kGpioModeOutput)
+            return mode == kModerAlternate && pull == 0U;
+        return mode == kModerInput && pull == setting.pull;
     }
 
-    void set_pwm_compare(uint8_t channel_index, uint32_t compare) {
-        *channel_hardware(channel_index).compare_register = compare;
+    void read_config(vc::GpioConfigPayload& out) const {
+        out = running_ ? setting_ : vc::GpioConfigPayload{};
     }
 
-    void configure_hal_gpio_output(uint8_t channel_index) {
-        const auto& hardware = channel_hardware(channel_index);
+    // ---- 数据通路 ----
 
-        // HAL_GPIO_Init() 只在新模式带中断时才改 EXTI 寄存器: 以边沿触发读过的通道切到
-        // 输出后, 边沿中断仍然使能, PWM 每个边沿都白进一次 EXTI 中断(PE13 与 BMI088
-        // 数据就绪共用 EXTI15_10)。HAL_GPIO_DeInit() 解除该线的映射与使能, 再清掉可能
-        // 已挂起的标志。state.mode 已先置为输出, 其间进来的中断会被丢弃。
-        HAL_GPIO_DeInit(hardware.gpio_port, hardware.gpio_pin);
-        __HAL_GPIO_EXTI_CLEAR_IT(hardware.gpio_pin);
+    void handle_digital_write(const data::GpioDigitalDataView& data) {
+        if (!running_ || setting_.mode != vc::kGpioModeOutput)
+            return;
+        *compare_register_ = data.high ? counter_period() : 0U;
+    }
 
+    void handle_analog_write(const data::GpioAnalogDataView& data) {
+        if (!running_ || setting_.mode != vc::kGpioModeOutput)
+            return;
+        *compare_register_ = duty16_to_compare(data.value);
+    }
+
+    // kRead: 现在采一次。上下拉在声明时就已生效, 到主机发得出这条请求时早已稳定(EP0 声明
+    // 与它之间至少隔一次控制传输), 不必再等。
+    void handle_read_request() {
+        if (!running_ || setting_.mode != vc::kGpioModeInput)
+            return;
+        publish(read_level(), current_timestamp_quarter_us());
+    }
+
+    // 主循环, kGpioSampling 位置着时: 到期就采一次。
+    void poll_periodic() {
+        if (!running_ || sample_period_ == kNoPeriod)
+            return;
+        if (!timer::timer->check_reached(next_sample_))
+            return;
+        publish(read_level(), current_timestamp_quarter_us());
+        next_sample_ = timer::timer->timepoint() + sample_period_;
+    }
+
+    // EXTI 中断。边沿只在声明了边沿且正在运行时才被解除屏蔽, 这里的检查挡的是屏蔽前
+    // 已挂起的那一个。
+    void handle_edge() {
+        if (!running_ || !edges_armed_)
+            return;
+        const uint32_t timestamp_quarter_us = current_timestamp_quarter_us();
+        publish(read_level(), timestamp_quarter_us);
+    }
+
+    // 新会话取代旧会话: 旧主机写的输出值不留给新主机继承, 方向与运行状态不变。
+    void zero_output() {
+        if (setting_.mode == vc::kGpioModeOutput)
+            *compare_register_ = 0;
+    }
+
+    [[nodiscard]] bool samples_periodically() const {
+        return running_ && sample_period_ != kNoPeriod;
+    }
+
+private:
+    static constexpr auto kNoPeriod = timer::Timer::Duration::zero();
+    static constexpr uint32_t kModerInput = 0U;
+    static constexpr uint32_t kModerAlternate = 2U;
+    static constexpr uint32_t kEdges = vc::kGpioInputRisingEdge | vc::kGpioInputFallingEdge;
+
+    [[nodiscard]] uint32_t pin_number() const {
+        return static_cast<uint32_t>(__builtin_ctz(wiring_.gpio_pin));
+    }
+
+    void configure_output() {
+        // HAL_GPIO_Init() 只在新模式带中断时才改 EXTI 寄存器: 以边沿输入用过的引脚切到
+        // 输出后, 边沿配置还在。HAL_GPIO_DeInit() 解除该线的映射与触发, 再清掉可能已
+        // 挂起的标志(PE13 与 BMI088 数据就绪共用 EXTI15_10)。
+        HAL_GPIO_DeInit(wiring_.gpio_port, wiring_.gpio_pin);
+        __HAL_GPIO_EXTI_CLEAR_IT(wiring_.gpio_pin);
+
+        *compare_register_ = 0; // 从低电平开始
         GPIO_InitTypeDef gpio_init = {};
-        gpio_init.Pin = hardware.gpio_pin;
+        gpio_init.Pin = wiring_.gpio_pin;
         gpio_init.Mode = GPIO_MODE_AF_PP;
         gpio_init.Pull = GPIO_NOPULL;
         gpio_init.Speed = GPIO_SPEED_FREQ_LOW;
-        gpio_init.Alternate = hardware.alternate_function;
-        HAL_GPIO_Init(hardware.gpio_port, &gpio_init);
-    }
+        gpio_init.Alternate = wiring_.alternate_function;
+        HAL_GPIO_Init(wiring_.gpio_port, &gpio_init);
 
-    void configure_hal_gpio_input(
-        uint8_t channel_index, bool rising_edge, bool falling_edge, data::GpioPull pull) {
-        const auto& hardware = channel_hardware(channel_index);
-
-        GPIO_InitTypeDef gpio_init = {};
-        gpio_init.Pin = hardware.gpio_pin;
-        if (rising_edge && falling_edge) {
-            gpio_init.Mode = GPIO_MODE_IT_RISING_FALLING;
-        } else if (rising_edge) {
-            gpio_init.Mode = GPIO_MODE_IT_RISING;
-        } else if (falling_edge) {
-            gpio_init.Mode = GPIO_MODE_IT_FALLING;
-        } else {
-            gpio_init.Mode = GPIO_MODE_INPUT;
+        if (!channel_started_) {
+            core::utility::assert_always(
+                HAL_TIM_PWM_Start(wiring_.timer, wiring_.timer_channel) == HAL_OK);
+            channel_started_ = true;
         }
-        gpio_init.Pull = hal_gpio_pull(pull);
-        gpio_init.Speed = GPIO_SPEED_FREQ_LOW;
-        HAL_GPIO_Init(hardware.gpio_port, &gpio_init);
     }
 
-    void publish_digital_input_sample(
-        uint8_t channel_index, bool high, uint32_t timestamp_quarter_us) {
-        const auto& state = channel_state(channel_index);
-        const std::optional<uint32_t> timestamp_to_publish =
-            state.capture_timestamp ? std::optional<uint32_t>{timestamp_quarter_us} : std::nullopt;
+    void configure_input(const vc::GpioConfigPayload& setting) {
+        const bool rising = (setting.input_flags & vc::kGpioInputRisingEdge) != 0U;
+        const bool falling = (setting.input_flags & vc::kGpioInputFallingEdge) != 0U;
+        GPIO_InitTypeDef gpio_init = {};
+        gpio_init.Pin = wiring_.gpio_pin;
+        if (rising && falling)
+            gpio_init.Mode = GPIO_MODE_IT_RISING_FALLING;
+        else if (rising)
+            gpio_init.Mode = GPIO_MODE_IT_RISING;
+        else if (falling)
+            gpio_init.Mode = GPIO_MODE_IT_FALLING;
+        else
+            gpio_init.Mode = GPIO_MODE_INPUT;
+        switch (setting.pull) {
+        case vc::kGpioPullUp: gpio_init.Pull = GPIO_PULLUP; break;
+        case vc::kGpioPullDown: gpio_init.Pull = GPIO_PULLDOWN; break;
+        default: gpio_init.Pull = GPIO_NOPULL; break;
+        }
+        gpio_init.Speed = GPIO_SPEED_FREQ_LOW;
+        HAL_GPIO_Init(wiring_.gpio_port, &gpio_init);
+        // HAL 带中断模式时顺手解除了屏蔽; 开不开由 resume() 决定。
+        if (rising || falling) {
+            CLEAR_BIT(EXTI->IMR1, wiring_.gpio_pin);
+            __HAL_GPIO_EXTI_CLEAR_IT(wiring_.gpio_pin);
+        }
+    }
 
-        auto& serializer = usb::get_serializer();
+    void arm_edges() {
+        if ((setting_.input_flags & kEdges) == 0U)
+            return;
+        // 本线的中断向量第一次被用到时才使能。EXTI15_10 由 MX_GPIO_Init 为 BMI088 使能过,
+        // 已使能的不再改它的优先级。
+        if (NVIC_GetEnableIRQ(wiring_.exti_irq) == 0U) {
+            HAL_NVIC_SetPriority(wiring_.exti_irq, 4, 0);
+            HAL_NVIC_EnableIRQ(wiring_.exti_irq);
+        }
+        __HAL_GPIO_EXTI_CLEAR_IT(wiring_.gpio_pin);
+        SET_BIT(EXTI->IMR1, wiring_.gpio_pin);
+        edges_armed_ = true;
+    }
+
+    // 只撤自己武装过的线: EXTI 线按引脚号共用, 别的口(或 IMU)可能正用着同号的线。
+    void disarm_edges() {
+        if (!edges_armed_)
+            return;
+        CLEAR_BIT(EXTI->IMR1, wiring_.gpio_pin);
+        __HAL_GPIO_EXTI_CLEAR_IT(wiring_.gpio_pin);
+        edges_armed_ = false;
+    }
+
+    [[nodiscard]] bool read_level() const {
+        return HAL_GPIO_ReadPin(wiring_.gpio_port, wiring_.gpio_pin) == GPIO_PIN_SET;
+    }
+
+    void publish(bool high, uint32_t timestamp_quarter_us) const {
+        const std::optional<uint32_t> timestamp =
+            (setting_.input_flags & vc::kGpioInputTimestamp) != 0U
+                ? std::optional<uint32_t>{timestamp_quarter_us}
+                : std::nullopt;
         core::utility::assert_debug(
-            serializer.write_gpio_digital_value(
-                channel_index, {.high = high, .timestamp_quarter_us = timestamp_to_publish})
+            usb::get_serializer().write_gpio_digital_value(
+                line_, {.high = high, .timestamp_quarter_us = timestamp})
             != core::protocol::Serializer::SerializeResult::kInvalidArgument);
     }
 
@@ -261,94 +286,123 @@ private:
         return timer::timer->timepoint().time_since_epoch().count();
     }
 
-    static uint8_t exti_line_from_pin(uint16_t gpio_pin) {
-        core::utility::assert_debug(gpio_pin != 0);
+    // 所属定时器的 ARR + 1。运行时读取而非编译期常量: 两个定时器不共用周期。TIM2 跑
+    // 275 MHz、ARR 5499999, TIM1 跑 1 MHz、ARR 19999, 两者都产生 50 Hz。TIM2 曾同时是
+    // USB-SOF 捕获定时器, 所以周期被锁死; 2026-10-05 起捕获在 TIM5(sync/sof.cpp), TIM2 的
+    // 周期可以按需在 .ioc 里改。
+    [[nodiscard]] uint32_t counter_period() const { return wiring_.timer->Instance->ARR + 1U; }
 
-        uint8_t line = 0;
-        while ((gpio_pin & 0x1U) == 0U) {
-            gpio_pin >>= 1;
-            ++line;
-        }
-
-        return line;
-    }
-
-    static uint8_t channel_index_from_exti_line(uint8_t exti_line) {
-        switch (exti_line) {
-        case 0: return spec::mc02::kGpioDescriptors.kPwm1.channel_index;  // PA0
-        case 2: return spec::mc02::kGpioDescriptors.kPwm2.channel_index;  // PA2
-        case 9: return spec::mc02::kGpioDescriptors.kPwm3.channel_index;  // PE9
-        case 13: return spec::mc02::kGpioDescriptors.kPwm4.channel_index; // PE13
-        default: return kInvalidChannelIndex;
-        }
-    }
-
-    ChannelState& channel_state(uint8_t channel_index) {
-        const auto index = static_cast<std::size_t>(channel_index);
-        core::utility::assert_debug(index < kChannelCount);
-        return channel_states_[index];
-    }
-
-    const ChannelHardware& channel_hardware(uint8_t channel_index) const {
-        const auto index = static_cast<std::size_t>(channel_index);
-        core::utility::assert_debug(index < kChannelCount);
-        return channel_hardware_[index];
-    }
-
-    uint32_t pwm_counter_period(uint8_t channel_index) const {
-        return *channel_hardware(channel_index).autoreload_register + 1U;
-    }
-
-    // 64 位中间量: TIM2 周期为 5500000 计数时, 乘积在 duty 约 780 处溢出 32 位,
-    // 会静默回绕。
-    uint32_t duty16_to_pwm_compare(uint8_t channel_index, uint16_t duty) const {
-        const uint64_t period = pwm_counter_period(channel_index);
+    // 64 位中间量: TIM2 周期为 5500000 计数时, 乘积在 duty 约 780 处溢出 32 位, 会静默
+    // 回绕。
+    [[nodiscard]] uint32_t duty16_to_compare(uint16_t duty) const {
+        const uint64_t period = counter_period();
         return static_cast<uint32_t>(((static_cast<uint64_t>(duty) * period) + 32767U) / 65535U);
     }
 
-    static uint32_t hal_gpio_pull(data::GpioPull pull) {
-        switch (pull) {
-        case data::GpioPull::kNone: return GPIO_NOPULL;
-        case data::GpioPull::kUp: return GPIO_PULLUP;
-        case data::GpioPull::kDown: return GPIO_PULLDOWN;
-        default: core::utility::assert_failed_debug(); return GPIO_NOPULL;
+    const uint8_t line_;
+    const Wiring wiring_;
+    volatile uint32_t* const compare_register_;
+
+    // 写进引脚寄存器的设置; kGpioModeOff = 从没声明过。挂起不清它: 重新声明成同样的设置
+    // 时 configure() 不必重写引脚, resume() 按它重新开工。
+    vc::GpioConfigPayload setting_{};
+    bool running_ = false;
+    bool channel_started_ = false;
+    bool edges_armed_ = false;
+    timer::Timer::Duration sample_period_ = kNoPeriod;
+    timer::Timer::TimePoint next_sample_{};
+};
+
+// GPIO 口的驱动: 四根线。对象在启动时构造(不碰硬件), 线由清单逐根声明启动。
+class Gpio : private core::utility::Immovable {
+public:
+    using Lazy = utility::Lazy<Gpio>;
+    using Spec = spec::mc02::Spec;
+
+    // 口的原语(core/src/link/port_ops.hpp 的 GpioPortDriver)。四根线都在定时器通道上, 也都
+    // 有自己的 EXTI 线 -- 全部能力。口清单里 GPIO 口的能力字节是线数。
+    static constexpr uint8_t kLineCount = 4;
+    static constexpr std::array<uint8_t, kLineCount> kLineCapabilities{
+        spec::kGpioCapPwmPin, spec::kGpioCapPwmPin, spec::kGpioCapPwmPin, spec::kGpioCapPwmPin};
+    static constexpr uint8_t kPortCapabilities = kLineCount;
+    static_assert(kLineCount == Spec::kGpioLineCount);
+
+    Pin pwm1{
+        Spec::Gpios::kPwm1.line,
+        {GPIOA, GPIO_PIN_0, GPIO_AF1_TIM2, &htim2, TIM_CHANNEL_1, EXTI0_IRQn}
+    };
+    Pin pwm2{
+        Spec::Gpios::kPwm2.line,
+        {GPIOA, GPIO_PIN_2, GPIO_AF1_TIM2, &htim2, TIM_CHANNEL_3, EXTI2_IRQn}
+    };
+    Pin pwm3{
+        Spec::Gpios::kPwm3.line,
+        {GPIOE, GPIO_PIN_9, GPIO_AF1_TIM1, &htim1, TIM_CHANNEL_1, EXTI9_5_IRQn}
+    };
+    Pin pwm4{
+        Spec::Gpios::kPwm4.line,
+        {GPIOE, GPIO_PIN_13, GPIO_AF1_TIM1, &htim1, TIM_CHANNEL_3, EXTI15_10_IRQn}
+    };
+
+    // 第 index 根线; 本口没有这根线时为空(下行记录的线号来自主机, 不可信)。
+    [[nodiscard]] Pin* line(uint8_t index) { return index < kLineCount ? pins()[index] : nullptr; }
+
+    // 整口: 会话结束、清单回滚、归属交接。resume() 只让声明过的线重新开工。
+    void suspend() {
+        for (Pin* p : pins())
+            p->suspend();
+    }
+    void resume() {
+        for (Pin* p : pins())
+            p->resume();
+    }
+    [[nodiscard]] link::PortStatus describe() {
+        bool running = false;
+        for (Pin* p : pins())
+            running = running || p->running();
+        return {.running = running, .fd = false};
+    }
+
+    // 新会话取代旧会话: 只清输出值, 引脚仍按刚被接受的声明工作。
+    void zero_outputs() {
+        for (Pin* p : pins())
+            p->zero_output();
+    }
+
+    // 主循环入口, 只在 loop::active 的 kGpioSampling 位置着时调用: 没有引脚配周期采样时
+    // -- 绝大多数接线如此 -- 主循环根本不进来, 也就不去读定时器(一次 D2 域外设访问)。
+    void poll_periodic() {
+        for (Pin* p : pins())
+            p->poll_periodic();
+    }
+
+    // EXTI 回调里, IMU 的两条线之外的边沿。
+    void handle_edge(uint16_t gpio_pin) {
+        for (Pin* p : pins()) {
+            if (p->gpio_pin() == gpio_pin)
+                p->handle_edge();
         }
     }
 
-    const ChannelHardware channel_hardware_[kChannelCount]{
-        {
-         .gpio_port = GPIOA,
-         .gpio_pin = GPIO_PIN_0,
-         .alternate_function = GPIO_AF1_TIM2,
-         .compare_register = &htim2.Instance->CCR1,
-         .autoreload_register = &htim2.Instance->ARR,
-         }, // ch0 PA0 TIM2_CH1 (EXTI0)
-        {
-         .gpio_port = GPIOA,
-         .gpio_pin = GPIO_PIN_2,
-         .alternate_function = GPIO_AF1_TIM2,
-         .compare_register = &htim2.Instance->CCR3,
-         .autoreload_register = &htim2.Instance->ARR,
-         }, // ch1 PA2 TIM2_CH3 (EXTI2)
-        {
-         .gpio_port = GPIOE,
-         .gpio_pin = GPIO_PIN_9,
-         .alternate_function = GPIO_AF1_TIM1,
-         .compare_register = &htim1.Instance->CCR1,
-         .autoreload_register = &htim1.Instance->ARR,
-         }, // ch2 PE9 TIM1_CH1 (EXTI9)
-        {
-         .gpio_port = GPIOE,
-         .gpio_pin = GPIO_PIN_13,
-         .alternate_function = GPIO_AF1_TIM1,
-         .compare_register = &htim1.Instance->CCR3,
-         .autoreload_register = &htim1.Instance->ARR,
-         }, // ch3 PE13 TIM1_CH3 (EXTI13)
-    };
+    [[nodiscard]] bool any_sampling() {
+        for (Pin* p : pins()) {
+            if (p->samples_periodically())
+                return true;
+        }
+        return false;
+    }
 
-    ChannelState channel_states_[kChannelCount];
+private:
+    [[nodiscard]] std::array<Pin*, kLineCount> pins() { return {&pwm1, &pwm2, &pwm3, &pwm4}; }
 };
 
 inline constinit Gpio::Lazy gpio;
+
+inline void refresh_sampling() {
+    if (gpio->any_sampling())
+        loop::set(loop::kGpioSampling);
+    else
+        loop::clear(loop::kGpioSampling);
+}
 
 } // namespace libhcs::firmware::gpio

@@ -29,7 +29,7 @@ USB vendor 类 bulk 传输)所需的环境。
 | Python | 3.x(实测 3.12.3) | 否 | 已装 |
 | Python 包 | `PyYAML`、`jinja2` | 否(pip 装) | 需确认 |
 | HPM SDK | v1.12.0(fork `zyitom/hpm_sdk`,`v1.12.0-3-ge4347411`) | **是**(`bsp/hpm_sdk`) | 随仓库 |
-| TinyUSB | v0.21.0 | **是**(`../c_board/bsp/tinyusb` submodule) | 随仓库，需初始化 |
+| TinyUSB | v0.21.0 | **是**(`../common/bsp/tinyusb` submodule) | 随仓库，需初始化 |
 | RISC-V 工具链 | `rv32imac_zicsr_zifencei_multilib_b_ext`(HPMicro GNU) | **否** | 见下方状态更新 |
 | 烧录工具 | HPMicro Manufacturing Tool v0.6.0(DFU) | 否 | 见 §5 |
 
@@ -81,10 +81,10 @@ pip3 install PyYAML jinja2
 
 无需单独安装——已随仓库 vendored 在 `firmware/hpm_board/bsp/hpm_sdk`。当前固件只使用
 它的 SoC、USB PHY 和寄存器驱动；TinyUSB device stack 来自共享的
-`firmware/c_board/bsp/tinyusb` v0.21.0。clone 后需初始化两项 submodule：
+`firmware/common/bsp/tinyusb` v0.21.0。clone 后需初始化两项 submodule：
 
 ```bash
-git submodule update --init firmware/hpm_board/bsp/hpm_sdk firmware/c_board/bsp/tinyusb
+git submodule update --init firmware/hpm_board/bsp/hpm_sdk firmware/common/bsp/tinyusb
 ```
 
 submodule 指向 **fork `zyitom/hpm_sdk`**(不是上游),当前

@@ -50,12 +50,6 @@ CompileFlags:
 
 ---
 If:
-  PathMatch: .*firmware/ch32_board/.*
-CompileFlags:
-  CompilationDatabase: firmware/ch32_board/build
-
----
-If:
   PathMatch: .*firmware/hpm_board/.*
 CompileFlags:
   CompilationDatabase: firmware/hpm_board/build

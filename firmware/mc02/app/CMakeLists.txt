@@ -1,7 +1,8 @@
 add_executable(mc02_app)
 
-set(MC02_APP_TINYUSB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../c_board/bsp/tinyusb")
+set(MC02_APP_TINYUSB_ROOT "${libhcs_PROJECT_ROOT}/firmware/common/bsp/tinyusb")
 cmake_path(ABSOLUTE_PATH MC02_APP_TINYUSB_ROOT NORMALIZE)
+set(MC02_APP_SEGGER_ROOT "${libhcs_PROJECT_ROOT}/firmware/common/bsp/SEGGER")
 set(MC02_APP_TINYUSB_COMMON_SOURCES
     "${MC02_APP_TINYUSB_ROOT}/src/tusb.c"
     "${MC02_APP_TINYUSB_ROOT}/src/common/tusb_fifo.c"
@@ -38,8 +39,8 @@ target_compile_definitions(stm32cubemx PRIVATE
     CFG_TUSB_MCU=OPT_MCU_STM32H7
 )
 target_include_directories(stm32cubemx SYSTEM PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../c_board/bsp/SEGGER/RTT"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../c_board/bsp/SEGGER/Config"
+    "${MC02_APP_SEGGER_ROOT}/RTT"
+    "${MC02_APP_SEGGER_ROOT}/Config"
     "${libhcs_PROJECT_ROOT}/firmware/c_board"
 )
 
@@ -48,26 +49,21 @@ file(GLOB_RECURSE MC02_APP_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c"
     "${libhcs_PROJECT_ROOT}/core/src/*.cpp"
     "${libhcs_PROJECT_ROOT}/core/src/*.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../c_board/bsp/SEGGER/RTT/*.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../c_board/bsp/SEGGER/RTT/*.S"
+    "${MC02_APP_SEGGER_ROOT}/RTT/*.c"
+    "${MC02_APP_SEGGER_ROOT}/RTT/*.S"
 )
 target_sources(mc02_app PRIVATE
     ${MC02_APP_SOURCES}
 )
 
 target_include_directories(mc02_app SYSTEM PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../c_board/bsp/SEGGER/RTT"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../c_board/bsp/SEGGER/Config"
+    "${MC02_APP_SEGGER_ROOT}/RTT"
+    "${MC02_APP_SEGGER_ROOT}/Config"
 )
 
 target_link_libraries(mc02_app PRIVATE
     tinyusb_app
 )
-
-option(libhcs_APP_IMU_ENABLE "Enable BMI088 initialization and runtime sampling" OFF)
-if(libhcs_APP_IMU_ENABLE)
-    target_compile_definitions(mc02_app PRIVATE libhcs_APP_IMU_ENABLE=1)
-endif()
 
 # Enclosure UART2 / UART3 (USART2 / USART3 RS-485) are ALWAYS compiled in.
 #
@@ -169,23 +165,18 @@ if(libhcs_APP_DEBUG_KNOBS)
     target_compile_definitions(mc02_app PRIVATE libhcs_APP_DEBUG_KNOBS=1)
 endif()
 
-# Shared cross-board USB-SOF time base (src/sync/). OFF by default: it adds a
-# 1 kHz interrupt and, more to the point, the kTimeAnchor/kTimeStatus session
-# types carry a payload after the session header -- a host that enables time sync
-# against firmware without this loses downlink framing, so the two switches must
-# be turned on together (host side: AdvancedOptions::set_enable_time_sync).
+# Shared cross-board USB-SOF time base (src/sync/). In every image and not a
+# build option: the host asks for it in its EP0 manifest (kManifestFlagTimeSync)
+# and only then does the board unmask the SOF interrupt (1 kHz).
 #
 # The --wrap is how the SOF hook reaches the interrupt vector. OTG_HS_IRQHandler
 # lives in bsp/cubemx/Core/Src/stm32h7xx_it.c, which is generated output this
 # repo does not edit, and all it does is call TinyUSB's dcd_int_handler(). The
 # linker reroutes that call to __wrap_dcd_int_handler() in src/sync/sof.cpp,
 # which timestamps and then chains to __real_dcd_int_handler(). Nothing
-# generated is touched and the default build does not carry the flag at all.
-option(libhcs_APP_TIME_SYNC "Run the shared USB-SOF time base" OFF)
-if(libhcs_APP_TIME_SYNC)
-    target_compile_definitions(mc02_app PRIVATE libhcs_APP_TIME_SYNC=1)
-    target_link_options(mc02_app PRIVATE "LINKER:--wrap=dcd_int_handler")
-endif()
+# generated is touched; with the time base off the hook costs one load and a
+# branch per USB interrupt.
+target_link_options(mc02_app PRIVATE "LINKER:--wrap=dcd_int_handler")
 
 option(libhcs_APP_CAN_DIAG "Emit CAN telemetry on the kUart0 uplink" OFF)
 if(libhcs_APP_CAN_DIAG)

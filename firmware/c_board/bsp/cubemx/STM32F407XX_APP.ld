@@ -53,9 +53,14 @@
 ENTRY(Reset_Handler)
 
 /* Specify the memory areas */
+/* RAM 缩到 96K: 其上的 0x20018000..0x20020000(SRAM1 尾部 16K + SRAM2 16K, 32K 对齐)
+ * 是 DMARAM -- 全部 DMA 目标缓冲的归宿。D-cache 开启后(app.cpp 的 ART 使能)该窗口被
+ * MPU 设为非缓存(TEX1/C0/B0), DMA 与 CPU 双向直通内存, 免逐传输做 clean/invalidate。
+ * 除 .dmaram 段外不要往这里放任何东西 -- 普通数据放这里等于放弃缓存。 */
 MEMORY
 {
-RAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 128K
+RAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 96K
+DMARAM (rw)    : ORIGIN = 0x20018000, LENGTH = 32K
 CCMRAM (xrw)      : ORIGIN = 0x10000000, LENGTH = 64K - 64
 MAILBOX (rw)   : ORIGIN = 0x1000FFC0, LENGTH = 64
 FLASH (rx)      : ORIGIN = 0x8010000, LENGTH = 960K
@@ -250,6 +255,23 @@ SECTIONS
 
   PROVIDE( __bss_start = __tbss_start );
   PROVIDE( __bss_size = __bss_end - __bss_start );
+
+  _sidmaram = LOADADDR(.dmaram);
+
+  /* DMA 目标缓冲区(与 .ccmram 同一形态: 带加载映像, 上电由 App::App() 拷入)。
+   * 存放被 DMA 读写的缓冲(uart 收发环/暂存、spi 收发、SOF 捕获目的字)。该区域被
+   * app.cpp 的 MPU 区域设为非缓存, DMA 与 CPU 直通; 段必须 32 字节对齐(缓存行,
+   * 便于审计隔离)。往这里放非 DMA 数据等于让它绕开 D-cache, 不要这么做。 */
+  .dmaram :
+  {
+    . = ALIGN(32);
+    _sdmaram = .;
+    *(.dmaram)
+    *(.dmaram*)
+
+    . = ALIGN(32);
+    _edmaram = .;
+  } >DMARAM AT> FLASH
 
   .boot_mailbox (NOLOAD) :
   {

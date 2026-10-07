@@ -11,14 +11,24 @@
 #include <stm32h7xx_hal_fdcan.h>
 
 #include "core/include/libhcs/data/datas.hpp"
+#include "core/include/libhcs/spec/mc02/ports.hpp"
+#include "core/src/link/port.hpp"
 #include "core/src/protocol/serializer.hpp"
 #include "core/src/utility/assert.hpp"
 #include "core/src/utility/immovable.hpp"
+#include "firmware/common/app/src/utility/event_counter.hpp"
+#include "firmware/common/app/src/utility/latched_bus_error.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/ring_buffer.hpp"
 #include "firmware/mc02/app/src/led/led.hpp"
-#include "firmware/mc02/app/src/utility/lazy.hpp"
-#include "firmware/mc02/app/src/utility/ring_buffer.hpp"
+#include "firmware/mc02/app/src/sync/sof.hpp"
+#include "firmware/mc02/app/src/sync/sof_capture.hpp"
+#include "firmware/mc02/app/src/utility/loop_work.hpp"
 
 namespace libhcs::firmware::can {
+
+namespace vc = libhcs::core::protocol::vendor_control;
+namespace link = libhcs::core::link;
 
 // 帧类型是总线的属性, 不属于单个帧。曾按主机设置的头部位逐帧选择, 该位已废弃
 // (见 core/src/protocol/protocol.hpp 的 CanHeaderLayout); 模式现固定于此, 主机
@@ -40,18 +50,23 @@ struct CanPort {
     CanMode mode;
 };
 
-// 表序即总线序: 下标 0 对应丝印 CAN1(kCan1), 依此类推, 与
-// core/include/libhcs/spec/mc02/can.hpp 及 can.cpp 的 ISR 分发一致。三处需同步维护。
+// 表序即总线序: 下标 0 对应丝印 CAN1, 依此类推, 与 can.cpp 的 ISR 分发一致。身份引用
+// spec/mc02/ports.hpp 的具名描述符, 行序由 ports.hpp 的 static_assert 钉死。
 inline constexpr CanPort kCanPorts[] = {
-    {.handle = &hfdcan1, .data_id = data::DataId::kCan1, .mode = CanMode::kCanFd},
-    {.handle = &hfdcan2, .data_id = data::DataId::kCan2, .mode = CanMode::kCanFd},
-    {.handle = &hfdcan3, .data_id = data::DataId::kCan3, .mode = CanMode::kCanFd},
+    {.handle = &hfdcan1, .data_id = spec::mc02::Spec::Cans::kCan1.data_id, .mode = CanMode::kCanFd},
+    {.handle = &hfdcan2, .data_id = spec::mc02::Spec::Cans::kCan2.data_id, .mode = CanMode::kCanFd},
+    {.handle = &hfdcan3, .data_id = spec::mc02::Spec::Cans::kCan3.data_id, .mode = CanMode::kCanFd},
 };
 inline constexpr size_t kCanCount = std::size(kCanPorts);
 static_assert(kCanCount == 3);
 
 class Can : private core::utility::Immovable {
 public:
+    // 这个驱动作为 EP0 口能做什么(kGetPortList 原样上报): 帧型可切(只翻 Tx 元素的
+    // FDF/BRS, 控制器保持 FD 能力); 速率不可设(位时序由 CubeMX 预设钉死, 声明里的速率
+    // 只作核对); 不承载长帧(RX FIFO 元素仍是 8 字节, 扩容前不广告"能发不能收"的能力)。
+    static constexpr uint8_t kPortCapabilities = spec::kCanCapModeSettable;
+
     using Lazy = utility::Lazy<Can, FDCAN_HandleTypeDef*, uint32_t>;
 
     Can(FDCAN_HandleTypeDef* hal_can_handle, uint32_t hal_filter_index)
@@ -65,11 +80,49 @@ public:
     }
 
     // 本总线当前实际发送的帧型, 可经 EP0 配置通道在运行时切换
-    // (usb/vendor_control.cpp 的 kSetCanConfig + kCanConfigApply)。控制器自身保持
+    // (usb/vendor_control.cpp 的清单应用)。控制器自身保持
     // FD 能力 -- CubeMX 以 FDCAN_FRAME_FD_BRS 启动它, 这里不进 INIT 模式 -- 切换
     // 只改本驱动写进 Tx 元素的 FDF/BRS 标志; 收方向两个模式都是超集。
     [[nodiscard]] bool fd_mode() const { return canfd_; }
     void set_fd_mode(bool fd) { canfd_ = fd; }
+
+    // ---- 启停: 总线只在主机声明之后才工作 ----
+    //
+    // 构造只把控制器配置好并留在 INIT 模式: 不上总线、不应答别人的帧、不发错误帧,
+    // 也没有任何中断。声明清单里有这一路, 就是主机声明要用这条总线,
+    // 控制器随即启动(core 的清单应用 -> resume()); 新的清单不再声明它、或会话结束
+    // (ports::Registry::suspend_all())时停掉。帧型先于启动设好, 所以控制器一上总线发的就是
+    // 主机要的帧型。
+    //
+    // 只在主循环调用(EP0 处理器与会话状态机都经 tud_task() / 主循环到达)。
+    [[nodiscard]] bool started() const { return started_; }
+
+    void start() {
+        if (started_)
+            return;
+        constexpr auto ok = HAL_OK;
+        core::utility::assert_always(HAL_FDCAN_Start(hal_can_handle_) == ok);
+        core::utility::assert_always(
+            HAL_FDCAN_ActivateNotification(hal_can_handle_, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0)
+            == ok);
+        // 总线关闭恢复: 本板是转发桥, 瞬时线路故障(下游节点拔掉、无 ACK)不能让端口
+        // 挂死到重启为止。该通知触发 HAL_FDCAN_ErrorStatusCallback(见 can.cpp),
+        // 重启 bus-off 恢复流程, 端口可自行复活。
+        core::utility::assert_always(
+            HAL_FDCAN_ActivateNotification(hal_can_handle_, FDCAN_IT_BUS_OFF, 0) == ok);
+        // 协议错误(仲裁段 / 数据段)各进一次中断, 当场读 PSR 锁存错误码(note_bus_errors)。
+        // 不能等主循环: LEC/DLEC 在下一帧成功收发后就被硬件清成 kNone, 总线忙时 250 ms 一读
+        // 几乎永远看不到错误码。单发模式下每个出错的帧至多一次, 中断数以帧率为上限。
+        core::utility::assert_always(
+            HAL_FDCAN_ActivateNotification(
+                hal_can_handle_, FDCAN_IT_ARB_PROTOCOL_ERROR | FDCAN_IT_DATA_PROTOCOL_ERROR, 0)
+            == ok);
+        started_ = true;
+        loop::set(loop::bit(kCanPorts[diag_index()].data_id));
+    }
+
+    // 定义在 can.cpp: 要清本控制器在 transmit_pending_mask_ 里的那一位。
+    void stop();
 
     // 软件 TX 环的深度。
     static constexpr size_t kTransmitQueueSize = 64;
@@ -80,18 +133,6 @@ public:
     void handle_downlink(const data::CanDataView& data);
     void handle_uplink(data::DataId field_id, core::protocol::Serializer& serializer);
 
-    // 控制器错误状态, 供 EP0 状态查询(usb/vendor_control.cpp)使用。每次调用直接
-    // 读硬件: PSR 的 LEC/DLEC 读后自清为"无变化", 缓存副本会永远报旧错误, 而跳过
-    // 读取则会对唯一的另一读者隐瞒错误。那个读者是 bus-off 恢复路径, 它读的是
-    // 协议状态里的 BusOff -- 电平标志, 不会自清 -- 因此两者不会互相抹掉对错误
-    // 锁存的观察。
-    struct Status {
-        uint8_t tec, rec, last_error, data_last_error, flags;
-        uint32_t tx_occurred, tx_cancelled, rx_frames, rx_fifo_level;
-    };
-
-    [[nodiscard]] Status status() const;
-
     // 把本控制器的软件队列排入硬件 Tx FIFO。只有 FIFO 满过队列才会有内容, 故
     // 几乎总为空; 判空内联在此, 空队列零调用开销。主循环走
     // drain_pending_transmits(), 这个单总线形式留给只关心单个控制器的调用方。
@@ -101,8 +142,9 @@ public:
         return drain_transmit_queue();
     }
 
-    // 三路控制器共用的主循环入口。transmit_pending_mask_ 每控制器一位, 表示其
-    // 队列可能仍有帧, 三路全空的常见情况因此只需一次加载加一次分支。
+    // 三路控制器共用的主循环入口, 只在至少有一条总线被声明(loop::active 的 kCanBuses
+    // 位)时调用。transmit_pending_mask_ 每控制器一位, 表示其队列可能仍有帧, 三路全空的
+    // 常见情况因此只需一次加载加一次分支。
     //
     // mask 是普通数据而非原子量: 读写双方都只在主循环运行 -- handle_downlink 仅
     // 经 tud_task() 到达(TinyUSB vendor class 未注册 xfer_isr, tud_vendor_rx_cb
@@ -115,38 +157,66 @@ public:
         } else {
             drain_pending_transmits_slow();
         }
-
-        // ES0491 2.22.3 守护: 每 kStuckCheckPassInterval 趟主循环查一次各控制器的
-        // 挂起发送请求(50-85 kHz 循环下约每 6-10 ms), 详见 recover_stuck_transmits()。
-        // 三次 D2 域寄存器读摊在 512 趟上; 热路径只在命中检查的那一趟多付一次分支。
-        if ((++stuck_check_phase_ & (kStuckCheckPassInterval - 1U)) == 0U) [[unlikely]]
-            recover_all_stuck_transmits();
     }
+
+    // ES0491 (STM32H72x/73x) 2.22.3 的软件守护, 机制见 can.cpp 的
+    // recover_stuck_transmits()。逐控制器跑一遍。由主循环的毫秒杂务调用(每毫秒一次,
+    // 且只在有总线被声明时): 判据是"挂起超过 20 ms", 毫秒一查绰绰有余, 而主循环的
+    // 每一趟不必为它付任何东西。定义在 can.cpp, 因为 can1/2/3 声明在本类之后。
+    static void recover_all_stuck_transmits();
 
     // 仅 HAL_FDCAN_ErrorStatusCallback(IR.BO 的置位/清零两个沿, 中断上下文)调用。
     // bus-off 恢复期间(129*11 个隐性位, 约 1.4 ms)挂起的发送请求合法地保持 TXBRP
     // 非零, 守护以该标志为屏蔽位; DTCM 内对齐字节写在 M7 上是原子的。
     void note_bus_off(bool bus_off) { bus_off_ = bus_off; }
 
+    // ---- 端口接口(core/src/link/ 的通用 CAN 操作按这一组原语工作) ----
+    //
+    // 全部是冷路径(EP0 的清单声明与读回)。本板的速率由 CubeMX 预设钉死, 声明里的
+    // 速率只是核对 -- setting()/expected_of() 因此都指向硬件事实; 能改的只有帧型。
+    [[nodiscard]] bool running() const { return started_; }
+    void suspend() { stop(); }
+    void resume() { start(); }
+    [[nodiscard]] bool fd_now() const { return canfd_; }
+    // 寄存器预设重构的位时序事实(定义在 can.cpp)。
+    [[nodiscard]] link::CanTimingValue timing() const;
+    [[nodiscard]] link::CanSetting setting() const {
+        const link::CanTimingValue t = timing();
+        return {
+            .fd = canfd_,
+            .arbitration_baudrate = t.arbitration_baudrate,
+            .data_baudrate = t.data_baudrate};
+    }
+    [[nodiscard]] link::CanTimingValue expected_of(const link::CanSetting&) const {
+        return timing(); // 帧型不影响上报的速率(控制器保持 FD 能力), 时序不变
+    }
+    // 应用 = 切 Tx 元素的 FDF/BRS 标志; 控制器不进 INIT, 速率不变。回读即 canfd_。
+    [[nodiscard]] bool apply_setting(const link::CanSetting& s) {
+        set_fd_mode(s.fd);
+        return fd_now() == s.fd;
+    }
+    void read_config(vc::CanConfigPayload& out) const;
+    // 运行时状态, 每个 keepalive 轮次在主循环读一次(见 can.cpp)。
+    [[nodiscard]] data::CanStatusView read_status();
+    // 协议错误中断(line0_isr)里调用: 读一次 PSR, 把真实错误码交给锁存。
+    void note_bus_errors();
+    [[nodiscard]] link::PortStatus describe() const { return {.running = started_, .fd = canfd_}; }
+
 private:
     bool drain_transmit_queue();
     static void drain_pending_transmits_slow();
     static bool transmit_queues_empty();
 
-    // ES0491 (STM32H72x/73x) 2.22.3 的软件守护, 机制见 can.cpp 的
-    // recover_stuck_transmits()。逐控制器跑一遍; 定义在 can.cpp, 因为 can1/2/3
-    // 声明在本类之后, 类内看不到。
-    static void recover_all_stuck_transmits();
     void recover_stuck_transmits();
 
     bool bus_off_ = false;
 
+    // 控制器是否在总线上。只在主循环写; RX / bus-off 中断只读, DTCM 内对齐字节的
+    // 读写在 M7 上是原子的。
+    bool started_ = false;
+
     // 非 0 表示"TXBRP 非零且非 bus-off"自该 HAL_GetTick 毫秒起持续; 0 表示无。
     uint32_t stuck_request_since_ms_ = 0;
-
-    // 守护检查的节流相位与间隔: 主循环每 512 趟查一次。
-    static constexpr uint32_t kStuckCheckPassInterval = 512;
-    [[gnu::section(".dtcm")]] static inline constinit uint32_t stuck_check_phase_ = 0;
 
     // diag_index() 对应的位, 置位表示该控制器的队列可能仍有帧; 放在控制器旁的
     // 零等待 DTCM。见 drain_pending_transmits()。
@@ -176,17 +246,28 @@ private:
                 FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE)
             == ok);
 
-        // 不启用硬件 RX 时间戳: 内部计数器只有 16 位, 约 65.5 ms 回绕,
-        // 无法承载协议要求的 32 位微秒时间戳。handle_uplink() 不填
-        // CanDataView::timestamp_us, 开着只会白耗总线周期。若上行恢复上报时间戳,
-        // 取消下面两行注释即可; 它们必须在控制器仍处于 READY 态时执行
-        // (即 HAL_FDCAN_Start 之前)。
+        // 硬件 RX 时间戳: 外部计数器(TSCC.TSS = 10), 即 TIM3 [RM0468 61.5.8], 在帧起始沿锁进
+        // RX 元素 R1[15:0]; handle_uplink() 经 sync::sof_capture::stamp_of() 把它换成共享微帧
+        // 轴上的位置(CanDataView::sof_stamp)。内部计数器不用: 一拍是一个标称位时间
+        // (1 Mbit/s 下 1 us), 与 SOF 也不在同一个计数器上。总是开(TIM3 不走就锁 0, 没人
+        // 读); 必须在 READY 态执行(start() 里的 HAL_FDCAN_Start 之前)。
         //
-        // 内部 16 位计数器, 一个 tick = 一个标称位时间, 在 1 Mbit/s 仲裁速率下即 1 us。
-        // core::utility::assert_always(
-        //     HAL_FDCAN_ConfigTimestampCounter(hal_can_handle_, FDCAN_TIMESTAMP_PRESC_1) == ok);
-        // core::utility::assert_always(
-        //     HAL_FDCAN_EnableTimestampCounter(hal_can_handle_, FDCAN_TIMESTAMP_INTERNAL) == ok);
+        // TIM3 只有 16 位: 帧起始到接收中断若超过它的回绕窗口, 时间戳认不出过了几圈。
+        // 按本总线的标称位时间估最长的帧(经典扩展帧 8 字节、填充位最多, 约 160 位)
+        // 加 100 us 中断余量, 窗口盖不住就不给这条总线的帧打戳。1 Mbit/s 是 260 us,
+        // 窗口 357 us(TIM3 7.3 ns 一拍, 回绕 477 us 的 3/4); 本板速率由 .ioc 钉死在
+        // 1M/5M, 低于约 620 kbit/s 的总线才会不打戳。窗口在第一次开时间基准时才定下
+        // (sof_capture::configure()), 所以这里只算帧龄上界, 接收中断逐帧问。
+        core::utility::assert_always(
+            HAL_FDCAN_EnableTimestampCounter(hal_can_handle_, FDCAN_TIMESTAMP_EXTERNAL) == ok);
+        const auto& init = hal_can_handle_->Init;
+        const std::uint64_t kernel_hz = HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_FDCAN);
+        const std::uint64_t bit_tq =
+            init.NominalPrescaler * (1U + init.NominalTimeSeg1 + init.NominalTimeSeg2);
+        if (kernel_hz != 0U) {
+            const std::uint64_t longest_frame_ns = (160U * bit_tq * 1'000'000'000U) / kernel_hz;
+            longest_frame_age_ns_ = static_cast<std::uint32_t>(longest_frame_ns + 100'000U);
+        }
 
         // 发送延迟补偿(TDC)。数据段速率 =
         // 80 MHz / (DataPrescaler 1 * (1 + DataTimeSeg1 13 + DataTimeSeg2 2)) = 5 Mbit/s,
@@ -200,22 +281,14 @@ private:
         // 收发器无毛刺问题时的常规选择。
         //
         // STM32F407 完全没有 CAN-FD, 所以 c_board 没有对应逻辑。
-        // 必须在 READY 态执行, 即下面 HAL_FDCAN_Start 之前。
+        // 必须在 READY 态执行, 即 start() 里的 HAL_FDCAN_Start 之前。
         const uint32_t tdc_offset =
             hal_can_handle_->Init.DataPrescaler * hal_can_handle_->Init.DataTimeSeg1;
         core::utility::assert_always(
             HAL_FDCAN_ConfigTxDelayCompensation(hal_can_handle_, tdc_offset, 0) == ok);
         core::utility::assert_always(HAL_FDCAN_EnableTxDelayCompensation(hal_can_handle_) == ok);
 
-        core::utility::assert_always(HAL_FDCAN_Start(hal_can_handle_) == ok);
-        core::utility::assert_always(
-            HAL_FDCAN_ActivateNotification(hal_can_handle_, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0)
-            == ok);
-        // 总线关闭恢复: 本板是转发桥, 瞬时线路故障(下游节点拔掉、无 ACK)不能让端口
-        // 挂死到重启为止。该通知触发 HAL_FDCAN_ErrorStatusCallback(见 can.cpp),
-        // 重启 bus-off 恢复流程, 端口可自行复活。
-        core::utility::assert_always(
-            HAL_FDCAN_ActivateNotification(hal_can_handle_, FDCAN_IT_BUS_OFF, 0) == ok);
+        // 控制器留在 READY(INIT 模式), 不在此启动: 见 start()。
     }
 
     // 遥测用的逻辑编号, 由外设实例推导而非存储: 构造函数不带索引参数,
@@ -233,9 +306,23 @@ private:
     // 本控制器往总线上发送的帧格式, 构造时由 kCanPorts 固定。
     bool canfd_ = false;
 
-    // 开机以来交给 serializer 的帧数, 由 EP0 状态查询上报。仅 RX 中断写、仅主
-    // 循环读; Cortex-M 上对齐的 32 位读写是原子的, 且这里只关心数值变化, 无需同步。
-    uint32_t forwarded_frames_ = 0;
+    // 帧起始到接收中断最长可能隔多久(ns, 见 config_can()): 时间基准开着、且它装得进
+    // TIM3 的回绕窗口时, 收到的帧才带共享微帧轴上的时间戳。0 = 内核时钟读不出, 不打戳。
+    std::uint32_t longest_frame_age_ns_ = 0;
+
+    // 板子自己丢的帧(read_status() 报给主机): 下行撞上发送队列满(主循环写),
+    // 上行撞上上行批量池满(RX 中断写)。
+    utility::EventCounter tx_dropped_;
+    utility::EventCounter rx_dropped_;
+    // 单发作废的帧(push_to_hardware() 清点, 主循环写)与 RX FIFO0 溢出(read_status() 记)。
+    utility::EventCounter cancelled_frames_;
+    utility::EventCounter rx_lost_;
+    // 最近一次真实错误码(仲裁段 / 数据段), 只协议错误中断(note_bus_errors)写。
+    utility::LatchedBusError last_bus_error_;
+    utility::LatchedBusError last_data_bus_error_;
+    // 本次启动以来写过帧的发送槽(只在主循环读写; stop() 清零)。bus-off 恢复不清: 那在
+    // 中断里, 清了就与主循环抢写; 代价是恢复后至多一个 FIFO 深度的槽可能被多计作废。
+    uint32_t used_tx_slots_ = 0;
 
     struct TransmitMailboxData {
         uint32_t identifier; // Tx 元素 T0: ID + XTD/RTR 标志
@@ -273,5 +360,9 @@ inline Can* can_by_index(size_t index) {
     default: return nullptr;
     }
 }
+
+// 三路 FDCAN 第 0 中断线的处理器(can.cpp, 放在 ITCM)写进向量表。App 在把向量表搬进
+// DTCM 之后调用(app.cpp), 于是这三条接收中断从取向量到转发全程不碰 FLASH。
+void install_interrupt_vectors(std::uint32_t* vectors);
 
 } // namespace libhcs::firmware::can

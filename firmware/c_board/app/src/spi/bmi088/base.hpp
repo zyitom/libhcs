@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono> // IWYU pragma: keep (https://github.com/llvm/llvm-project/issues/68213)
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,10 @@
 #include "firmware/c_board/app/src/timer/timer.hpp"
 
 namespace libhcs::firmware::spi::bmi088 {
+
+// IMU 口声明了没有(ImuPort::resume / suspend 写, 主循环)。传感器照常按编译期挡位采样,
+// 没声明时三路样本(加速度、陀螺仪、温度)一律不上报 -- 没声明的口不工作。SPI 完成中断读。
+inline constinit std::atomic<bool> uplink_enabled{false};
 
 template <typename TraitsT>
 class Bmi088Base : private SpiModule {

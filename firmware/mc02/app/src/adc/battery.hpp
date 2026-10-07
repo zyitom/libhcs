@@ -8,7 +8,7 @@
 
 #include "core/src/utility/assert.hpp"
 #include "core/src/utility/immovable.hpp"
-#include "firmware/mc02/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 
 // 电阻分压接入 ADC 通道的电池/电源轨电压, 循环 DMA 采样, 无需任何代码等待转换。
 //
@@ -123,8 +123,8 @@ public:
     // 平均, 与对稳定的窗口取平均同样有意义。无锁、无 cache 维护, 转发循环无需
     // 等待任何东西。
     [[nodiscard]] uint32_t raw() const {
-        // start() asserts sample_count > 0 before setting started_; the analyzer
-        // cannot see that invariant, so the division keeps its own guard.
+        // start() 在置 started_ 之前断言 sample_count > 0; 分析器看不见这条不变量,
+        // 所以这里的除法自己带保护。
         if (!started_ || config_.sample_count == 0)
             return 0;
         uint32_t sum = 0;

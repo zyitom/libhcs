@@ -15,14 +15,26 @@
 
 #include "core/include/libhcs/data/datas.hpp"
 #include "core/src/utility/assert.hpp"
+#include "firmware/common/app/src/utility/ring_buffer.hpp"
 #include "firmware/mc02/app/src/timer/timer.hpp"
-#include "firmware/mc02/app/src/utility/ring_buffer.hpp"
 
 namespace libhcs::firmware::uart {
 
+// characters 个字符在线上占的时间, 向上取整到定时器 tick。一个字符 = 起始位 + 数据位
+// + 校验位 + 停止位(bits_per_character)。纯算术, 不碰寄存器。
+[[nodiscard]] constexpr timer::Timer::Duration
+    line_time(uint32_t characters, uint32_t bits_per_character, uint32_t baudrate) {
+    const uint64_t bits = uint64_t{characters} * bits_per_character;
+    return timer::Timer::Duration{
+        static_cast<uint32_t>((bits * timer::Timer::kClockFrequency + baudrate - 1U) / baudrate)};
+}
+static_assert(line_time(2, 10, 921'600).count() == 87);  // 8N1: 21.7 us
+static_assert(line_time(2, 10, 9'600).count() == 8334);  // 8N1: 2.08 ms
+static_assert(line_time(2, 12, 100'000).count() == 960); // DBUS 8E2: 240 us
+
 // 带 idle 边界保持的环形 DMA 发送。ring 缓存下行包; 被标为 idle_delimited 的
-// 包会在其边界记录检查点, try_dequeue 在线路静默满 300 us 前拒绝越过检查点
-// 发送, 以保住按 idle 定界的设备所依赖的帧结构。
+// 包会在其边界记录检查点, try_dequeue 在线路静默满两个字符时间(idle_gap_)前拒绝
+// 越过检查点发送, 以保住按 idle 定界的设备所依赖的帧结构。
 //
 // half_duplex 区分独占总线的口与 RS-485 双线共享总线的口; 本板仅此一种区别,
 // 且为 RS-485 固有属性, 故用裸 bool 而非策略类型。它守护的分支都在
@@ -53,6 +65,11 @@ public:
     // 代价, 取小则会碰撞。half_duplex 为 false 时不使用。
     static constexpr auto kTurnaroundDeadline = std::chrono::microseconds(1000);
 
+    // idle 定界包之后线路至少静默几个字符时间(全双工口)。对端按"一个字符时间没有
+    // 起始位"判帧尾(STM32 的 IDLE 即如此), 两个字符留一倍余量。旧的固定 300 us 在
+    // 9600 下不到一个字符(对端分不出帧), 在 921600 下多等约 27 个字符。
+    static constexpr uint32_t kIdleGapCharacters = 2;
+
     static constexpr size_t kBufferSize = buffer_size;
     static constexpr size_t kBufferMask = kBufferSize - 1;
     static_assert((kBufferSize & (kBufferSize - 1)) == 0);
@@ -69,10 +86,19 @@ public:
     static constexpr size_t kMaxIdleCheckpointCount = checkpoint_count;
     static_assert((kMaxIdleCheckpointCount & (kMaxIdleCheckpointCount - 1)) == 0);
 
+    // DMA 读的两段内存, 必须放在 DMA1/DMA2 够得着的非缓存区(.d2_sram)。不在本对象
+    // 里, 理由同 RxBuffer::DmaMemory: 主循环每圈读写的下标和标志才能进 DTCM。
+    struct DmaMemory {
+        alignas(uint32_t) std::array<std::byte, kBufferSize> ring{};
+        alignas(uint32_t) std::array<std::byte, kStagingBufferSize> staging{};
+    };
+
     explicit TxBuffer(
-        UART_HandleTypeDef* hal_uart_handle, void (*dma_complete_callback)(DMA_HandleTypeDef*),
+        UART_HandleTypeDef* hal_uart_handle, DmaMemory& dma,
+        void (*dma_complete_callback)(DMA_HandleTypeDef*),
         void (*dma_error_callback)(DMA_HandleTypeDef*))
         : hal_uart_handle_(hal_uart_handle)
+        , dma_(dma)
         , dma_complete_callback_(dma_complete_callback)
         , dma_error_callback_(dma_error_callback) {
         core::utility::assert_always(hal_uart_handle_ != nullptr);
@@ -80,6 +106,13 @@ public:
         // UartRxOnly。
         core::utility::assert_always(tx_dma_handle() != nullptr);
         bind_tx_dma_callbacks();
+    }
+
+    // 端口的速率或帧格式变了(EP0 清单提交时、构造时): 按新的字符时间重算包间空隙。
+    // 冷路径; 每趟主循环只读存下的结果。baudrate 为 0 说明内核时钟没解出来, 保持原值。
+    void set_line_rate(uint32_t baudrate, uint32_t bits_per_character) {
+        if (baudrate != 0U) [[likely]]
+            idle_gap_ = line_time(kIdleGapCharacters, bits_per_character, baudrate);
     }
 
     bool try_enqueue(const data::UartDataView& data_view) {
@@ -138,8 +171,8 @@ public:
             if (wrapped)
                 trailing_boundary_segmentable_ = !delimited;
 
-            std::memcpy(ring_buffer_.data() + offset, data_view.uart_data.data(), slice);
-            std::memcpy(ring_buffer_.data(), data_view.uart_data.data() + slice, size - slice);
+            std::memcpy(dma_.ring.data() + offset, data_view.uart_data.data(), slice);
+            std::memcpy(dma_.ring.data(), data_view.uart_data.data() + slice, size - slice);
 
             in_.store(
                 static_cast<IndexType>(in + static_cast<IndexType>(size)),
@@ -165,7 +198,7 @@ public:
         // DMA 完成只代表最后一个字节到达 TDR, 在 STM32H7 上并非发送结束: 所有
         // 端口都开了 FIFO 模式(见 RxBuffer::enable_fifo_mode, 该决定为何放在
         // 驱动里即由此而来), TXFIFO 深 16(DS13313 Table 5), 其后还可压着至多
-        // 16 字节, 921600 baud 下约 173 us, 与它所供的 300 us idle 窗口同量级。
+        // 16 字节, 是它所供的两字符 idle 窗口的八倍(921600 baud 下约 173 us)。
         // 按 DMA 完成计时会把仍在发送判成线路空闲, 而下方检查点的全部意义正是
         // 让 idle 定界包保持分隔。
         //
@@ -192,8 +225,7 @@ public:
                 is_idle_ = peer_idle_count != peer_idle_count_at_tx_
                         || timer::timer->check_expired(tx_complete_timepoint_, kTurnaroundDeadline);
             } else {
-                is_idle_ = timer::timer->check_expired(
-                    tx_complete_timepoint_, std::chrono::microseconds(300));
+                is_idle_ = timer::timer->check_expired(tx_complete_timepoint_, idle_gap_);
             }
         }
 
@@ -250,24 +282,30 @@ public:
 
         if (wrapped && !trailing_boundary_segmentable_) {
             // 严格包跨回绕必须连续: 摊平进 staging, 一次 DMA 发出。
-            std::memcpy(staging_buffer_.data(), ring_buffer_.data() + offset, slice);
-            std::memcpy(staging_buffer_.data() + slice, ring_buffer_.data(), size - slice);
+            std::memcpy(dma_.staging.data(), dma_.ring.data() + offset, slice);
+            std::memcpy(dma_.staging.data() + slice, dma_.ring.data(), size - slice);
             out = static_cast<IndexType>(out + static_cast<IndexType>(size));
             out_.store(out, std::memory_order::release);
 
             start_tx_dma(
-                reinterpret_cast<const uint8_t*>(staging_buffer_.data()),
-                static_cast<uint16_t>(size));
+                reinterpret_cast<const uint8_t*>(dma_.staging.data()), static_cast<uint16_t>(size));
             return true;
         }
 
         // 非严格路径可直接从 ring 流式发送, 完成时再提交进度。
         start_tx_dma(
-            reinterpret_cast<const uint8_t*>(ring_buffer_.data() + offset),
+            reinterpret_cast<const uint8_t*>(dma_.ring.data() + offset),
             static_cast<uint16_t>(slice));
         in_flight_ = static_cast<IndexType>(slice);
 
         return true;
+    }
+
+    // 发送侧已彻底排空: ring 里没有待发字节, 也没有 DMA 在途。端口停口之后靠它
+    // 判断还要不要继续轮询(见各端口的 try_transmit())。
+    [[nodiscard]] bool drained() const {
+        return !is_busy_.load(std::memory_order::acquire) && in_flight_ == 0
+            && in_.load(std::memory_order::relaxed) == out_.load(std::memory_order::relaxed);
     }
 
     void tx_complete_callback() {
@@ -336,14 +374,12 @@ private:
     }
 
     UART_HandleTypeDef* hal_uart_handle_;
-    void (*dma_complete_callback_)(DMA_HandleTypeDef*);
-    void (*dma_error_callback_)(DMA_HandleTypeDef*);
-
-    // 两个缓冲都在端口对象内, uart.hpp 把它放进 .d2_sram(0x30000000 的 D2
+    // ring 与 staging 所在的内存。uart.hpp 把它放进 .d2_sram(0x30000000 的 D2
     // SRAM, 由 MPU region 1 (app.cpp)映射为 non-cacheable), DMA 无需维护缓存
     // 即可看到这些写入。
-    alignas(uint32_t) std::array<std::byte, kBufferSize> ring_buffer_{};
-    alignas(uint32_t) std::array<std::byte, kStagingBufferSize> staging_buffer_{};
+    DmaMemory& dma_;
+    void (*dma_complete_callback_)(DMA_HandleTypeDef*);
+    void (*dma_error_callback_)(DMA_HandleTypeDef*);
 
     std::atomic<IndexType> in_{0};
     std::atomic<IndexType> out_{0};
@@ -367,6 +403,8 @@ private:
     [[no_unique_address]] std::conditional_t<half_duplex, uint16_t, Unused>
         peer_idle_count_at_tx_{};
     timer::Timer::TimePoint tx_complete_timepoint_{timer::Timer::TimePoint::min()};
+    // 两个字符时间, set_line_rate() 存下。半双工口不读它(那里是 kTurnaroundDeadline)。
+    timer::Timer::Duration idle_gap_{line_time(kIdleGapCharacters, 10, 115'200)};
 
     utility::RingBuffer<IndexType, kMaxIdleCheckpointCount> idle_checkpoints_;
 };

@@ -12,9 +12,9 @@
 # include "core/include/libhcs/data/datas.hpp"
 # include "core/src/protocol/protocol.hpp"
 # include "core/src/protocol/serializer.hpp"
+# include "firmware/common/app/src/utility/interrupt_lock.hpp"
 # include "firmware/hpm_board/app/src/link/uplink.hpp"
 # include "firmware/hpm_board/app/src/timer/timer.hpp"
-# include "firmware/hpm_board/app/src/utility/interrupt_lock.hpp"
 
 namespace libhcs::firmware::sync::sof_probe {
 namespace {

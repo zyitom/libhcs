@@ -13,8 +13,8 @@
 #include "firmware/c_board/app/src/spi/spi.hpp"
 #include "firmware/c_board/app/src/timer/timer.hpp"
 #include "firmware/c_board/app/src/usb/vendor.hpp"
-#include "firmware/c_board/app/src/utility/interrupt_lock.hpp"
-#include "firmware/c_board/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/interrupt_lock.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 
 namespace libhcs::firmware::spi::bmi088 {
 
@@ -24,16 +24,15 @@ class Temperature final
 public:
     using Lazy = utility::Lazy<Temperature, Spi::Lazy*>;
 
-    // The BMI088 temperature register (TEMP_MSB/TEMP_LSB) only updates every 1.28 s
-    // (datasheet). The probe period must stay below that, so each probe interval holds at
-    // most one update: none is missed, and handle_uplink()'s midpoint estimate of the change
-    // time stays valid. 1 Hz leaves ~22% margin; the change time is then known to +-0.5 s,
-    // which does not matter for a temperature.
+    // BMI088 的温度寄存器(TEMP_MSB/TEMP_LSB)每 1.28 s 才更新一次(数据手册)。探测
+    // 周期必须小于它, 于是每个探测间隔最多容纳一次更新: 一次不漏, handle_uplink()
+    // 用中点估计变化时刻才继续成立。1 Hz 留约 22% 余量; 变化时刻误差 +-0.5 s,
+    // 对温度无所谓。
     static constexpr uint32_t kProbeFrequencyHz = 1U;
     static constexpr timer::Timer::Duration kProbePeriod{
         (timer::Timer::kClockFrequency + (kProbeFrequencyHz / 2U)) / kProbeFrequencyHz};
-    // Re-send interval for an unchanged value. With 1 s probes it fires on the first probe
-    // at or past 1.3 s, i.e. every 2 s.
+    // 值未变时的重发间隔。1 s 探测下在首个到达或超过 1.3 s 的探测时发出, 即
+    // 每 2 s 一次。
     static constexpr uint32_t kHeartbeatPeriodQuarterUs = 1'300U * 1'000U * 4U;
 
     explicit Temperature(Spi::Lazy* spi)
@@ -41,6 +40,8 @@ public:
         , next_probe_deadline_(timer::timer->timepoint() + kProbePeriod) {}
 
     void poll_pending_probe() {
+        if (!uplink_enabled.load(std::memory_order_relaxed))
+            return; // IMU 口没声明: 不探测, 不占 SPI
         const auto now = timer::timer->timepoint();
 
         const utility::InterruptLockGuard guard;
@@ -51,6 +52,12 @@ public:
         next_probe_deadline_ = now + kProbePeriod;
     }
 
+    // IMU 口挂起时丢掉到期未读的探测。
+    void drop_pending() {
+        const utility::InterruptLockGuard guard;
+        probe_pending_ = false;
+    }
+
     bool service_pending_read() {
         const utility::InterruptLockGuard guard;
         if (!probe_pending_)
@@ -58,7 +65,7 @@ public:
         if (!read_async(RegisterAddress::kTempMsb, kTemperatureReadSizeBytes))
             return false;
 
-        // Temperature timestamps are anchored to SPI launch time, not probe-deadline arrival.
+        // 温度时间戳锚定在 SPI 发起时刻, 不是探测期限到达时刻。
         active_probe_launch_timestamp_quarter_us_.store(
             timer::timer->timepoint().time_since_epoch().count(), std::memory_order_relaxed);
         has_active_probe_launch_timestamp_.store(true, std::memory_order_release);
@@ -104,11 +111,12 @@ private:
     void handle_uplink(
         core::protocol::Serializer& serializer, uint16_t raw_temperature,
         uint32_t probe_launch_timestamp_quarter_us) {
+        if (!uplink_enabled.load(std::memory_order_relaxed))
+            return;
         const bool observed_value_changed =
             !has_last_observation_ || raw_temperature != last_observed_temperature_;
         if (observed_value_changed) {
-            // When the observed temperature changes, estimate the update time as the midpoint
-            // between the previous and current probe launches.
+            // 观测值变化时, 把更新时刻估计为上一次与本次探测发起时刻的中点。
             current_value_timestamp_quarter_us_ = has_last_observation_
                                                     ? midpoint_timestamp_quarter_us(
                                                           last_probe_launch_timestamp_quarter_us_,

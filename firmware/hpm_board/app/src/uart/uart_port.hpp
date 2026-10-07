@@ -17,10 +17,9 @@ struct UartPort {
     uint32_t irq_num; // 中断号, 即 IRQn_UARTx
     uint32_t dma_src_tx;
     uint32_t dma_src_rx;
+    // 端口身份(丝印号), 取自板型 spec 的具名描述符; ports.hpp 的绑定核对它与 EP0 的
+    // 寻址是同一个口。
     data::DataId data_id;
-    // 承载本端口运行时配置(波特率)的下行 id。与 data_id 配对, 其中
-    // kUart0 -> kUart0Config, kUartDbus -> kUartDbusConfig。
-    data::DataId config_data_id;
     uint32_t baudrate;
     parity_setting_t parity;
 };

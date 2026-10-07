@@ -19,15 +19,15 @@
 #include "board_app.hpp"
 #include "core/include/libhcs/data/datas.hpp"
 #include "core/src/utility/immovable.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/ring_buffer.hpp"
 #include "firmware/hpm_board/app/src/can/can.hpp"
 #include "firmware/hpm_board/app/src/diag/latency.hpp"
 #include "firmware/hpm_board/app/src/dmtool/dm_persist.hpp"
 #include "firmware/hpm_board/app/src/led/led.hpp"
-#include "firmware/hpm_board/app/src/link/uplink.hpp"
+#include "firmware/hpm_board/app/src/timer/timer.hpp"
 #include "firmware/hpm_board/app/src/uart/uart.hpp"
 #include "firmware/hpm_board/app/src/usb/usb_descriptors.hpp"
-#include "firmware/hpm_board/app/src/utility/lazy.hpp"
-#include "firmware/hpm_board/app/src/utility/ring_buffer.hpp"
 
 // DMTool 仿真的实现: USB 应用类驱动、命令应答、CAN 收发与记录流、CDC 串口桥。
 // 协议格式见 dm_protocol.hpp, 与 libhcs 的共存规则见 dm_adapter.hpp。
@@ -230,26 +230,108 @@ public:
     // 总线复位: 端点随之关闭, 状态作废。
     void on_usb_reset() {
         endpoints_ = {};
+        cdc_endpoint_count_ = 0;
+        cdc_data_in_ = 0;
+        cdc_data_out_ = 0;
         isolated_ = false;
         reset();
     }
 
-    // ---- 端点隔离(libhcs 会话期间, 见 dm_adapter.hpp) ----
+    // ---- 端点隔离(板子归 libhcs 期间, 见 dm_adapter.hpp) ----
+    //
+    // 板子归 libhcs 期间只为 libhcs 服务, DMTool 仿真与串口桥是没有 libhcs 主机时的
+    // 附加功能。所以 libhcs 一握手, 除了 EP0、libhcs 自己那一对 bulk 端点与 CDC 的 bulk
+    // OUT(理由见 isolate()), **其余端点在控制器里全部关掉**(DMTool 的三对、CDC 的
+    // bulk IN 与通知端点): 关掉使能位的端点对主机的令牌不应答, 也不产生任何中断与事件。
+    // 配置描述符不变(改它要重新枚举, libhcs 的连接就断了), 主机仍然看得到这些接口, 只是
+    // 用不了。
+    //
+    // 为什么是"不应答"而不是合规的 STALL -- 两者对 libhcs 的代价不同, 都实测过
+    // (DMTOOL_PROTOCOL.md 5.1): 主机上若有程序开着串口, 内核一直在 CDC 的 bulk IN 上
+    // 挂着读请求。端点照常回 NAK 时主机控制器不停空轮询它, 洪泛包率掉 25%; 回 STALL 时
+    // cdc_acm 立刻清 halt、撤掉并重新提交全部读请求, 板子重新 STALL, 两边每秒打转约
+    // 500 次, 还要掉 2-3%; 不应答时读请求以 -EPROTO 失败, cdc_acm 把出错的那个搁
+    // 500 ms 再重提, 量不出代价。这不是合规的端点行为, 取的是上面那条原则; 没有别的
+    // 程序在会话期间碰这些端点时, 应答不应答都一样, 端点上本来就没有事务。
+    // 板子交给 libhcs(Handoff::to_libhcs): 回到"DMTool 与 CDC 都没在用", 端点隔离,
+    // CDC 两个 FIFO 里属于上一个使用者的字节丢掉 -- 来不及发给主机的串口上行、主机
+    // 写来还没上 UART 的下行, 都不该在 libhcs 走后再冒出来。
+    void yield() {
+        reset();
+        isolate();
+        tud_cdc_n_read_flush(kCdcInterface);
+        (void)tud_cdc_n_write_clear(kCdcInterface);
+    }
 
+    // 板子从附加功能易手给 libhcs 时调到这里; 已经隔离时什么都不做。
     void isolate() {
+        if (isolated_)
+            return;
         isolated_ = true;
-        // STALL 顺带 flush 掉在途传输(dcd_ci_hs 的 dcd_edpt_stall), 之后控制器对
-        // 这些端点的每个令牌都直接回 STALL, 不产生中断与事件。
-        for_each_endpoint([this](uint8_t address) { usbd_edpt_stall(rhport_, address); });
+        // DMTool 的端点先 stall 再关: stall 顺带 flush 掉在途传输(dcd_ci_hs 的
+        // dcd_edpt_stall), usbd 那边也记下"已 stall", 会话结束时照原样恢复。
+        for_each_endpoint([this](uint8_t address) {
+            usbd_edpt_stall(rhport_, address);
+            set_answering(address, false);
+        });
+        // CDC: bulk IN 同样先置 halt(留给交还后的恢复, 见 release()); 通知端点只关不
+        // stall。bulk OUT 不关, 照常应答: 主机写来的字节由 on_cdc_rx() 读空丢掉(桥是
+        // 关的)。关掉的话主机的写会以传输错误收场, xHCI 借此把主机一侧的 data toggle
+        // 复位, 板子无从得知, 交还后写的第一个包被当成重发丢掉(实测); 而主机写没写过,
+        // 关着的端点不产生任何事件, 板子判断不了该不该跟着复位。照常应答的代价只在有
+        // 程序在 libhcs 期间真往串口写时才有, 写多少占多少总线; 没人写时 OUT 上没有
+        // 任何事务。
+        for (std::size_t index = 0; index < cdc_endpoint_count_; ++index) {
+            const uint8_t address = cdc_endpoints_[index];
+            if (address == cdc_data_out_)
+                continue;
+            if (address == cdc_data_in_)
+                usbd_edpt_stall(rhport_, address);
+            set_answering(address, false);
+        }
+    }
+
+    // 端点对主机的令牌应答与否 = 控制器里这个端点方向的使能位。TinyUSB 的 dcd 没有
+    // 对应的接口, 直接写端点控制寄存器; usbd 的 stall / clear stall 不动这一位。
+    // 两块 HPM 板的设备口都是 USB0(tusb_config.h 的 BOARD_DEVICE_RHPORT_NUM)。
+    static void set_answering(uint8_t address, bool answering) {
+        static_assert(BOARD_DEVICE_RHPORT_NUM == 0);
+        const uint32_t enable =
+            tu_edpt_dir(address) == TUSB_DIR_IN ? USB_ENDPTCTRL_TXE_MASK : USB_ENDPTCTRL_RXE_MASK;
+        auto& control = HPM_USB0->ENDPTCTRL[tu_edpt_number(address)];
+        if (answering)
+            control |= enable;
+        else
+            control &= ~enable;
     }
 
     void release() {
         if (!isolated_)
             return;
         isolated_ = false;
-        for_each_endpoint([this](uint8_t address) { usbd_edpt_clear_stall(rhport_, address); });
+        // CDC: 全部恢复应答。bulk IN 上的 halt 留着不清 -- 主机下次读串口时拿到 STALL,
+        // 按标准流程清 halt, 两边的 data toggle 同时回到 DATA0。板子自己清的话只复位了
+        // 设备这一侧: 主机若整个会话都没碰过这个端点(串口没开), 它那边不会跟着复位,
+        // 之后串口上行的第一个包就被主机当成重发丢掉(实测丢过一个 32 字节的包)。等主机
+        // 来清的这段时间里板子要发的字节在 CDC 的发送队列里等着, 不丢。隔离已解除,
+        // on_clear_halt() 不再把它重新 stall。
+        for (std::size_t index = 0; index < cdc_endpoint_count_; ++index)
+            set_answering(cdc_endpoints_[index], true);
+        for_each_endpoint([this](uint8_t address) {
+            set_answering(address, true);
+            usbd_edpt_clear_stall(rhport_, address);
+        });
         for (std::size_t index = 0; index < endpoints_.size(); ++index)
             arm_out(static_cast<uint8_t>(index));
+        // libhcs 期间 UART 可能被声明成了别的速率与帧格式, 而主机不会为此重发线路编码:
+        // 一直开着的串口不重发, 重新打开时 Linux 的 cdc_acm 也只在编码与它记着的不同
+        // 时才发(实测: libhcs 把 UART0 声明成 1M 之后, 按原来的 115200 重开串口, 桥一直
+        // 不通)。所以只要主机设过线路编码, 交还时就照它写回 UART, 让 UART 与主机认为的
+        // 一致, 再按速率重判桥。交还的顺序保证此时 UART 已经恢复
+        // (usb/vendor.hpp 的 BoardOwnership)。
+        if (cdc_line_coding_.bit_rate != 0U)
+            apply_cdc_line_coding();
+        update_cdc_bridge();
     }
 
     // 主机对本驱动某端点发了 CLEAR_FEATURE(ENDPOINT_HALT); usbd 已经先执行了
@@ -258,8 +340,22 @@ public:
     // 送进来。不在隔离期时什么都不做(clear_halt 与 data toggle 的问题见
     // DMTOOL_PROTOCOL.md 6.4, 修法待定)。
     void on_clear_halt(uint8_t address) {
-        if (isolated_ && interface_of(address))
+        if (!isolated_ || address == 0)
+            return;
+        // usbd 只清了 halt, 使能位它不动: 端点仍然不应答, 这里把 halt 补回去即可。
+        if (interface_of(address) || address == cdc_data_in_)
             usbd_edpt_stall(rhport_, address);
+    }
+
+    // CDC 串口的端点, 由 cdc_open() 从配置描述符里逐个认出来后告知。
+    void add_cdc_endpoint(uint8_t rhport, const tusb_desc_endpoint_t& endpoint) {
+        rhport_ = rhport;
+        if (cdc_endpoint_count_ < cdc_endpoints_.size())
+            cdc_endpoints_[cdc_endpoint_count_++] = endpoint.bEndpointAddress;
+        if (endpoint.bmAttributes.xfer != TUSB_XFER_BULK)
+            return;
+        (tu_edpt_dir(endpoint.bEndpointAddress) == TUSB_DIR_IN ? cdc_data_in_ : cdc_data_out_) =
+            endpoint.bEndpointAddress;
     }
 
     // ---- CDC ----
@@ -271,41 +367,31 @@ public:
         while (const uint32_t count = tud_cdc_n_read(kCdcInterface, chunk.data(), chunk.size())) {
             if (!cdc_bridge_)
                 continue;
-            if (auto* uart = uart::uart_array[0].try_get())
+            note_cdc_traffic();
+            if (auto* uart = uart::bridge_uart())
                 uart->handle_downlink({.uart_data = std::as_bytes(std::span{chunk}.first(count))});
         }
     }
 
-    void on_cdc_line_state(bool dtr) {
-        cdc_dtr_ = dtr;
-        update_cdc_bridge();
+    // LED 判据(session_established()): 桥上真有字节走过。主循环调用。
+    static void note_cdc_traffic() {
+        internal::g_cdc_traffic_tick = timer::timer->tick_count();
+        internal::g_cdc_traffic_seen = true;
     }
 
     // 标准 VCP 语义: 主机设的线路编码(Linux termios / Windows SetCommState ->
     // CDC SET_LINE_CODING, 两个操作系统走同一条标准请求)真实下发到板上 UART,
-    // 而非只做速率比对。仅在 libhcs 会话之外转发(UART 此时属于桥); 速率求解
-    // 失败时保持原值, 桥因速率失配保持关闭, 主机换个合法速率即恢复。
+    // 而非只做速率比对。仅在板子不归 libhcs 时转发(UART 此时属于桥); 线路编码走
+    // EP0, 端点隔离挡不住它, 所以这里要自己判。速率求解失败时保持原值, 桥因速率
+    // 失配保持关闭, 主机换个合法速率即恢复。
     // 编码映射: CDC 校验 0=无 1=奇 2=偶 -> libhcs 1=无 3=奇 2=偶 (mark/space
     // 不支持, 保持不变); CDC 停止 0=1 1=1.5 2=2 -> libhcs 1=1 其余=2 (16550
     // 的 1.5 停止位只在 5 位字长存在); 数据位 7/8 直传, 其余保持不变。
     void on_cdc_line_coding(uint32_t bit_rate, uint8_t stop, uint8_t parity, uint8_t data_bits) {
-        cdc_bit_rate_ = bit_rate;
-        if (!link::uplink_enabled()) {
-            if (auto* uart = uart::uart_array[0].try_get(); uart != nullptr) {
-                if (bit_rate != 0U)
-                    (void)uart->set_baudrate(bit_rate);
-                uint32_t parity_out = 0U;
-                if (parity == 1U)
-                    parity_out = 3U;
-                else if (parity == 2U)
-                    parity_out = 2U;
-                else if (parity == 0U)
-                    parity_out = 1U;
-                const uint32_t stop_out = stop == 0U ? 1U : 2U;
-                uart->commit_framing(
-                    (data_bits == 7U || data_bits == 8U) ? data_bits : 0U, parity_out, stop_out);
-            }
-        }
+        cdc_line_coding_ = {
+            .bit_rate = bit_rate, .stop = stop, .parity = parity, .data_bits = data_bits};
+        if (!isolated_)
+            apply_cdc_line_coding();
         update_cdc_bridge();
     }
 
@@ -356,10 +442,10 @@ public:
 
     // 总线复位与 libhcs 让位共用: 回到"DMTool 与 CDC 都没在用"。先撤闸, ISR 从此
     // 不再入队, 之后清队列(主循环是这些队列的消费者, 清空是消费侧操作)。端点保持
-    // 原样: libhcs 让位时总线仍是配置好的。
+    // 原样: libhcs 让位时总线仍是配置好的。主机设的线路编码不清: 那是主机那一侧的
+    // 设置, 不是要丢的数据, 交还时 release() 靠它重新接通桥。
     void reset() {
         capture_mask_ = 0;
-        cdc_dtr_ = false;
         cdc_bridge_ = false;
         pending_ack_size_ = 0;
         preset_applied_ = false;
@@ -489,7 +575,7 @@ private:
     // 而异(2.1.6.7 打开即 START_CAP, 更早的版本先读版本/读波特率), 连接前先读
     // 一次波特率同样要读到表里有的值。
     void ensure_session_timing() {
-        if (preset_applied_ || link::uplink_enabled())
+        if (preset_applied_ || isolated_)
             return;
         preset_applied_ = true;
 
@@ -523,8 +609,8 @@ private:
     }
 
     AckStatus start_capture(std::span<const uint8_t> payload) {
-        // libhcs 会话期间不接 DMTool: libhcs 优先(见 dm_adapter.hpp)。
-        if (payload.size() != 1 || channel_can(payload[0]) == nullptr || link::uplink_enabled())
+        // 板子归 libhcs 期间不接 DMTool: libhcs 优先(见 dm_adapter.hpp)。
+        if (payload.size() != 1 || channel_can(payload[0]) == nullptr || isolated_)
             return AckStatus::kFailed;
         const uint8_t channel = payload[0];
         (void)rx_queues_[channel].clear(); // 采集关着时生产者不入队, 清的只是旧帧
@@ -738,7 +824,7 @@ private:
         can::Can* can = channel_can(request.channel);
         const bool id_valid = request.flags.extended || request.id <= 0x7FFU;
         const bool delivered = can != nullptr && id_valid && request.payload.size() <= 64
-                            && !link::uplink_enabled(); // libhcs 会话期间 DMTool 不上总线
+                            && !isolated_; // 板子归 libhcs 期间 DMTool 不上总线
 
         // 实际上线的帧型: 经典端口发不出 FD, BRS 只在 FD 帧上有意义。
         const bool fd = can != nullptr && can->is_fd() && request.flags.fd;
@@ -823,17 +909,39 @@ private:
 
     // ---- CDC 串口桥 ----
 
-    // 桥只在串口已打开(DTR)、主机设的波特率与板上 UART 实际速率一致、且 libhcs
-    // 不在时接通。波特率不去改 UART -- 那是 libhcs 经 EP0 管的配置, 串口工具关掉
-    // 后 libhcs 必须看到它原来的样子; 反过来要求主机按 UART 的速率打开, 也顺带把
-    // ModemManager 一类按 9600/115200 探测的程序挡在 UART 之外。
+    // 桥在主机设的波特率与板上 UART 实际速率一致、且板子不归 libhcs 时接通。速率比对
+    // 挡住的是 UART 解不出主机所设速率的情况(见 on_cdc_line_coding(): 求解失败时 UART
+    // 保持原值)。不看 DTR: Windows 上 Qt 的 QSerialPort 打开串口不拉 DTR, DMTool 也从不
+    // 调 setDataTerminalReady, 要求 DTR 的话 Windows 上 DMTool 的串口永远不通(Linux
+    // 打开 tty 时内核替它拉了, 所以只在 Windows 上坏)。
     void update_cdc_bridge() {
-        const auto* uart = uart::uart_array[0].try_get();
-        cdc_bridge_ = cdc_dtr_ && uart != nullptr && !link::uplink_enabled()
-                   && baudrate_matches(cdc_bit_rate_, uart->effective_baudrate());
+        const auto* uart = uart::bridge_uart();
+        cdc_bridge_ = uart != nullptr && !isolated_
+                   && baudrate_matches(cdc_line_coding_.bit_rate, uart->effective_baudrate());
         publish();
         if (!cdc_bridge_)
             (void)uart_to_cdc_.clear();
+    }
+
+    // 把主机最近一次设的线路编码写进 UART。映射见 on_cdc_line_coding()。
+    void apply_cdc_line_coding() const {
+        auto* uart = uart::bridge_uart();
+        if (uart == nullptr)
+            return;
+        const auto& coding = cdc_line_coding_;
+        if (coding.bit_rate != 0U)
+            (void)uart->set_baudrate(coding.bit_rate);
+        uint32_t parity_out = 0U;
+        if (coding.parity == 1U)
+            parity_out = 3U;
+        else if (coding.parity == 2U)
+            parity_out = 2U;
+        else if (coding.parity == 0U)
+            parity_out = 1U;
+        const uint32_t stop_out = coding.stop == 0U ? 1U : 2U;
+        uart->commit_framing(
+            (coding.data_bits == 7U || coding.data_bits == 8U) ? coding.data_bits : 0U, parity_out,
+            stop_out, 0U);
     }
 
     void pump_uart_to_cdc() {
@@ -852,8 +960,11 @@ private:
             (void)tud_cdc_n_write(kCdcInterface, chunk.data(), count);
             wrote = true;
         }
-        if (wrote)
+        if (wrote) {
             (void)tud_cdc_n_write_flush(kCdcInterface);
+            // 串口没开时主机不取, CDC 的发送 FIFO 几毫秒就满, 之后写不进去也就不再记。
+            note_cdc_traffic();
+        }
     }
 
     // ---- 闸 ----
@@ -888,15 +999,25 @@ private:
 
     // 主循环侧的真值, 经 publish() 发布。
     uint8_t capture_mask_ = 0;
-    bool cdc_dtr_ = false;
-    uint32_t cdc_bit_rate_ = 0;
+    // 主机最近一次设的线路编码(SET_LINE_CODING 原值), 归 libhcs 期间也照记。
+    struct CdcLineCoding {
+        uint32_t bit_rate = 0; // 0 = 主机还没设过
+        uint8_t stop = 0;
+        uint8_t parity = 0;
+        uint8_t data_bits = 0;
+    } cdc_line_coding_;
     bool cdc_bridge_ = false;
+    // CDC 串口的全部端点(bulk IN / OUT 与通知端点)与其中的两个 bulk 端点; 枚举时填。
+    std::array<uint8_t, 3> cdc_endpoints_{};
+    std::size_t cdc_endpoint_count_ = 0;
+    uint8_t cdc_data_in_ = 0;  // 0 = 还没枚举
+    uint8_t cdc_data_out_ = 0; // 0 = 还没枚举
     // 本会话是否已套用过预设/保存的时序(见 ensure_session_timing)。reset() 清除。
     bool preset_applied_ = false;
-    // libhcs 会话期间端点处于 STALL 隔离(isolate / release)。
     // ---- 下行背压(2026-09-22, 电机 IAP 突发零丢帧) ----
     // CAN TX 软件队列满时, 帧留在 EP 0x03 的 DMA 缓冲, 端点不重挂(主机 NAK
     // 自适应), 队列疏干后从断点续帧。仅 kCan 通道; 命令/心跳即时处理。
+    // 板子归 libhcs 期间为 true: 端点隔离(isolate / release), 本模块不碰 CAN 与 UART。
     bool isolated_ = false;
     // 待写的 flash 保存(保存配置 ACK 先回, 写入随后)。
     bool save_pending_ = false;
@@ -958,16 +1079,57 @@ bool driver_xfer(uint8_t rhport, uint8_t endpoint, xfer_result_t result, uint32_
     return true;
 }
 
-constexpr usbd_class_driver_t kDriver{
-    .name = "DMTOOL",
-    .init = driver_init,
-    .deinit = driver_deinit,
-    .reset = driver_reset,
-    .open = driver_open,
-    .control_xfer_cb = driver_control_xfer,
-    .xfer_cb = driver_xfer,
-    .xfer_isr = nullptr,
-    .sof = nullptr,
+// CDC 串口仍由 TinyUSB 自带的类驱动实现, 这里只在它前面垫一层: 标准端点请求
+// (CLEAR_FEATURE)自带驱动不看, 而隔离期间主机清掉 CDC 端点的 halt 之后要立刻重新
+// stall(见 Adapter::on_clear_halt)。应用驱动先于内建驱动认领接口, 所以 CDC 的两个
+// 接口归这一项; init / reset 仍由内建那一项执行(usbd 对每个内建驱动都会调), 这里
+// 留空以免做两遍。
+uint16_t cdc_open(uint8_t rhport, const tusb_desc_interface_t* interface, uint16_t max_len) {
+    const uint16_t used = cdcd_open(rhport, interface, max_len);
+    const auto* begin = reinterpret_cast<const uint8_t*>(interface);
+    for (const uint8_t* descriptor = begin; tu_desc_in_bounds(descriptor, begin + used);
+         descriptor = tu_desc_next(descriptor)) {
+        if (tu_desc_type(descriptor) != TUSB_DESC_ENDPOINT)
+            continue;
+        adapter->add_cdc_endpoint(
+            rhport, *reinterpret_cast<const tusb_desc_endpoint_t*>(descriptor));
+    }
+    return used;
+}
+
+bool cdc_control_xfer(uint8_t rhport, uint8_t stage, const tusb_control_request_t* request) {
+    if (stage == CONTROL_STAGE_SETUP && request->bmRequestType_bit.type == TUSB_REQ_TYPE_STANDARD
+        && request->bmRequestType_bit.recipient == TUSB_REQ_RCPT_ENDPOINT
+        && request->bRequest == TUSB_REQ_CLEAR_FEATURE
+        && request->wValue == TUSB_REQ_FEATURE_EDPT_HALT) {
+        with_adapter([request](Adapter& a) { a.on_clear_halt(tu_u16_low(request->wIndex)); });
+    }
+    return cdcd_control_xfer_cb(rhport, stage, request);
+}
+
+constexpr usbd_class_driver_t kDrivers[]{
+    {
+     .name = "DMTOOL",
+     .init = driver_init,
+     .deinit = driver_deinit,
+     .reset = driver_reset,
+     .open = driver_open,
+     .control_xfer_cb = driver_control_xfer,
+     .xfer_cb = driver_xfer,
+     .xfer_isr = nullptr,
+     .sof = nullptr,
+     },
+    {
+     .name = "CDC-GUARD",
+     .init = [] {},
+     .deinit = [] { return true; },
+     .reset = [](uint8_t) {},
+     .open = cdc_open,
+     .control_xfer_cb = cdc_control_xfer,
+     .xfer_cb = cdcd_xfer_cb,
+     .xfer_isr = nullptr,
+     .sof = nullptr,
+     },
 };
 
 } // namespace
@@ -991,20 +1153,14 @@ void uart_rx_without_session(
     adapter->push_uart_rx({data2, size2});
 }
 
-void on_libhcs_session() {
-    // libhcs 会话开始: DMTool 会话可能把总线改成了别的速率, 还原编译期位时序
-    // 与端口 FD 模式, 让 libhcs 期望的总线参数成立(87.5% 采样点那套实测结果)。
-    for (std::size_t i = 0; i < can::can_count(); ++i) {
-        if (auto* can = can::can_array[i].try_get(); can != nullptr)
-            (void)can->restore_default_timing();
-    }
-    with_adapter([](Adapter& a) {
-        a.reset();
-        a.isolate();
-    });
+// DMTool 会话可能把总线改成了别的速率、帧型与自动重传, 这里不必还原: 同一次交接紧接
+// 着把全部端口挂起(usb/vendor.hpp 的 BoardOwnership, core 的 PortHandoff), 主机声明的
+// 每一路都按 libhcs 的设置重新初始化, 没声明的不上总线。
+void Handoff::to_libhcs() {
+    with_adapter([](Adapter& a) { a.yield(); });
 }
 
-void on_libhcs_session_end() {
+void Handoff::to_tools() {
     with_adapter([](Adapter& a) { a.release(); });
 }
 
@@ -1012,19 +1168,13 @@ void on_libhcs_session_end() {
 extern "C" {
 
 usbd_class_driver_t const* usbd_app_driver_get_cb(uint8_t* driver_count) {
-    *driver_count = 1;
-    return &kDriver;
+    *driver_count = static_cast<uint8_t>(std::size(kDrivers));
+    return kDrivers;
 }
 
 void tud_cdc_rx_cb(uint8_t itf) {
     (void)itf;
     with_adapter([](Adapter& a) { a.on_cdc_rx(); });
-}
-
-void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts) {
-    (void)itf;
-    (void)rts;
-    with_adapter([dtr](Adapter& a) { a.on_cdc_line_state(dtr); });
 }
 
 void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const* p_line_coding) {

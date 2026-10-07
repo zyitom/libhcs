@@ -67,6 +67,15 @@ else()
     message(STATUS "Building shared libhcs")
 endif()
 
+# How a project uses the SDK: FetchContent the release's libhcs-sdk-src-<version>.zip and link
+# libhcs::sdk (README.md). The namespaced name fails at configure time when misspelled, where a
+# plain target name would silently become a "-l" flag.
+add_library(libhcs::sdk ALIAS ${PROJECT_NAME})
+# The public headers need C++23 (concepts, requires-expressions); linking the target is enough
+# for a consumer to get it. Without this a project on the compiler's default standard compiles
+# the headers wrong instead of failing.
+target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_23)
+
 target_compile_definitions(${PROJECT_NAME} PRIVATE libhcs_PROJECT_VERSION_STRING="${libhcs_PROJECT_VERSION}")
 target_compile_definitions(${PROJECT_NAME} PRIVATE BUILDING_libhcs)
 
@@ -74,7 +83,12 @@ target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..
 target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../host/include)
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
-# Force optimization in debug mode
+# Optimize the SDK even in Debug builds -- deliberate, kept from upstream
+# librmcs. An application built as Debug still runs the IO thread (record
+# decoding, timestamp conversion, the transmit path) at release speed, so a
+# Debug build of HCS behaves on the bench like the real thing and its timing
+# tests stay meaningful. To step through the SDK itself, drop these lines in a
+# local build.
 if(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE $<$<CONFIG:Debug>:/O2>)
 else()
@@ -96,14 +110,14 @@ elseif(UNIX)
     target_link_libraries(${PROJECT_NAME} PUBLIC Threads::Threads)
 endif()
 
-# Enable LTO optimization
-set_target_properties(${PROJECT_NAME} PROPERTIES
-    INTERPROCEDURAL_OPTIMIZATION TRUE
-)
-
-install(TARGETS ${PROJECT_NAME} LIBRARY DESTINATION lib ARCHIVE DESTINATION lib)
-install(DIRECTORY ../core/include/ DESTINATION include)
-install(DIRECTORY include/ DESTINATION include)
+# LTO is the consumer's call, not the library's: a static archive of LTO objects only links when
+# the final link does LTO too (clang's driver loads its LTO plugin only under -flto, so a plain
+# link with the default bfd linker fails). Off by default, so the released source builds into
+# ordinary objects any toolchain links; a project that links with LTO turns it on (HCS does).
+option(LIBHCS_LTO "Build the SDK with link-time optimization; the final link must use LTO too" OFF)
+if(LIBHCS_LTO)
+    set_target_properties(${PROJECT_NAME} PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
 
 # include(CTest)
 # if(BUILD_TESTING)
@@ -128,46 +142,12 @@ install(DIRECTORY include/ DESTINATION include)
 #     add_test(NAME libhcs_tests COMMAND libhcs_tests)
 # endif()
 
-if(UNIX AND NOT APPLE)
-    if(NOT DEFINED libhcs_DEBIAN_VERSION OR libhcs_DEBIAN_VERSION STREQUAL "")
-        execute_process(
-            COMMAND ".scripts/generate_version" "--format" "debian"
-            WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/.."
-            OUTPUT_VARIABLE libhcs_DEBIAN_VERSION
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            COMMAND_ERROR_IS_FATAL ANY
-        )
-    endif()
-    message(STATUS "libhcs Debian package version: ${libhcs_DEBIAN_VERSION}")
-
-    set(CPACK_GENERATOR "DEB")
-
-    set(ARCHITECTURE ${CMAKE_SYSTEM_PROCESSOR})
-    if(ARCHITECTURE STREQUAL "x86_64")
-        set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "amd64")
-    elseif(ARCHITECTURE STREQUAL "aarch64")
-        set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "arm64")
-    else()
-        message(FATAL_ERROR "Unsupported architecture: ${ARCHITECTURE}.")
-    endif()
-
-    set(CPACK_DEBIAN_PACKAGE_NAME "${PROJECT_NAME}")
-    set(CPACK_DEBIAN_PACKAGE_VERSION "${libhcs_DEBIAN_VERSION}")
-    set(CPACK_DEBIAN_PACKAGE_MAINTAINER "Zihan Qin <zihanqin2048@gmail.com>")
-    set(CPACK_DEBIAN_PACKAGE_DESCRIPTION "A portable library implements the core functionality of HCS")
-    set(CPACK_DEBIAN_PACKAGE_HOMEPAGE "https://github.com/zyitom/libhcs")
-    set(CPACK_DEBIAN_PACKAGE_DEPENDS "libusb-1.0-0-dev")
-    set(CPACK_DEBIAN_PACKAGE_SECTION "libs")
-    set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
-
-    string(TOLOWER "${CMAKE_BUILD_TYPE}" PACKAGE_BUILD_MODE)
-    set(CPACK_PACKAGE_FILE_NAME "${PROJECT_NAME}-${libhcs_PROJECT_VERSION}-${CPACK_DEBIAN_PACKAGE_ARCHITECTURE}-${PACKAGE_BUILD_MODE}")
-    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/../LICENSE")
-
-    include(CPack)
-endif()
-
-option(BUILD_EXAMPLES "Build example programs" OFF)
-if(BUILD_EXAMPLES)
-    add_subdirectory(examples)
+# Tests are part of the default build when this is the top-level project: a test
+# nobody compiles is a test nobody notices breaking. Embedded in another project
+# (add_subdirectory from HCS) they stay off here -- that project builds the same
+# sources into its own test run.
+option(LIBHCS_BUILD_TESTS "Build and register the host-side tests" ${PROJECT_IS_TOP_LEVEL})
+if(LIBHCS_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
 endif()

@@ -7,16 +7,22 @@
 #include <usart.h>
 
 #include "core/include/libhcs/data/datas.hpp"
+#include "core/include/libhcs/spec/mc02/ports.hpp"
+#include "core/src/link/port.hpp"
 #include "core/src/protocol/serializer.hpp"
 #include "core/src/utility/assert.hpp"
 #include "core/src/utility/immovable.hpp"
+#include "firmware/common/app/src/utility/event_counter.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 #include "firmware/mc02/app/src/led/led.hpp"
 #include "firmware/mc02/app/src/uart/rx_buffer.hpp"
 #include "firmware/mc02/app/src/uart/tx_buffer.hpp"
 #include "firmware/mc02/app/src/usb/helper.hpp"
-#include "firmware/mc02/app/src/utility/lazy.hpp"
+#include "firmware/mc02/app/src/utility/loop_work.hpp"
 
 namespace libhcs::firmware::uart {
+
+namespace vc = libhcs::core::protocol::vendor_control;
 
 // 两种端口共享的状态与行为: 身份标识、运行时波特率控制、接收字节向 USB 的
 // 交接。自身不持有缓冲, 因此仅接收的 DBUS 口不必背着一个永远用不上的 3 KB
@@ -63,10 +69,16 @@ public:
         return true;
     }
 
-    // 提交 solve_brr() 的结果。只在校验全部通过后调用, 无失败路径。
+    // 提交 solve_brr() 的结果。只在校验全部通过后调用, 无失败路径。BRR 只能在 UE=0 时写
+    // (RM0468 USART_BRR), 所以拉低 UE 写完再原样放回; 窗口内到达的字节会失配, 调用方
+    // 必须先静默链路(与 commit_framing() 同)。
     void commit_brr(uint32_t baudrate, uint32_t brr) {
         hal_uart_handle_->Init.BaudRate = baudrate;
-        hal_uart_handle_->Instance->BRR = brr;
+        auto* instance = hal_uart_handle_->Instance;
+        const uint32_t cr1 = instance->CR1;
+        instance->CR1 = cr1 & ~USART_CR1_UE;
+        instance->BRR = brr;
+        instance->CR1 = cr1;
     }
 
     // 应用帧格式前的**纯校验**, 不碰任何寄存器。EP0 处理器先调它排除非法组合,
@@ -121,11 +133,13 @@ public:
         if (stop_bits == 2U)
             stop_reg = USART_CR2_STOP_1;
 
+        // new_cr1 保留进来时的 UE: 最后那次写回才是"恢复"。这里曾把 UE 也一并掩掉,
+        // 于是"恢复"写回的是 UE=0 -- 任何一次经 EP0 的串口配置之后端口就整个停了,
+        // 收发都不通 [2026-10-03 上板才发现, 此前这条路只编译过]。
         auto* instance = hal_uart_handle_->Instance;
         const uint32_t cr1 = instance->CR1;
         const uint32_t new_cr1 =
-            (cr1 & ~(USART_CR1_UE | USART_CR1_M | USART_CR1_PCE | USART_CR1_PS)) | m_bits
-            | parity_bits;
+            (cr1 & ~(USART_CR1_M | USART_CR1_PCE | USART_CR1_PS)) | m_bits | parity_bits;
 
         instance->CR1 = new_cr1 & ~USART_CR1_UE; // UE=0, 帧格式字段可写
         uint32_t cr2 = instance->CR2;
@@ -134,7 +148,7 @@ public:
         if (rx_polarity != 0U)
             cr2 = rx_polarity == 2U ? (cr2 | USART_CR2_RXINV) : (cr2 & ~USART_CR2_RXINV);
         instance->CR2 = cr2;
-        instance->CR1 = new_cr1; // UE 恢复
+        instance->CR1 = new_cr1; // UE 回到进来时的值
     }
 
     // ---- 帧格式读回: 从活寄存器解码, 编码同上, 永不返回 0(0 只表示"跳过") ----
@@ -161,6 +175,11 @@ public:
         // 1.5 停止位的编码不会由本驱动写出(见 check_framing); 万一出现, 如实上报
         // 协议中无此编码的原始值没有意义, 按最近的 2 处理并注释于此。
         return (hal_uart_handle_->Instance->CR2 & USART_CR2_STOP) == USART_CR2_STOP_1 ? 2U : 1U;
+    }
+
+    // 一个字符在线上的位数: 起始位 + 数据位 + 校验位 + 停止位。
+    [[nodiscard]] uint32_t bits_per_character() const {
+        return 1U + word_length() + (parity() != 1U ? 1U : 0U) + stop_bits();
     }
 
     // 1 = 正常, 2 = 反相(CR2.RXINV)。
@@ -190,7 +209,7 @@ public:
         return clock / brr;
     }
 
-    // UartDivisor 的两个整数, 供 EP0 的 kGetUartConfig 上报与 kSetUartConfig
+    // UartDivisor 的两个整数, 供 EP0 的 kGetPortConfig 上报与清单声明
     // 回读比对。**divisor 就是 BRR 寄存器本身**(低 16 位), 不做任何归一化 ——
     // 与 solve_brr() 交给 commit_brr() 写进去的那个整数逐位相等, 因此这里报的
     // 既是硬件事实, 又正是 solve_brr() 的返回值, 两端比对不需要任何换算。
@@ -212,17 +231,140 @@ public:
         return divisor_u16() == expected_divisor && oversample() == expected_oversample;
     }
 
+    // ---- 端口接口(core/src/link/ 的通用 UART 操作按这一组原语工作) ----
+    //
+    // 全部是冷路径(EP0 的清单声明与读回)。solve/commit_baudrate 是 solve_brr/
+    // commit_brr 的统一签名视图: 核心流程对三块板写同一份代码, BRR 的编码差异留在
+    // 各自的求解器里。过采样是 Init 的编译期事实(CubeMX), 不随速率变。
+    [[nodiscard]] bool running() const { return started_; }
+
+    [[nodiscard]] bool solve(uint32_t baudrate, uint16_t& divisor, uint8_t& oversample) const {
+        uint32_t brr = 0;
+        if (!solve_brr(baudrate, brr))
+            return false;
+        divisor = static_cast<uint16_t>(brr);
+        oversample = hal_uart_handle_->Init.OverSampling == UART_OVERSAMPLING_8 ? 8U : 16U;
+        return true;
+    }
+
+    [[nodiscard]] bool commit_baudrate(uint32_t baudrate, uint16_t divisor, uint8_t) {
+        commit_brr(baudrate, divisor);
+        return true; // commit_brr 无失败路径: 校验已在 solve 阶段完成
+    }
+
+    // 统一签名视图: 速率由 BRR 与本口时钟决定, 过采样是 Init 的编译期事实,
+    // 不参与重建。
+    [[nodiscard]] uint32_t baudrate_for(uint16_t divisor, uint8_t) const {
+        return baudrate_for(static_cast<uint32_t>(divisor));
+    }
+
+    [[nodiscard]] bool framing_matches(
+        uint32_t word_length, uint32_t parity, uint32_t stop_bits, uint32_t rx_polarity) const {
+        return (word_length == 0U || word_length == this->word_length())
+            && (parity == 0U || parity == this->parity())
+            && (stop_bits == 0U || stop_bits == this->stop_bits())
+            && (rx_polarity == 0U || rx_polarity == this->rx_polarity());
+    }
+
+    // kGetPortConfig 的应答: 硬件事实而非"上次请求"。波特率从 BRR 重构, 帧格式从
+    // 活寄存器解码, control 恒为 0。divisor/oversample 一并上报 -- 它们是速率真正的
+    // 整数形式, 主机就是靠这两个整数判定切换是否生效。见 UartDivisor。
+    void read_config(vc::UartConfigPayload& out) const {
+        out = {
+            .baudrate = effective_baudrate(),
+            .divisor = divisor_u16(),
+            .oversample = oversample(),
+            .word_length = static_cast<uint8_t>(word_length()),
+            .parity = static_cast<uint8_t>(parity()),
+            .stop_bits = static_cast<uint8_t>(stop_bits()),
+            .control = 0,
+            .rx_polarity = static_cast<uint8_t>(rx_polarity()),
+        };
+    }
+
+    [[nodiscard]] core::link::PortStatus describe() const {
+        return {.running = started_, .fd = false};
+    }
+
+    // ---- 启停: 端口只在主机声明之后才工作 ----
+    //
+    // 上电时所有端口都是停的: 不收、不发、不产生中断, 主循环也不去轮询它的寄存器。
+    // 清单里有这一路(声明被接受), 端口随即启动
+    // (core 的清单应用 -> resume()); 新的清单不再声明它、或会话结束
+    // (ports::Registry::suspend_all())时停掉。配置先于启动生效, 所以端口一起来就已经是主机要的
+    // 速率和帧格式。
+    //
+    // 具体的启停在各端口类的 start() / stop() 里, 这里只是它们共用的状态位。
+    [[nodiscard]] bool started() const { return started_; }
+
+    // 端口身份(丝印号)。ports.hpp 的注册表在上电时核对它与 EP0 绑定的身份一致。
+    [[nodiscard]] data::DataId data_id() const { return data_id_; }
+
+    // 运行时状态(core/src/link/port_status.hpp), 每个 keepalive 轮次在主循环读一次。
+    //
+    // 接收错误按轮计, 与 hpm 同口径: 一个计数 = "这一轮里出现过这种错误", 每种每轮至多
+    // +1。RX 路径有意不开 CR3.EIE / CR1.PEIE(见 RxBuffer::configure_rx_error_policy()),
+    // 线路错误不进中断, HAL 错误回调也就不会为 PE/NE/FE 而来; 但 ISR 的 PE/FE/NE 是粘滞
+    // 位, DMA 取走 RDR 不清, 只有写 ICR 才清(HAL_UART_IRQHandler 在错误中断关着时也不
+    // 碰), 所以每轮读一次、记下、清掉, 不需要中断。溢出检测关着(OVRDIS), overrun 只来自
+    // note_rx_errors()。
+    [[nodiscard]] data::UartStatusView read_status() {
+        USART_TypeDef* const instance = hal_uart_handle_->Instance;
+        const uint32_t flags = instance->ISR & (USART_ISR_PE | USART_ISR_FE | USART_ISR_NE);
+        if (flags != 0U) {
+            uint32_t clear = 0U;
+            if ((flags & USART_ISR_PE) != 0U) {
+                parity_errors_.note();
+                clear |= USART_ICR_PECF;
+            }
+            if ((flags & USART_ISR_FE) != 0U) {
+                framing_errors_.note();
+                clear |= USART_ICR_FECF;
+            }
+            if ((flags & USART_ISR_NE) != 0U) {
+                noise_errors_.note();
+                clear |= USART_ICR_NECF;
+            }
+            instance->ICR = clear;
+        }
+        return {
+            .overrun = overrun_.count(),
+            .parity = parity_errors_.count(),
+            .framing = framing_errors_.count(),
+            .noise = noise_errors_.count(),
+            .tx_dropped = tx_dropped_.count(),
+            .rx_dropped = rx_dropped_.count(),
+        };
+    }
+
 protected:
     UartCommon(data::DataId data_id, UART_HandleTypeDef* hal_uart_handle)
         : data_id_(data_id)
         , hal_uart_handle_(hal_uart_handle) {}
 
+    // 启动即在 loop::active 里置本口的位(位号 = DataId), 主循环从下一圈起轮询它; 清位由
+    // ports.hpp 的 poll_uarts() 在口停下且发完之后做。
+    void mark_active() const { loop::set(loop::bit(data_id_)); }
+
     // RxBuffer 与 TxBuffer 各存一份句柄, 派生端口无法无限定地访问
     // hal_uart_handle_; 把所需的两处访问经此路由, 避免到处写 UartCommon:: 限定。
-    [[nodiscard]] bool has_rx_error() const {
+    //
+    // HAL 错误回调(中断上下文)的第一步: 按 ErrorCode 的位各记一次, 返回是否有接收
+    // 错误。HAL 对非阻塞错误(PE/NE/FE)回调后即清 ErrorCode, 阻塞错误(ORE)由
+    // rx_error_callback() 重启接收时清, 所以每次回调看到的都是新发生的错误。
+    [[nodiscard]] bool note_rx_errors() {
+        const uint32_t code = hal_uart_handle_->ErrorCode;
+        if ((code & HAL_UART_ERROR_ORE) != 0U)
+            overrun_.note();
+        if ((code & HAL_UART_ERROR_PE) != 0U)
+            parity_errors_.note();
+        if ((code & HAL_UART_ERROR_FE) != 0U)
+            framing_errors_.note();
+        if ((code & HAL_UART_ERROR_NE) != 0U)
+            noise_errors_.note();
         constexpr uint32_t rx_error_mask =
             HAL_UART_ERROR_PE | HAL_UART_ERROR_NE | HAL_UART_ERROR_FE | HAL_UART_ERROR_ORE;
-        return (hal_uart_handle_->ErrorCode & rx_error_mask) != 0U;
+        return (code & rx_error_mask) != 0U;
     }
 
     void flag_dma_error() { hal_uart_handle_->ErrorCode |= HAL_UART_ERROR_DMA; }
@@ -236,10 +378,12 @@ protected:
             return;
 
         auto& serializer = usb::get_serializer();
+        const auto result = serializer.write_uart(
+            data_id_, {.uart_data = payload, .idle_delimited = is_idle}, payload2);
+        if (result == core::protocol::Serializer::SerializeResult::kBadAlloc) [[unlikely]]
+            rx_dropped_.note();
         core::utility::assert_always(
-            serializer.write_uart(
-                data_id_, {.uart_data = payload, .idle_delimited = is_idle}, payload2)
-            != core::protocol::Serializer::SerializeResult::kInvalidArgument);
+            result != core::protocol::Serializer::SerializeResult::kInvalidArgument);
     }
 
     // 供给本 UART 波特率除数的内核时钟。
@@ -267,8 +411,8 @@ protected:
         case UART_CLOCKSOURCE_LSE: return LSE_VALUE;
         case UART_CLOCKSOURCE_HSI:
             // HSI 经分频器到达 UART, 仅当分频为 1 时裸 HSI_VALUE 才正确,
-            // UART_SetConfig 同样移位。UART7/UART10 在 .ioc 中选择 HSI, 此路径
-            // 是活的。
+            // UART_SetConfig 同样移位。2026-10-04 起 .ioc 里所有串口都选 PLL3Q
+            // (晶振), 此路径暂时不走; 留着让 .ioc 改回 HSI 时仍然算对。
             if (__HAL_RCC_GET_FLAG(RCC_FLAG_HSIDIV) != 0U)
                 return static_cast<uint32_t>(HSI_VALUE >> (__HAL_RCC_GET_HSI_DIVIDER() >> 3U));
             return static_cast<uint32_t>(HSI_VALUE);
@@ -288,6 +432,17 @@ protected:
 
     data::DataId data_id_;
     UART_HandleTypeDef* hal_uart_handle_;
+
+    // 运行时状态的计数(read_status())。接收错误与上行丢弃在中断里记, 下行丢弃在
+    // 主循环里记; 各自单写者。
+    utility::EventCounter overrun_;
+    utility::EventCounter parity_errors_;
+    utility::EventCounter framing_errors_;
+    utility::EventCounter noise_errors_;
+    utility::EventCounter tx_dropped_;
+    utility::EventCounter rx_dropped_;
+    // 只在主循环读写(EP0 处理器、会话状态机、try_transmit 都在那里)。
+    bool started_ = false;
 };
 
 // 全双工端口: USART1、UART7、USART10, CubeMX 为每个口接好 RX 与 TX 两条
@@ -299,27 +454,90 @@ class Uart
     friend class RxBuffer<Uart>;
 
 public:
-    using Lazy = utility::Lazy<Uart, data::DataId, UART_HandleTypeDef*>;
+    // EP0 口能力: 无。
+    static constexpr uint8_t kPortCapabilities = 0;
 
-    Uart(data::DataId data_id, UART_HandleTypeDef* hal_uart_handle)
+    // 这个口交给 DMA 的全部内存, 与端口对象分开放(见本文件末尾的对象定义)。
+    struct DmaMemory {
+        RxBuffer::DmaMemory rx;
+        TxBuffer::DmaMemory tx;
+    };
+
+    using Lazy = utility::Lazy<Uart, data::DataId, UART_HandleTypeDef*, DmaMemory*>;
+
+    Uart(data::DataId data_id, UART_HandleTypeDef* hal_uart_handle, DmaMemory* dma)
         : UartCommon(data_id, hal_uart_handle)
-        , TxBuffer(hal_uart_handle, &hal_tx_dma_complete_callback, &hal_tx_dma_error_callback)
-        , RxBuffer(hal_uart_handle) {}
+        , TxBuffer(
+              hal_uart_handle, dma->tx, &hal_tx_dma_complete_callback, &hal_tx_dma_error_callback)
+        , RxBuffer(hal_uart_handle, dma->rx) {
+        update_line_rate(); // CubeMX 的初始速率与帧格式
+    }
+
+    // 速率与帧格式只在这两处变(EP0 清单应用): 写完按新的字符时间重算发送侧的包间空隙。
+    // 遮住 UartCommon 的同名原语, core 的 uart_apply() 经端口类型调到这里。半双工的
+    // UartRs485 不需要: 它的包间等待是总线换向(kTurnaroundDeadline), 不是帧间隔。
+    bool commit_baudrate(uint32_t baudrate, uint16_t divisor, uint8_t oversample) {
+        const bool committed = UartCommon::commit_baudrate(baudrate, divisor, oversample);
+        update_line_rate();
+        return committed;
+    }
+
+    void commit_framing(
+        uint32_t word_length, uint32_t parity, uint32_t stop_bits, uint32_t rx_polarity) {
+        UartCommon::commit_framing(word_length, parity, stop_bits, rx_polarity);
+        update_line_rate();
+    }
 
     void handle_downlink(const data::UartDataView& data) {
-        if (!TxBuffer::try_enqueue(data))
+        // 没声明的端口不发: 主机往它写的字节直接丢弃。
+        if (!started_)
+            return;
+        if (!TxBuffer::try_enqueue(data)) {
+            tx_dropped_.note();
             led::led->downlink_buffer_full();
+        }
     }
 
-    void try_transmit() {
-        RxBuffer::try_dequeue();
-        TxBuffer::try_dequeue();
+    // @return 这一口之后还要不要主循环来轮询(见 ports.hpp 的 poll_uarts())
+    bool try_transmit() {
+        if (started_) {
+            RxBuffer::try_dequeue();
+            TxBuffer::try_dequeue();
+            return true;
+        }
+        if (draining_) {
+            // 停口之前已经收下的字节照常发完, 发完就不再轮询。
+            TxBuffer::try_dequeue();
+            draining_ = !TxBuffer::drained();
+        }
+        return draining_;
     }
+
+    void start() {
+        if (started_)
+            return;
+        RxBuffer::start_rx();
+        started_ = true;
+        mark_active();
+    }
+
+    void stop() {
+        if (!started_)
+            return;
+        started_ = false;
+        RxBuffer::stop_rx();
+        draining_ = !TxBuffer::drained();
+    }
+
+    // 端口接口的统一名(见 core/src/link/port_ops.hpp): 启停语义与本板"上电全停"
+    // 的策略一致 -- 声明清单里没有的口回到停的状态。
+    void suspend() { stop(); }
+    void resume() { start(); }
 
     void tx_complete_callback() { TxBuffer::tx_complete_callback(); }
 
     void uart_error_callback() {
-        if (has_rx_error())
+        if (note_rx_errors())
             RxBuffer::rx_error_callback();
     }
 
@@ -333,11 +551,16 @@ public:
     void rx_event_callback() { RxBuffer::uart_idle_event_callback(); }
 
 private:
+    void update_line_rate() { TxBuffer::set_line_rate(effective_baudrate(), bits_per_character()); }
+
     static void hal_rx_dma_error_callback(DMA_HandleTypeDef* hal_dma_handle);
 
     static void hal_tx_dma_complete_callback(DMA_HandleTypeDef* hal_dma_handle);
 
     static void hal_tx_dma_error_callback(DMA_HandleTypeDef* hal_dma_handle);
+
+    // 已停口、但发送 ring 里还有停口前收下的字节。
+    bool draining_ = false;
 };
 
 // 仅接收端口, 用于 UART5 (DBUS)。
@@ -346,24 +569,53 @@ private:
 // (bsp/cubemx/Core/Src/usart.c 只声明 hdma_uart5_rx 而无 hdma_uart5_tx); 协议
 // 也不会把下行路由到 kUartDbus, usb/vendor.hpp 的 uart_deserialized_callback
 // 只分发 kUart1/kUart2/kUart3/kUart7/kUart10(不含 DBUS)。
-// 仅 kUartDbusConfig 路由至此, 落在 UartCommon::handle_config。
+// 到这里的只有 EP0 清单里 kUartDbus 的声明与读回。
 class UartRxOnly
     : public UartCommon
     , private RxBuffer<UartRxOnly> {
     friend class RxBuffer<UartRxOnly>;
 
 public:
-    using Lazy = utility::Lazy<UartRxOnly, data::DataId, UART_HandleTypeDef*>;
+    // EP0 口能力: DBUS 口有 RX 反相(RXINV 抵消板上反相器, iBUS 接收机由此可用), 声明里的
+    // rx_polarity 是设置。
+    static constexpr uint8_t kPortCapabilities = spec::kUartCapRxPolaritySettable;
 
-    UartRxOnly(data::DataId data_id, UART_HandleTypeDef* hal_uart_handle)
+    using DmaMemory = RxBuffer::DmaMemory;
+
+    using Lazy = utility::Lazy<UartRxOnly, data::DataId, UART_HandleTypeDef*, DmaMemory*>;
+
+    UartRxOnly(data::DataId data_id, UART_HandleTypeDef* hal_uart_handle, DmaMemory* dma)
         : UartCommon(data_id, hal_uart_handle)
-        , RxBuffer(hal_uart_handle) {}
+        , RxBuffer(hal_uart_handle, *dma) {}
 
-    // 与全双工端口同名, 便于 app.cpp 统一轮询所有端口; 此处仅排空接收 ring。
-    void try_transmit() { RxBuffer::try_dequeue(); }
+    // 与全双工端口同名, 便于统一轮询所有端口; 此处仅排空接收 ring。
+    // @return 这一口之后还要不要主循环来轮询(见 ports.hpp 的 poll_uarts())
+    bool try_transmit() {
+        if (started_)
+            RxBuffer::try_dequeue();
+        return started_;
+    }
+
+    void start() {
+        if (started_)
+            return;
+        RxBuffer::start_rx();
+        started_ = true;
+        mark_active();
+    }
+
+    void stop() {
+        if (!started_)
+            return;
+        started_ = false;
+        RxBuffer::stop_rx();
+    }
+
+    void suspend() { stop(); }
+    void resume() { start(); }
 
     void uart_error_callback() {
-        if (has_rx_error())
+        if (note_rx_errors())
             RxBuffer::rx_error_callback();
     }
 
@@ -412,30 +664,76 @@ class UartRs485
     friend class RxBuffer<UartRs485, kRs485BufferSize>;
 
 public:
-    using Lazy = utility::Lazy<UartRs485, data::DataId, UART_HandleTypeDef*>;
+    // EP0 口能力: 无。
+    static constexpr uint8_t kPortCapabilities = 0;
 
-    UartRs485(data::DataId data_id, UART_HandleTypeDef* hal_uart_handle)
+    struct DmaMemory {
+        RxBuffer::DmaMemory rx;
+        TxBuffer::DmaMemory tx;
+    };
+
+    using Lazy = utility::Lazy<UartRs485, data::DataId, UART_HandleTypeDef*, DmaMemory*>;
+
+    UartRs485(data::DataId data_id, UART_HandleTypeDef* hal_uart_handle, DmaMemory* dma)
         : UartCommon(data_id, hal_uart_handle)
-        , TxBuffer(hal_uart_handle, &hal_tx_dma_complete_callback, &hal_tx_dma_error_callback)
-        , RxBuffer(hal_uart_handle) {}
+        , TxBuffer(
+              hal_uart_handle, dma->tx, &hal_tx_dma_complete_callback, &hal_tx_dma_error_callback)
+        , RxBuffer(hal_uart_handle, dma->rx) {}
 
     void handle_downlink(const data::UartDataView& data) {
-        if (!TxBuffer::try_enqueue(data))
+        // 没声明的端口不发: 主机往它写的字节直接丢弃。
+        if (!started_)
+            return;
+        if (!TxBuffer::try_enqueue(data)) {
+            tx_dropped_.note();
             led::led->downlink_buffer_full();
+        }
     }
 
     // 把原始 IDLE 计数喂给 turnaround 门, 刻意不用 RxBuffer::try_dequeue()
     // 维护的 consumed_idle_count_: 总线是否重新空闲只取决于对端是否停口, 与
     // 主机是否已取走字节无关。
-    void try_transmit() {
-        RxBuffer::try_dequeue();
-        TxBuffer::try_dequeue(RxBuffer::idle_count());
+    // @return 这一口之后还要不要主循环来轮询(见 ports.hpp 的 poll_uarts())
+    bool try_transmit() {
+        if (started_) {
+            RxBuffer::try_dequeue();
+            TxBuffer::try_dequeue(RxBuffer::idle_count());
+            return true;
+        }
+        if (draining_) {
+            // 停口之前已经收下的事务照常发完, 发完就不再轮询。接收已停, IDLE 计数
+            // 不再前进, turnaround 门退回它的超时。
+            TxBuffer::try_dequeue(RxBuffer::idle_count());
+            draining_ = !TxBuffer::drained();
+        }
+        return draining_;
     }
+
+    void start() {
+        if (started_)
+            return;
+        RxBuffer::start_rx();
+        started_ = true;
+        mark_active();
+    }
+
+    void stop() {
+        if (!started_)
+            return;
+        started_ = false;
+        RxBuffer::stop_rx();
+        draining_ = !TxBuffer::drained();
+    }
+
+    // 端口接口的统一名(见 core/src/link/port_ops.hpp): 启停语义与本板"上电全停"
+    // 的策略一致 -- 声明清单里没有的口回到停的状态。
+    void suspend() { stop(); }
+    void resume() { start(); }
 
     void tx_complete_callback() { TxBuffer::tx_complete_callback(); }
 
     void uart_error_callback() {
-        if (has_rx_error())
+        if (note_rx_errors())
             RxBuffer::rx_error_callback();
     }
 
@@ -450,8 +748,9 @@ public:
     // ISR 排空方案: 确能省掉主循环每遍的 NDTR 读取(5410 -> 5133 周期/遍,
     // 101 -> 107 kHz), 但该时间本就富余(每个到达的 USB 包主循环已跑四遍), 且
     // 200 字节消息的往返耗时增加 26%, 因为仅按 IDLE 发布会放弃
-    // RxBuffer::try_dequeue() 在字节仍在到达时按 kMinFragmentSize 边界的分块
-    // 流式转发。数据见 firmware/mc02/AGENTS.md, 该开关因此被移除。
+    // RxBuffer::try_dequeue() 在字节仍在到达时的分块流式转发(当时按 32 字节分块,
+    // 2026-10-04 起按时间门槛 kHoldCycles)。数据见 firmware/mc02/AGENTS.md, 该开关
+    // 因此被移除。
     void rx_event_callback() { RxBuffer::uart_idle_event_callback(); }
 
 private:
@@ -460,19 +759,39 @@ private:
     static void hal_tx_dma_complete_callback(DMA_HandleTypeDef* hal_dma_handle);
 
     static void hal_tx_dma_error_callback(DMA_HandleTypeDef* hal_dma_handle);
+
+    // 已停口、但发送 ring 里还有停口前收下的字节。
+    bool draining_ = false;
 };
 
-// 位于 D2 SRAM (.d2_sram, 0x30000000)。每个对象自带 DMA ring, 而驱动 UART
-// RX/TX 流的 DMA1/DMA2 是 D2 域主设备: ring 放在 D2 SRAM 使每次传输都留在域
-// 内, 不跨 D2-D1 互连去 AXI SRAM 与 M7 争用。第二个原因(non-cacheable MPU
-// 窗口下的 AXI SRAM 余量)与 app.cpp 开机需做的事, 见
-// bsp/linker/STM32H723VGTx_APP.ld 的 .d2_sram 注释。不可像 can.hpp 那样挪进
-// .dtcm: DTCM 仅核内可达, 指向它的 DMA 流会静默地什么都传不了。
-[[gnu::section(".d2_sram")]] inline constinit Uart::Lazy uart1{data::DataId::kUart1, &huart1};
-[[gnu::section(".d2_sram")]] inline constinit Uart::Lazy uart7{data::DataId::kUart7, &huart7};
-[[gnu::section(".d2_sram")]] inline constinit Uart::Lazy uart10{data::DataId::kUart10, &huart10};
-[[gnu::section(".d2_sram")]] inline constinit UartRxOnly::Lazy uart_dbus{
-    data::DataId::kUartDbus, &huart5};
+// 每个端口分成两块放 [2026-10-03]:
+//
+//   - DMA 读写的内存(ring 与 staging, 各口的 DmaMemory)在 D2 SRAM (.d2_sram,
+//     0x30000000)。驱动 UART RX/TX 流的 DMA1/DMA2 是 D2 域主设备: 放在这里每次传输
+//     都留在域内, 不跨 D2-D1 互连去 AXI SRAM 与 M7 争用。第二个原因(non-cacheable
+//     MPU 窗口下的 AXI SRAM 余量)与 app.cpp 开机需做的事, 见
+//     bsp/linker/STM32H723VGTx_APP.ld 的 .d2_sram 注释。这块不能进 .dtcm: DTCM 仅
+//     核内可达, 指向它的 DMA 流会静默地什么都传不了。
+//   - 端口对象本身(下标、计数、标志、检查点队列)在零等待的 DTCM (.dtcm), 和 CAN
+//     对象一样。此前它跟着 ring 一起在 D2 SRAM 里, 而那一区是非缓存的: 主循环每圈
+//     轮询一个已声明的端口要读写十来个成员, 每个都是一次跨域总线事务, 一个全双工
+//     口每圈因此多花约 200 个周期。实测见 PACKET_RATE_LOG.md 4.5 节。
+//
+// 新增端口时两样都要写: 漏掉 section 属性的 DmaMemory 会落进 .bss, 那里目前恰好
+// 也是非缓存的 AXI SRAM, 功能上能跑, 但每个字节都要跨域。
+[[gnu::section(".d2_sram")]] inline constinit Uart::DmaMemory uart1_memory{};
+[[gnu::section(".d2_sram")]] inline constinit Uart::DmaMemory uart7_memory{};
+[[gnu::section(".d2_sram")]] inline constinit Uart::DmaMemory uart10_memory{};
+[[gnu::section(".d2_sram")]] inline constinit UartRxOnly::DmaMemory uart_dbus_memory{};
+
+[[gnu::section(".dtcm")]] inline constinit Uart::Lazy uart1{
+    spec::mc02::Spec::Uarts::kUart1.data_id, &huart1, &uart1_memory};
+[[gnu::section(".dtcm")]] inline constinit Uart::Lazy uart7{
+    spec::mc02::Spec::Uarts::kUart7.data_id, &huart7, &uart7_memory};
+[[gnu::section(".dtcm")]] inline constinit Uart::Lazy uart10{
+    spec::mc02::Spec::Uarts::kUart10.data_id, &huart10, &uart10_memory};
+[[gnu::section(".dtcm")]] inline constinit UartRxOnly::Lazy uart_dbus{
+    spec::mc02::Spec::Uarts::kDbus.data_id, &huart5, &uart_dbus_memory};
 
 // RS-485 端口接在 USART2 / USART3, 按机壳丝印 (UART2 / UART3) 而非备用协议
 // 槽位命名。与流式端口的差异见 UartRs485, 以及 tx_buffer.hpp 的
@@ -507,12 +826,21 @@ private:
 // 镜像 —— 主机分不清"这块板没有 UART2"与"这版镜像把 UART2 编掉了"。代价是
 // ~1.8 KB D2 SRAM 常驻(Lazy 与其 DMA ring 在链接期就占位, 与是否 init() 无关),
 // 已明确接受。
-[[gnu::section(".d2_sram")]] inline constinit UartRs485::Lazy uart2{data::DataId::kUart2, &huart2};
+[[gnu::section(".d2_sram")]] inline constinit UartRs485::DmaMemory uart2_memory{};
+[[gnu::section(".dtcm")]] inline constinit UartRs485::Lazy uart2{
+    spec::mc02::Spec::Uarts::kUart2.data_id, &huart2, &uart2_memory};
 
 // 第二个 RS-485 口, USART3 经收发器 U6: 485_DIR1 由 PB14 上的 USART3_DE 驱动,
 // 数据走 PD8/PD9, 总线接 P5 连接器。电路与上述 U5 相同, RE# 接 DE, R12 把 RO
 // 拉到 3V3 使禁用的接收器维持空闲电平, R18 把 DE 网络拉低使端口上电即接收,
 // R16 在本端装 120R 端接。
-[[gnu::section(".d2_sram")]] inline constinit UartRs485::Lazy uart3{data::DataId::kUart3, &huart3};
+[[gnu::section(".d2_sram")]] inline constinit UartRs485::DmaMemory uart3_memory{};
+[[gnu::section(".dtcm")]] inline constinit UartRs485::Lazy uart3{
+    spec::mc02::Spec::Uarts::kUart3.data_id, &huart3, &uart3_memory};
+
+// 主循环要轮询的端口在 loop::active 里各占一位, 位号就是端口的 DataId(utility/loop_work.hpp):
+// 主机声明过的, 加上停口之后发送 ring 还没排空的。端口的 start() 自己置位; stop() 不清位,
+// 停掉的口在下一圈被轮询最后一次, 由 try_transmit() 的返回值决定是清位还是留着排空。
+// 按位分发到端口对象的是注册表(ports.hpp 的 poll_uarts()), 这里不另立"第几路"的表。
 
 } // namespace libhcs::firmware::uart

@@ -519,7 +519,9 @@ JL1111 的 ID `0x937c4024`，但不随任何 RJ45 建立链路，被判定为广
 - `board_console_try_send_byte()` 之所以是非阻塞的，正是因为 SDK 的
   `console_send_byte()` 会在 THR-empty 上忙等约 87us/字节——在没接收端的板子上那是纯浪费。
 - UART1（PY06/PY07）同属这一类调试引脚，**不要盲翻它们的电平**（同段的
-  `PWDG_RSTN` 是看门狗复位）。
+  `PWDG_RSTN` 是看门狗复位）。它曾作为"测试 UART"进了 libhcs 的口表；2026-10-04 起生产
+  镜像不带它的驱动，本板的口只有 CAN0..CAN3（`spec/hpm6e8y/ports.hpp`，固件
+  `board_app.hpp` 的 `kUartPorts` 为空）。
 
 ## 调试与救砖
 

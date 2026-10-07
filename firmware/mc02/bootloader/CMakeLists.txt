@@ -1,6 +1,6 @@
 add_executable(mc02_bootloader)
 
-set(MC02_BOOTLOADER_TINYUSB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../c_board/bsp/tinyusb")
+set(MC02_BOOTLOADER_TINYUSB_ROOT "${libhcs_PROJECT_ROOT}/firmware/common/bsp/tinyusb")
 cmake_path(ABSOLUTE_PATH MC02_BOOTLOADER_TINYUSB_ROOT NORMALIZE)
 set(MC02_BOOTLOADER_TINYUSB_COMMON_SOURCES
     "${MC02_BOOTLOADER_TINYUSB_ROOT}/src/tusb.c"

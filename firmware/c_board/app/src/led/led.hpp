@@ -7,7 +7,7 @@
 #include <tim.h>
 
 #include "core/src/utility/assert.hpp"
-#include "firmware/c_board/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 
 namespace libhcs::firmware::led {
 
@@ -26,7 +26,7 @@ public:
         user_controlling_.store(false, std::memory_order::relaxed);
     }
 
-    // Lighting effect lasts for 5 seconds
+    // 灯效持续 5 秒
     void uplink_buffer_full() {
         uplink_full_reset_counter_.store(5000, std::memory_order::relaxed);
     }
@@ -35,11 +35,11 @@ public:
     }
 
     void update(uint32_t tick) {
-        // Do not change the lighting when user controlling
+        // 用户控制时不改灯效
         if (user_controlling_.load(std::memory_order::relaxed))
             return;
 
-        // Atomic decrease counter
+        // 原子递减计数器
         uint16_t uplink_full;
         do {
             uplink_full = uplink_full_reset_counter_.load(std::memory_order::relaxed);
@@ -57,30 +57,30 @@ public:
             downlink_full, downlink_full - 1, std::memory_order::relaxed));
 
         if (uplink_full && downlink_full) {
-            // Both full: yellow and aqua lights flashing alternately
+            // 双满: 黄与青交替闪
             if (tick & 128)
                 set_value(255, 255, 0);
             else
                 set_value(0, 255, 255);
         } else if (uplink_full) {
-            // Uplink full: yellow light flashing
+            // 上行满: 黄灯闪
             if (tick & 128)
                 set_value(255, 255, 0);
             else
                 set_value(0, 0, 0);
         } else if (downlink_full) {
-            // Downlink full: aqua light flashing
+            // 下行满: 青灯闪
             if (tick & 128)
                 set_value(0, 0, 0);
             else
                 set_value(0, 255, 255);
         } else if (host_connected_.load(std::memory_order::relaxed)) {
-            // Host session established (nonce handshake done, keepalive lease
-            // live): steady green means data is actually being forwarded.
+            // 主机会话已建立(nonce 握手完成、保活租约在身): 常亮绿即数据确实
+            // 在转发。
             set_value(0, 255, 0);
         } else {
-            // Alive but no host session yet: green breathing light. Enumerated
-            // without a live session still shows as "waiting", not "working".
+            // 活着但还没有主机会话: 绿灯呼吸。枚举完成而无会话显示"等待", 不是
+            // "工作"。
             auto brightness = (tick >> 2) & 511;
             if (brightness > 255)
                 brightness = 511 - brightness;
@@ -92,7 +92,7 @@ public:
         host_connected_.store(connected, std::memory_order::relaxed);
     }
 
-    // Non-static to ensure instantiation
+    // 非静态, 确保实例化
     // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
     void set_value(uint8_t red, uint8_t green, uint8_t blue) {
         htim5.Instance->CCR1 = blue;

@@ -85,6 +85,12 @@ extern "C" {
 #define CFG_TUD_VENDOR_RX_BUFSIZE 0
 #define CFG_TUD_VENDOR_TX_BUFSIZE 0
 
+// 先挂后处理(共享 TinyUSB 的本地补丁, 见 class/vendor/vendor_device.h): OUT 端点两块缓冲,
+// 收完一块先把另一块挂上再交给 tud_vendor_rx_cb(), 处理下行包期间端点不再对主机 NAK。
+// 主机连续灌包时包率 +10%, 1 kHz 往返延迟不变(USB_OPTIMIZATION_LOG.md 16.3)。代价是多
+// 512 字节 noncacheable RAM。只在本板打开: mc02 / c_board 不受影响。
+#define CFG_TUD_VENDOR_RX_ARM_FIRST 1
+
 // CDC 串口桥: FIFO 与端点缓冲都按高速 bulk 包长 512 取。
 #define CFG_TUD_CDC_RX_BUFSIZE 512
 #define CFG_TUD_CDC_TX_BUFSIZE 512

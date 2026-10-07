@@ -109,11 +109,6 @@ hpm6e8y-core1)
     echo "       at boot. Erase the hpm6e8y target instead." >&2
     exit 2
     ;;
-ch32_board)
-    echo "error: ch32_board is debugged over WCH-Link, which J-Link does not speak." >&2
-    echo "       See firmware/ch32_board/AGENTS.md." >&2
-    exit 2
-    ;;
 "")
     echo "error: no target given" >&2
     echo >&2

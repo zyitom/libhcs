@@ -337,14 +337,27 @@ idle 分帧不被拼接、4096/32768 字节流逐字节、**一端切波特率�
 
 **已知缺口**
 
-- `kMinFragmentSize = 32` 是**个数不是时间**，低波特率下代价爆炸（9600 时 33 ms）。
-  加一条时间兜底触发（`timer::check_expired`，`TxBuffer` 已在用）就能把延迟钉死。
-  纯软件、不动协议。**这是串口路径上唯一还能明显挪动延迟的旋钮。**
-- UART 内核时钟选的是 **HSI 64 MHz**（`RCC.USART16CLockSelection` /
-  `USART234578CLockSelection`，在各口的 MspInit 里生效）。改成 D2PCLK1/2（137.5 MHz，
-  由 24 MHz 晶振经 PLL1 得到）能把精度从 RC 的百分级提到 ppm 级——**只有精度价值，没有
-  速度价值**（5.1 已证明 4 Mbaud 就远超 USB 能搬走的量）。必须走 CubeMX：每个
-  `HAL_UART_MspInit` 都会把时钟源写回 HSI，app 代码改不动。
+- ~~`kMinFragmentSize = 32` 是**个数不是时间**，低波特率下代价爆炸（9600 时 33 ms）~~
+  **已改 [2026-10-04]**：门槛换成时间——线路没空闲、没攒满一条记录时，最早那个
+  没发的字节等满 250 µs 就发（`RxBuffer::kHoldCycles`）。计时读 `DWT->CYCCNT` 而不是
+  `timer::check_expired`（后者读 TIM5，是一次 D2 域外设访问），且只在"有字节在等"的那几趟
+  读；空环与空闲触发的路径和原来一样只有一次比较。250 µs 在 921600 下约 23 字节一段，与旧
+  门槛的 USB 开销同量级；ring 最小的 RS-485 口（256 B，4.8 Mbaud）一次等待进 120 B，有
+  `static_assert` 守着。5321 与 c_board 没跟着改：它们的写指针只在每 32 B 一次的 DMA 中断里
+  推进（5321 的转发本身也只在中断里跑），32 是中断粒度，改要先重构，见各自 `rx_buffer.hpp`。
+  `[实测 2026-10-04，5321 UART0 -> mc02 UART1，115200 连续 600 字节：主机收到 201 段、每段 3 字节、
+  首段 0.5-1.2 ms 到；旧门槛下是 32 字节一段、2.8 ms 一段]`。代价是低速率下上行记录变多（每段
+  3 字节数据配一个记录头），总量离 USB 上限很远。
+- 同一轮顺带：`idle_delimited` 包之后的发送空隙从固定 300 µs 改成两个字符时间
+  （`TxBuffer::kIdleGapCharacters`，在提交速率/帧格式时按 `BRR` 与帧位数算好存下）。300 µs 在
+  9600 下不到一个字符（对端分不出帧），在 921600 下多等约 27 个字符。c_board 同改，但从 DMA
+  完成起算要 2 + 2 个字符（F407 无 TXFIFO 也不看 `TC`，DMA 完成时 DR 与移位寄存器里还有至多
+  两个字符）。hpm 用硬件 TX 空闲检测，不涉及。`[mc02 实测 2026-10-04：9600 下三个 4 字节定界包
+  到 5321 是三条带 idle 的记录、间隔 6.2-6.3 ms = 4 字符数据 + 2 字符空隙；c_board 仅编译验证]`
+- ~~UART 内核时钟选的是 **HSI 64 MHz**~~ **已解决 [2026-10-04]**：全部串口改挂 PLL3Q
+  48 MHz（24 MHz 晶振，与 USB 同源），精度从 RC 的百分级到 ppm 级。48 MHz 在 16 倍过采样下
+  上限 3 Mbaud，两个默认 4.8 Mbaud 的 RS-485 口（USART2/3）在 .ioc 里改为 8 倍过采样；
+  本章 5.1 的 4 Mbaud 实测是在旧时钟下做的，新时钟下的高速率未上板复测。
 - `uart.hpp:49-50` 的 `kBrrMin`/`kBrrMax` 触发 clang-tidy 的
   `readability-identifier-naming`。**`firmware/mc02/` 整个不在 `.scripts/lint-targets.yml`
   里**，所以门禁从未覆盖过这块板；要加进去还得先补一份 `firmware/mc02/.clangd`。

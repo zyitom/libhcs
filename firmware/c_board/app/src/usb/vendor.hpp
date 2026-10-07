@@ -1,7 +1,6 @@
 #pragma once
 
 #include <algorithm>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
@@ -11,82 +10,107 @@
 #include <tusb.h>
 
 #include "core/include/libhcs/data/datas.hpp"
-#include "core/include/libhcs/spec/c_board/gpio.hpp"
-#include "core/include/libhcs/spec/gpio.hpp"
+#include "core/include/libhcs/spec/c_board/ports.hpp"
+#include "core/src/link/session.hpp"
 #include "core/src/protocol/deserializer.hpp"
 #include "core/src/protocol/protocol.hpp"
 #include "core/src/protocol/serializer.hpp"
 #include "core/src/utility/assert.hpp"
 #include "core/src/utility/immovable.hpp"
+#include "firmware/c_board/app/src/buzzer/buzzer.hpp"
 #include "firmware/c_board/app/src/can/can.hpp"
 #include "firmware/c_board/app/src/gpio/gpio.hpp"
+#include "firmware/c_board/app/src/sync/sof.hpp"
+#include "firmware/c_board/app/src/sync/timebase.hpp"
 #include "firmware/c_board/app/src/timer/timer.hpp"
 #include "firmware/c_board/app/src/uart/uart.hpp"
-#include "firmware/c_board/app/src/usb/interrupt_safe_buffer.hpp"
+#include "firmware/c_board/app/src/usb/helper.hpp"
 #include "firmware/c_board/app/src/usb/usb_descriptors.hpp"
-#include "firmware/c_board/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/link/host_session.hpp"
+#include "firmware/common/app/src/usb/interrupt_safe_buffer.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 
 namespace libhcs::firmware::usb {
 
 void poll_dfu_runtime_reboot();
 
-class Vendor
-    : private core::protocol::DeserializeCallback
-    , private core::utility::Immovable {
+// 上行满的板级报告: 无会话时的积压是预期稳态(见 usb/helper.hpp 的
+// uplink_session_active), 只有主机正在排空时的满才点亮 LED。旧版本无条件报,
+// 与 mc02 的会话门控漂移, 统一时取门控版。
+struct UplinkAllocFailed {
+    static void report() {
+        if (uplink_session_active())
+            led::led->uplink_buffer_full();
+    }
+};
+
+// batch 对齐 alignof(size_t): M4 没有缓存, 不需要缓存行对齐。
+using UpstreamBatches = InterruptSafeBuffer<alignof(size_t), UplinkAllocFailed>;
+
+// 共享时间基准与本板时刻的板级事实(firmware/common/app/src/link/host_session.hpp
+// 的策略契约)。本地时刻来自 TIM2(4 MHz, 按 quarter-us 上报), "此刻"插值读同一
+// 定时器后走 timebase::microframe_at()。捕获计数是 SOF 捕获(TIM2 ITR1 触发 DMA 抄
+// TIM7, sync/sof.cpp)的新鲜/过时次数; bxCAN 无帧时间戳, 没有 CAN 那一侧。
+struct TimeSync {
+    static bool on() { return sync::time_sync_on(); }
+
+    static void apply_anchor(std::uint64_t host_microframe) {
+        sync::timebase::apply_anchor(host_microframe);
+    }
+
+    static auto report() { return sync::timebase::report(); }
+
+    static bool interpolate_now(
+        std::uint32_t& now_quarter_us, std::uint64_t& out_microframe,
+        std::uint16_t& out_fraction_q16) {
+        now_quarter_us = timer::timer->timepoint().time_since_epoch().count();
+        return sync::timebase::microframe_at(now_quarter_us, out_microframe, out_fraction_q16);
+    }
+
+    static link::CaptureCounts take_capture_counts() {
+        const auto counts = sync::take_capture_counts();
+        return {counts.fresh, counts.stale};
+    }
+
+    static std::uint32_t now_quarter_us() {
+        return timer::timer->timepoint().time_since_epoch().count();
+    }
+};
+
+// USB vendor class 主机传输: 负责 TinyUSB 启动与传输形态(max-packet 分块 + ZLP
+// 收尾)。会话生命周期、下行分发与 kTimeAnchor 应答在共用的
+// firmware/common/app/src/link/host_session.hpp(2026-10-06 起与 hpm/mc02 同一份;
+// 原先本文件里的 kStart/kKeepalive、租约、锚点应答与批量缓冲成员皆已删去)。
+class Vendor : public link::HostSession<UpstreamBatches, TimeSync> {
 public:
     using Lazy = utility::Lazy<Vendor>;
 
     static constexpr size_t kMaxPacketSize = 64;
-    static constexpr std::size_t kGpioChannelCount = std::size(spec::c_board::kGpioDescriptors);
-    static constexpr auto kSessionLease = std::chrono::milliseconds{1000};
 
     Vendor() {
         usb::usb_descriptors.init();
         core::utility::assert_always(tusb_rhport_init(0, nullptr));
     }
 
-    core::protocol::Serializer& serializer() { return serializer_; }
-
-    // True once the host has completed the nonce handshake and is holding the
-    // keepalive lease, i.e. data is actually being forwarded. Distinct from mere
-    // USB enumeration, which says nothing about whether a host is talking.
-    bool session_established() const { return session_established_; }
-
-    // EP0 接口握手: 主机读过 kGetInterface 即置位, 之后才允许开会话。
-    // EP0 处理器(usb/vendor_control.cpp)在应答之后调用它。
+    // EP0 清单声明: 主机的 kApplyManifest 被完整应用即置位, 之后才允许开会话。
+    // EP0 处理器(usb/vendor_control.cpp)在应答之后调用它。会话结束(到期、总线
+    // 事件)时由 session_deactivated_callback() 一并清掉。
     void set_ep0_handshake_done(bool done) { ep0_handshake_done_ = done; }
 
-    void deactivate_session() {
-        session_established_ = false;
-        // A session takes the GPIO outputs it set with it; see Gpio::stop_outputs().
-        gpio::gpio->stop_outputs();
-    }
-
-    void handle_downlink(std::span<const std::byte> buffer, bool finished) {
-        deserializer_.feed(buffer);
-        if (finished)
-            deserializer_.finish_transfer();
-    }
-
-    void finish_downlink_transfer() { deserializer_.finish_transfer(); }
-
+    // 检查按代价从低到高排序, 且刻意不刷新会话 -- 租约检查在 poll_session()。
+    //
+    // batch 池是普通 RAM; tud_vendor_n_write_available() 读 TinyUSB 的端点状态,
+    // 同样是 RAM。没有待发内容时两者都不值得执行, 而 app.cpp 对每个数据源各调一次
+    // -- 每趟多次 -- "有没有活"这一测试之前的任何开销都要乘上九倍。
     bool try_transmit() {
-        refresh_session_state();
-
-        if (!session_established_) {
+        const auto* batch = next_batch();
+        if (!batch)
             return false;
-        }
 
         if (!tud_vendor_n_write_available(0))
             return false;
 
-        if (!transmitting_batch_) {
-            transmitting_batch_ = transmit_buffer_.pop_batch();
-        }
-        if (!transmitting_batch_)
-            return false;
-
-        const auto data = transmitting_batch_->data();
+        const auto data = batch->data();
 
         const auto target_size = std::min(data.size() - transmitted_size_, kMaxPacketSize);
 
@@ -95,215 +119,63 @@ public:
         if (target_size) {
             core::utility::assert_debug(tud_vendor_n_write(0, src, target_size) == target_size);
         } else {
-            // Terminate a batch whose length is an exact multiple of the endpoint size.
-            // In non-buffered vendor mode (RX/TX_BUFSIZE == 0) TinyUSB submits a
-            // zero-length write straight to the endpoint as a ZLP. The return value is 0
-            // both on success and on a failed endpoint claim, so there is nothing to
-            // assert; write_available() above already confirmed the endpoint is idle.
+            // 批长恰好是端点尺寸整数倍时补一个终结包。非缓冲 vendor 模式
+            // (RX/TX_BUFSIZE == 0)下 TinyUSB 把零长写直接作为 ZLP 提交到端点。
+            // 成功与认领端点失败的返回值都是 0, 没有可断言的东西; 上面的
+            // write_available() 已确认端点空闲。
             tud_vendor_n_write(0, src, 0);
         }
 
         transmitted_size_ += target_size;
         if (transmitted_size_ == data.size() && target_size < kMaxPacketSize) {
-            transmit_buffer_.release_batch(transmitting_batch_);
-            transmitting_batch_ = nullptr;
+            finish_batch();
             transmitted_size_ = 0;
         }
 
         return true;
     }
+
+    bool session_allowed() const noexcept override { return ep0_handshake_done_; }
+
+protected:
+    // 会话结束 -- 租约到期、总线复位、挂起或拔线(基类 deactivate_session() 的
+    // 下半段): 连同会话一并遗忘 EP0 握手。tud_mount_cb 只在重新枚举时触发, 不重新
+    // 插拔线缆地更换主机程序不会重新枚举 -- 否则从不做握手的新主机会继承上一台
+    // 主机的通行门(实测于 hpm_board: 它径直穿了过去)。与 mc02 同一约定。每个口
+    // 由自己的 suspend() 停 -- 引脚拉低、输入停采样(见 gpio::Pin::suspend); 本板
+    // CAN、UART 与 IMU 的 suspend() 是空操作, 继续跑。口集合就是注册表, 不在这里
+    // 再列一遍。定义在 vendor.cpp(ports.hpp 反向包含本文件, 不能进头文件)。
+    void session_deactivated_callback() override;
+
+    // 新会话: 旧主机下发的输出值不能留给新主机继承。
+    void session_activated_callback() override {
+        gpio::gpio->zero_outputs();
+        buzzer::buzzer_port.silence();
+        transmitted_size_ = 0;
+    }
+
+    // ---- 下行分发(定义在 vendor.cpp, 经 ports::Registry 分发)。会话门在基类
+    // 已把守; 不是本板这一类口的 DataId 才算不认识(返回 false)。没声明(或方向
+    // 不符)的口收到的数据由驱动自己丢弃。 ----
+    bool dispatch_can(core::protocol::FieldId id, const data::CanDataView& data) override;
+    bool dispatch_uart(core::protocol::FieldId id, const data::UartDataView& data) override;
+    void report_port_status(core::link::PortStatusRound& round) override;
+    bool dispatch_gpio_digital(uint8_t line, const data::GpioDigitalDataView& data) override;
+    bool dispatch_gpio_analog(uint8_t line, const data::GpioAnalogDataView& data) override;
+    bool dispatch_gpio_read(uint8_t line) override;
+    bool dispatch_buzzer(const data::BuzzerToneDataView& data) override;
 
 private:
-    void activate_session(uint32_t nonce) {
-        // A new session replacing an old one must not inherit the old host's outputs.
-        gpio::gpio->stop_outputs();
-        if (transmitting_batch_) {
-            transmit_buffer_.release_batch(transmitting_batch_);
-            transmitting_batch_ = nullptr;
-            transmitted_size_ = 0;
-        }
-        transmit_buffer_.clear();
-
-        current_session_nonce_ = nonce;
-        last_session_refresh_ = timer::timer->timepoint48();
-        session_established_ = true;
-    }
-
-    bool can_deserialized_callback(
-        core::protocol::FieldId id, const data::CanDataView& data) override {
-        if (!session_established_)
-            return true;
-        switch (id) {
-        case data::DataId::kCan1: can::can1->handle_downlink(data); return true;
-        case data::DataId::kCan2: can::can2->handle_downlink(data); return true;
-        default: return false;
-        }
-    }
-
-    bool uart_deserialized_callback(
-        core::protocol::FieldId id, const data::UartDataView& data) override {
-        if (!session_established_)
-            return true;
-        switch (id) {
-        case data::DataId::kUart1: uart::uart1->handle_downlink(data); return true;
-        case data::DataId::kUart2: uart::uart2->handle_downlink(data); return true;
-        default: return false;
-        }
-    }
-
-    bool uart_config_deserialized_callback(
-        core::protocol::FieldId id, const data::UartConfigView& data) override {
-        if (!session_established_)
-            return true;
-        switch (id) {
-        case data::DataId::kUartDbusConfig: return uart::uart_dbus->handle_config(data);
-        case data::DataId::kUart1Config: return uart::uart1->handle_config(data);
-        case data::DataId::kUart2Config: return uart::uart2->handle_config(data);
-        default: return false;
-        }
-    }
-
-    bool gpio_digital_data_deserialized_callback(
-        uint8_t channel_index, const data::GpioDigitalDataView& data) override {
-        if (!session_established_)
-            return true;
-        if (data.timestamp_quarter_us.has_value())
-            return false;
-        if (channel_index >= kGpioChannelCount)
-            return false;
-
-        const auto& gpio = spec::c_board::kGpioDescriptors[channel_index];
-        if (!gpio.supports(spec::GpioCapability::kDigitalWrite))
-            return false;
-
-        gpio::gpio->handle_digital_write(channel_index, data);
-        return true;
-    }
-
-    bool gpio_analog_data_deserialized_callback(
-        uint8_t channel_index, const data::GpioAnalogDataView& data) override {
-        if (!session_established_)
-            return true;
-        if (channel_index >= kGpioChannelCount)
-            return false;
-
-        const auto& gpio = spec::c_board::kGpioDescriptors[channel_index];
-        if (!gpio.supports(spec::GpioCapability::kAnalogWrite))
-            return false;
-
-        gpio::gpio->handle_analog_write(channel_index, data);
-        return true;
-    }
-
-    bool gpio_digital_read_config_deserialized_callback(
-        uint8_t channel_index, const data::GpioReadConfigView& data) override {
-        if (!session_established_)
-            return true;
-        if (channel_index >= kGpioChannelCount)
-            return false;
-
-        const auto& gpio = spec::c_board::kGpioDescriptors[channel_index];
-        if (!data.supported(gpio))
-            return false;
-
-        gpio::gpio->handle_digital_read(channel_index, data);
-        return true;
-    }
-
-    bool gpio_analog_read_config_deserialized_callback(
-        uint8_t channel_index, const data::GpioReadConfigView& data) override {
-        if (!session_established_)
-            return true;
-        (void)channel_index;
-        (void)data;
-        return false;
-    }
-
-    void accelerometer_deserialized_callback(const data::ImuAccelerometerDataView& data) override {
-        (void)data;
-    }
-
-    void gyroscope_deserialized_callback(const data::ImuGyroscopeDataView& data) override {
-        (void)data;
-    }
-
-    void temperature_deserialized_callback(const data::ImuTemperatureDataView& data) override {
-        (void)data;
-    }
-
-    void session_control_deserialized_callback(const data::SessionControlView& data) override {
-        switch (data.type) {
-        case data::SessionType::kStart: {
-            // 主机完成 EP0 接口握手之前静默拒绝。会话协议没有否定应答, 开不了
-            // 会话的主机约一秒后自行触发 ack 超时并给出自己的报错; 沉默是本层
-            // 唯一能说的话。这道门挡的是**旧主机**: EP0 之前的 SDK 会跳过
-            // kGetInterface 直接开会话, 而它的带内配置写入(本板已改为只走 EP0)
-            // 会被忽略, 于是"配了但没生效"静默发生 —— 那正是本任务要消灭的失败。
-            if (!ep0_handshake_done_)
-                return;
-
-            const bool same_session = session_established_ && data.nonce == current_session_nonce_;
-
-            if (!same_session)
-                activate_session(data.nonce);
-            else
-                last_session_refresh_ = timer::timer->timepoint48();
-
-            const auto result = serializer_.write_session_control(
-                {.type = data::SessionType::kStartAck, .nonce = data.nonce});
-            core::utility::assert_always(
-                result != core::protocol::Serializer::SerializeResult::kInvalidArgument);
-            break;
-        }
-        case data::SessionType::kKeepalive:
-            if (!session_established_ || data.nonce != current_session_nonce_)
-                return;
-
-            last_session_refresh_ = timer::timer->timepoint48();
-            {
-                const auto result = serializer_.write_session_control(
-                    {.type = data::SessionType::kKeepaliveAck, .nonce = data.nonce});
-                core::utility::assert_always(
-                    result != core::protocol::Serializer::SerializeResult::kInvalidArgument);
-            }
-            break;
-        default: return;
-        }
-    }
-
-    void error_callback() override {
-        // TODO: Report USB downlink deserialization errors through a dedicated error path.
-    }
-
-    void refresh_session_state() {
-        if (!session_established_)
-            return;
-
-        if (!timer::timer->check_expired(
-                last_session_refresh_, timer::Timer::to_duration48_checked(kSessionLease)))
-            return;
-
-        deactivate_session();
-    }
-
-    core::protocol::Deserializer deserializer_{*this};
-
-    InterruptSafeBuffer transmit_buffer_;
-    core::protocol::Serializer serializer_{transmit_buffer_};
-
-    const InterruptSafeBuffer::Batch* transmitting_batch_ = nullptr;
     size_t transmitted_size_ = 0;
-    bool session_established_ = false;
-    // EP0 接口握手标志, 由 usb/vendor_control.cpp 置位。见
-    // session_control_deserialized_callback() 的说明。
+    // EP0 握手门(会话状态本身在 core::link::Session), 由 usb/vendor_control.cpp
+    // 置位, 会话结束与总线事件时清掉。见 session_control_deserialized_callback()
+    // 的说明(基类)。
     bool ep0_handshake_done_ = false;
-    uint32_t current_session_nonce_ = 0;
-    timer::Timer::TimePoint48 last_session_refresh_ = timer::Timer::TimePoint48::min();
 };
 
-// Placed in zero-wait CCM (.ccmram, copied at boot by App::App()) so the uplink
-// serializer and USB batch buffers are written without touching the AHB bus or
-// contending with DMA. FS USB is CPU PIO (no internal DMA), so this is CPU-only.
+// 放在零等待的 CCM(.ccmram, 上电时由 App::App() 拷入), 上行序列化器与 USB 批缓冲
+// 写入时不碰 AHB 总线、不与 DMA 争用。FS USB 是 CPU PIO(片内无 DMA), 所以这里是
+// 纯 CPU 的。
 [[gnu::section(".ccmram")]] inline constinit Vendor::Lazy vendor;
 
 } // namespace libhcs::firmware::usb

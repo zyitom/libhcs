@@ -10,6 +10,8 @@
 #include "firmware/hpm_board/app/src/diag/can_diag.hpp"
 #include "firmware/hpm_board/app/src/diag/latency.hpp"
 #include "firmware/hpm_board/app/src/dmtool/dm_adapter.hpp"
+#include "firmware/hpm_board/app/src/sync/sof.hpp"
+#include "firmware/hpm_board/app/src/sync/sof_capture.hpp"
 
 // CAN 转发热路径在此以 out-of-line 方式定义于 ILM (.fast) 段, 而非内联在
 // can.hpp。ILM 零等待、永不 I-cache miss, 从而把 FLASH-XIP 取指抖动从最坏
@@ -73,8 +75,7 @@ bool Can::submit_downlink(const data::CanDataView& data, Policy policy) {
     // 同一线程上运行。
     //
     // 只在溢出时排队, 常见路径不添加任何额外工作。
-    if (transmit_buffer_.peek_front() == nullptr
-        && mcan_transmit_via_txfifo_nonblocking(can_base_, &frame, nullptr) == status_success) {
+    if (transmit_buffer_.peek_front() == nullptr && send_to_fifo(&frame) == status_success) {
         diag::latency::close_downlink();
         return true;
     }
@@ -103,9 +104,13 @@ bool Can::handle_downlink(const data::CanDataView& data) {
     // 当前的 FD/经典模式, 主机在构造握手时经 EP0 读回
     // (libhcs/protocol/vendor_control.hpp)。再读头部位会让主机与板子对线上
     // 已经定好的帧产生分歧。
+    // 主机没声明的总线不发: 控制器不在总线上, 帧直接丢弃(见 can.hpp 的 suspend())。
+    if (suspended_) [[unlikely]]
+        return true;
     // libhcs 下行在队列满时丢弃(2026-09-14 决策): 过期控制帧重发不如丢。
     if (submit_downlink(data, PortFrame{}))
         return true;
+    tx_dropped_.note();
     led::led->downlink_buffer_full();
     diag::note_tx_fail(can_index());
     return false;
@@ -116,6 +121,10 @@ bool Can::handle_downlink(const data::CanDataView& data) {
 // 实际发 FD 帧时才有意义。达妙电机的 bootloader 是经典 CAN, 升级流程逐帧带的
 // 就是"非 FD", 一律按端口模式发 FD 会让这些帧进不了电机。
 bool Can::handle_downlink_as(const data::CanDataView& data, RequestedFrame frame) {
+    // 总线被 libhcs 握手挂起时(两种主机按约定互斥, 走到这里说明约定被破坏)丢弃并
+    // 报"已收下": 报 false 会让适配器对一条永远不会恢复的总线一直背压。
+    if (suspended_) [[unlikely]]
+        return true;
     // 队列满时返回 false: DMTool 适配器侧对 0x03 施加背压(不重挂 OUT 端点),
     // 帧留在 USB 端点等重发, 突发零丢帧(2026-09-22, 电机 IAP 实测)。
     return submit_downlink(data, frame);
@@ -131,7 +140,7 @@ void Can::drain_transmit_queue() {
         std::memcpy(frame.data_8, queued->data, sizeof(queued->data));
 
         // FIFO 满: 其余留到下一轮, 本控制器的 pending 位同样保留。
-        if (mcan_transmit_via_txfifo_nonblocking(can_base_, &frame, nullptr) != status_success)
+        if (send_to_fifo(&frame) != status_success)
             return;
         // 队列 API 把所有权移交给回调; 丢弃已完成的帧本就不需要移动它。
         // NOLINTNEXTLINE(cppcoreguidelines-rvalue-reference-param-not-moved)
@@ -186,26 +195,19 @@ bool Can::read_uplink(data::CanDataView& data, uint8_t storage[64], bool& valid)
         std::memcpy(storage, rx.data_8, data_length);
     data.can_data = {reinterpret_cast<const std::byte*>(storage), data_length};
 
-    // SOF 处捕获的 64 位 TSU 时间戳, 来自共享 PTPC0 时基。PTPC 给出 IEEE-1588
-    // {seconds:nanoseconds} 对 (高 32 位为秒, 低 32 位为纳秒, 取值
-    // [0, 1e9)); 上报纳秒除以 kTsNsPerUs (160 MHz 时为 960 而非 1000) 即换成
-    // 微秒, 一步同时抵消 PTPC 的数字步进误差。
+    // 帧起始沿由 TSU 硬件锁进 PTPC0(capture_on_sof)。它只在与 SOF 的硬件锁存值
+    // 相减之后才有意义 -- PTPC 是板上自由跑的计数器, 单独上报给不了主机任何可比
+    // 的时刻 -- 所以这里直接换成共享 microframe 轴上的位置, 换不出就不带时间戳。
+    // 只用纳秒字: 相减的两个值相隔不到一秒, 对 1e9 取模即可, 秒字用不上。
+    // status_mcan_timestamp_not_exist (帧未被 sync 过滤器匹配) 同样不带。
     //
-    // 换算刻意只用 32 位: RV32 没有 64 位除法指令, 这里的 64/32 除法会落成
-    // __udivdi3 库循环 (约数百周期), 且在最高优先级 ISR 里。把秒与纳秒两个字
-    // 分开,
-    //   us = sec * (1e9 / 960) + sec * (640 / 960 == 2/3) + ns / 960
-    // 只含常量除法, GCC 降为乘加移位。相对精确商每次至多截断 1 us, 误差不
-    // 累积。结果约每 71.6 min 回绕一次; 主机只用差值, 回绕安全。
-    // status_mcan_timestamp_not_exist (帧未被 sync 过滤器匹配) 保持
-    // std::nullopt。
-    mcan_timestamp_value_t ts_value;
-    if (mcan_get_timestamp_from_received_message(can_base_, &rx, &ts_value) == status_success
-        && ts_value.is_64bit) {
-        const auto sec = static_cast<uint32_t>(ts_value.ts_64bit >> 32);
-        const auto ns = static_cast<uint32_t>(ts_value.ts_64bit);
-        data.timestamp_us =
-            (sec * (1'000'000'000U / kTsNsPerUs)) + ((sec * 2U) / 3U) + (ns / kTsNsPerUs);
+    // 主机的清单没要时间基准时只付这一次判断: 帧上不带时间戳(每帧省 3 字节), 也不
+    // 读 TSU 寄存器。
+    if (sync::time_sync_on()) {
+        mcan_timestamp_value_t ts_value;
+        if (mcan_get_timestamp_from_received_message(can_base_, &rx, &ts_value) == status_success
+            && ts_value.is_64bit)
+            data.sof_stamp = sync::sof_capture::stamp_of(static_cast<uint32_t>(ts_value.ts_64bit));
     }
 
     valid = true;
@@ -218,8 +220,10 @@ void Can::serialize_uplink(
     core::protocol::Serializer& serializer) {
 
     const auto result = serializer.write_can(field_id, data);
-    if (result == core::protocol::Serializer::SerializeResult::kBadAlloc) [[unlikely]]
+    if (result == core::protocol::Serializer::SerializeResult::kBadAlloc) [[unlikely]] {
+        rx_dropped_.note();
         led::led->uplink_buffer_full();
+    }
     // 经上述归一化后, 线上输入到不了这里; 只防内部契约回归。
     core::utility::assert_always(
         result != core::protocol::Serializer::SerializeResult::kInvalidArgument);
@@ -234,10 +238,6 @@ bool Can::handle_uplink(core::protocol::FieldId field_id, core::protocol::Serial
         return false;
     if (valid) {
         serialize_uplink(field_id, data, serializer);
-        // 转发路径上无条件自增一次 -- 旁边的 diag 计数器不同, 这个必须存在于
-        // 发行镜像: 主机靠它区分"这条总线根本没收到帧"与"收到了但下游丢弃了",
-        // 这个区分是每次死总线排查的第一个分叉。
-        ++forwarded_frames_;
         diag::latency::close_uplink(uplink_opened_at_);
         diag::note_frame(can_index());
     }
@@ -292,7 +292,6 @@ bool Can::handle_dm_uplink() {
     }
 
     dmtool::push_can_rx(can_index(), event);
-    ++forwarded_frames_;
     return true;
 }
 
@@ -314,6 +313,9 @@ bool Can::handle_dm_uplink() {
 //
 // 不进 .fast: 只在 DMTool 配置按钮时运行, ILM 留给转发热路径。
 bool Can::reconfigure_timing(bool fd, PhaseTiming nominal, PhaseTiming data) {
+    // libhcs 握手挂起的总线不归 DMTool 重配: 重配会把它重新初始化上线。
+    if (suspended_)
+        return false;
     // 改速窗口内不得有在途发送(与 handle_downlink 同线程, 此检查充分)。
     if (transmit_buffer_.readable() != 0)
         return false;
@@ -392,8 +394,9 @@ bool Can::reconfigure_timing(bool fd, PhaseTiming nominal, PhaseTiming data) {
     // 本函数只被 DMTool 仿真调用, 这里是全仓库唯一开自动重传的地方。libhcs
     // 不重传是刻意的(过期的控制指令重发不如丢掉), 但 DMTool 是通用适配器:
     // 它的电机固件升级一块镜像要连发 1025 帧、全部成功才等到一个 "OK", 丢一帧
-    // 整块作废, 而丢帧对上位机不可见。libhcs 会话建立时 restore_default_timing()
-    // 会连同时序一起把不重传恢复回去。
+    // 整块作废, 而丢帧对上位机不可见。libhcs 一握手所有控制器先挂起, 主机声明的
+    // 每一路按 libhcs 的设置重新初始化(apply_setting), 交还时 resume() 同样按它
+    // 重新初始化, 不重传随时序一起恢复。
     config.disable_auto_retransmission = false;
 
     mcan_deinit(can_base_);
@@ -447,7 +450,7 @@ bool Can::reconfigure_timing(bool fd, PhaseTiming nominal, PhaseTiming data) {
     }
 
     canfd_ = fd;
-    mcan_enable_interrupts(can_base_, kEnabledInterrupts);
+    enable_interrupts();
     return true;
 }
 
@@ -502,7 +505,7 @@ mcan_config_t Can::libhcs_config(const BusSetting& setting) const {
     config.mode = mcan_mode_normal;
     // 经典 = 控制器不开 FD(CCCR.FDOE/BRSE=0): 总线只支持 CAN 2.0, 任何 FD 位上线都会
     // 让总线崩溃, 所以不靠 Tx 元素的 FDF 标志, 由硬件保证发不出 FD 帧。
-    config.enable_canfd = setting.mode == CanMode::kCanFd;
+    config.enable_canfd = setting.fd;
     if (config.enable_canfd) {
         config.baudrate_fd = setting.data_baudrate;
 
@@ -570,12 +573,12 @@ bool Can::init_controller(const BusSetting& setting, uint32_t clock_hz) {
     // brp=1 tseg1=13 tseg2=2 (-Dlibhcs_CAN_DIAG=ON 可打印), 但换一个数据段
     // 速率求解器可以另选 -- 二级采样点悄悄错位与完全没补偿看起来一样。速率
     // 现由 host 下发, 这里判失败(调用方救回原设置)而不是停机。
-    const bool fd = setting.mode == CanMode::kCanFd;
+    const bool fd = setting.fd;
     canfd_ = fd; // mcan_init 已成功, 控制器确实跑在这个帧型上
     if (fd && MCAN_DBTP_DBRP_GET(can_base_->DBTP) != 0U)
         return false;
     // SDK 求解器用 src_clk / baudrate 的整除结果, 除不尽时会落在近似速率上; 回读必须精确等于所求。
-    return timing_identity() == timing_of(setting);
+    return timing_identity() == expected_of(setting);
 }
 
 bool Can::reinit(const BusSetting& setting) {
@@ -584,19 +587,43 @@ bool Can::reinit(const BusSetting& setting) {
     const mcan_msg_buf_attr_t attr = board::can_message_ram(can_index_);
     (void)mcan_set_msg_buf_attr(can_base_, &attr);
     const bool applied = init_controller(setting, can_clock_mhz_ * 1'000'000U);
-    mcan_enable_interrupts(can_base_, kEnabledInterrupts);
+    enable_interrupts();
     return applied;
 }
 
-bool Can::restore_default_timing() {
-    if (transmit_buffer_.readable() != 0)
-        return false;
-    return reinit(libhcs_setting_);
+// 把控制器撤下总线并关掉它的全部中断, 不改它的配置。IR 里已锁存的标志一并清掉:
+// 中断关着它们没人处理, 留着会让 poll() 的看门狗把一条静止的线当成"中断丢了"。
+void Can::take_off_bus() {
+    mcan_disable_interrupts(can_base_, kEnabledInterrupts);
+    mcan_enter_init_mode(can_base_);
+    mcan_clear_interrupt_flags(can_base_, mcan_get_interrupt_flags(can_base_));
+    watchdog_armed_ = false;
+}
+
+void Can::suspend() {
+    if (suspended_)
+        return;
+    set_suspended(true);
+    take_off_bus();
+    // 排队的帧属于上一个使用者, 不留给下一个。
+    (void)transmit_buffer_.clear();
+}
+
+void Can::resume() {
+    if (!suspended_)
+        return;
+    set_suspended(false);
+    // 按上一份成功的 libhcs 设置(或上电默认)重新初始化, 控制器随之回到总线。DMTool
+    // 改过的速率、帧型与自动重传也就此作废。
+    (void)reinit(libhcs_setting_);
 }
 
 // 不进 .fast: 只在 EP0 配置请求时运行。
+//
+// 被接受的设置同时是主机对这条总线的声明: 挂起的总线在这里重新初始化上线, 即使
+// 请求的设置与挂起前的完全一样。
 bool Can::apply_setting(const BusSetting& setting) {
-    if (mode() == setting.mode && timing_identity() == timing_of(setting)) {
+    if (!suspended_ && canfd_ == setting.fd && timing_identity() == expected_of(setting)) {
         libhcs_setting_ = setting;
         return true;
     }
@@ -604,11 +631,34 @@ bool Can::apply_setting(const BusSetting& setting) {
     (void)transmit_buffer_.clear();
     if (reinit(setting)) {
         libhcs_setting_ = setting;
+        set_suspended(false);
         return true;
+    }
+    if (suspended_) {
+        // 声明被拒: 总线保持未声明。reinit 失败时控制器停在什么状态由 SDK 决定,
+        // 且它末尾无条件开了中断, 这里重新撤下。
+        take_off_bus();
+        return false;
     }
     // 救回上一份 libhcs 设置: 它此前应用成功过, 或是上电默认值。
     (void)reinit(libhcs_setting_);
     return false;
+}
+
+// kGetPortConfig 的应答: 当前帧型 + 寄存器重构的速率与采样点。经典模式下控制器关 FD,
+// 没有数据段, 两项如实报 0。
+void Can::read_config(vc::CanConfigPayload& out) const {
+    const TimingIdentity timing = timing_identity();
+    out = {
+        .mode = std::to_underlying(canfd_ ? vc::CanMode::kCanFd : vc::CanMode::kClassic),
+        .control = 0,
+        .reserved0 = 0,
+        .arbitration_baudrate = timing.arbitration_baudrate,
+        .data_baudrate = timing.data_baudrate,
+        .nominal_sample_point = timing.nominal_sample_point,
+        .data_sample_point = timing.data_sample_point,
+        .reserved1 = 0,
+    };
 }
 
 ATTR_PLACE_AT(".fast")
@@ -672,6 +722,9 @@ void Can::irq_handler() {
 // 高且其间无 ISR 入口。正常时不会发生: 中断使能且源为电平触发时, ISR 会在
 // 主循环看第二次之前进入。
 void Can::poll() {
+    // 挂起的控制器中断全关, 没有"丢失的中断"可修, 也不去读它的寄存器。
+    if (suspended_)
+        return;
     const uint32_t flags = mcan_get_interrupt_flags(can_base_);
     if ((flags & kEnabledInterrupts) == 0) [[likely]] {
         watchdog_armed_ = false;
@@ -696,6 +749,10 @@ ATTR_PLACE_AT(".fast")
 void Can::handle_interrupt_flags(uint32_t flags) {
     mcan_clear_interrupt_flags(can_base_, flags);
 
+    // RF0L 不在使能掩码里, 但 IR 照样置位, 上面按读到的整份 IR 一并清掉: 在这里数。
+    if (flags & MCAN_INT_RXFIFO0_MSG_LOST) [[unlikely]]
+        rx_lost_.note();
+
     if (flags & MCAN_INT_RXFIFO0_NEW_MSG) [[likely]] {
         // 彻底排空 FIFO: RF0N 是状态位不是计数器, 一次中断可能对应多个缓冲帧。
         if (link::uplink_enabled()) {
@@ -716,8 +773,18 @@ void Can::handle_interrupt_flags(uint32_t flags) {
         // CAN-FD 仲裁相位用 LEC、更快的数据相位用 DLEC -- 仲裁相位无具体错误
         // 码时优先取数据相位码。不带新 LEC 的总线状态变化 (warning/passive)
         // 报 kNone, 只刷新超时 (见 Led::report_can_fault)。
+        //
+        // PSR 只读这一次: LEC/DLEC 读后自清。原先这里先查 bus-off、再读 LEC、再读 DLEC,
+        // 三次读 PSR, 后两次看到的永远是"无变化" -- LED 的错误分类与运行时状态的错误码
+        // 都因此丢了。读到的真实错误码锁存给 read_status()。
+        const uint32_t psr = can_base_->PSR;
+        const auto lec = static_cast<uint8_t>(MCAN_PSR_LEC_GET(psr));
+        const auto dlec = static_cast<uint8_t>(MCAN_PSR_DLEC_GET(psr));
+        last_bus_error_.note(static_cast<data::CanLastError>(lec));
+        last_data_bus_error_.note(static_cast<data::CanLastError>(dlec));
+
         led::CanFault fault = led::CanFault::kNone;
-        if (mcan_is_in_busoff_state(can_base_)) {
+        if (MCAN_PSR_BO_GET(psr) == 1U) {
             fault = led::CanFault::kBusOff;
             // bus-off 置起 CCCR.INIT 并停住控制器。本板是转发桥, 线上瞬时故障
             // (下游节点拔掉、无 ACK) 不能让 CAN 端口离线到重启为止。清 INIT
@@ -726,9 +793,9 @@ void Can::handle_interrupt_flags(uint32_t flags) {
             // bus-off 再重试, 端口保持存活。
             mcan_enter_normal_mode(can_base_);
         } else {
-            fault = classify_can_fault(mcan_get_last_error_code(can_base_));
+            fault = classify_can_fault(lec);
             if (fault == led::CanFault::kNone)
-                fault = classify_can_fault(mcan_get_data_phase_last_error_code(can_base_));
+                fault = classify_can_fault(dlec);
         }
         // 指示 LED 按本控制器在 board::kCanPorts 中的位置索引,
         // report_can_fault 的逐控制器状态即以它为键。旧的"第一路否则第二路"

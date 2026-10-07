@@ -16,7 +16,7 @@
 #include <tusb_config.h>
 
 #include "core/src/utility/assert.hpp"
-#include "firmware/mc02/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 
 namespace libhcs::firmware::usb {
 

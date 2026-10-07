@@ -7,7 +7,7 @@
 #include <main.h>
 #include <spi.h>
 
-#include "firmware/mc02/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 
 namespace libhcs::firmware::led {
 

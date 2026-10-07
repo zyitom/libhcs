@@ -1,6 +1,6 @@
 add_executable(c_board_app)
 
-set(C_BOARD_APP_TINYUSB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../bsp/tinyusb")
+set(C_BOARD_APP_TINYUSB_ROOT "${libhcs_PROJECT_ROOT}/firmware/common/bsp/tinyusb")
 cmake_path(ABSOLUTE_PATH C_BOARD_APP_TINYUSB_ROOT NORMALIZE)
 set(C_BOARD_APP_SEGGER_ROOT "${libhcs_PROJECT_ROOT}/firmware/common/bsp/SEGGER")
 set(C_BOARD_APP_TINYUSB_COMMON_SOURCES
@@ -52,6 +52,19 @@ target_link_libraries(c_board_app PRIVATE
 )
 
 c_board_apply_target_options(c_board_app "STM32F407XX_APP.ld")
+
+# Shared cross-board USB-SOF time base (src/sync/). In every image and not a
+# build option: the host asks for it in its EP0 manifest (kManifestFlagTimeSync)
+# and only then does the board unmask the SOF interrupt (1 kHz).
+#
+# The --wrap is how the SOF hook reaches the interrupt vector. OTG_FS_IRQHandler
+# lives in bsp/cubemx/Core/Src/stm32f4xx_it.c, which is generated output this
+# repo does not edit, and its USER CODE block calls TinyUSB's tusb_int_handler(),
+# which chains to dcd_int_handler(). The linker reroutes that call to
+# __wrap_dcd_int_handler() in src/sync/sof.cpp, which timestamps and then chains
+# to __real_dcd_int_handler(). Nothing generated is touched; with the time base
+# off the hook costs one load and a branch per USB interrupt.
+target_link_options(c_board_app PRIVATE "LINKER:--wrap=dcd_int_handler")
 
 libhcs_add_dfu_image(
     TARGET c_board_app

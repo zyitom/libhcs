@@ -13,8 +13,8 @@
 #include "firmware/c_board/app/src/spi/spi.hpp"
 #include "firmware/c_board/app/src/timer/timer.hpp"
 #include "firmware/c_board/app/src/usb/vendor.hpp"
-#include "firmware/c_board/app/src/utility/interrupt_lock.hpp"
-#include "firmware/c_board/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/interrupt_lock.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 
 namespace libhcs::firmware::spi::bmi088 {
 
@@ -74,29 +74,29 @@ public:
 
         core::utility::assert_debug(spi_.try_lock());
 
-        // Reset all registers to reset value.
+        // 全部寄存器复位到默认值。
         write_register(RegisterAddress::kGyroSoftReset, 0xB6);
         timer::timer->spin_wait(30ms);
 
-        // "Who am I" check.
+        // "Who am I" 核对。
         core::utility::assert_always(read_and_confirm(RegisterAddress::kGyroChipId, 0x0F));
 
-        // Enable the new data interrupt.
+        // 使能新数据中断。
         core::utility::assert_always(write_and_confirm(RegisterAddress::kGyroIntCtrl, 0x80));
 
-        // Set both INT3 and INT4 as push-pull, active-low, even though only INT3 is used.
+        // INT3 与 INT4 都设为推挽、低有效, 尽管只用到 INT3。
         core::utility::assert_always(write_and_confirm(RegisterAddress::kInt3Int4IoConf, 0b0000));
-        // Map data ready interrupt to INT3 pin.
+        // 数据就绪中断映射到 INT3。
         core::utility::assert_always(write_and_confirm(RegisterAddress::kInt3Int4IoMap, 0x01));
 
-        // Set ODR (output data rate, Hz) and filter bandwidth (Hz).
+        // 设 ODR(输出数据率, Hz)与滤波器带宽(Hz)。
         core::utility::assert_always(
             write_and_confirm(RegisterAddress::kGyroBandwidth, 0x80 | static_cast<uint8_t>(rate)));
-        // Set data range.
+        // 设量程。
         core::utility::assert_always(
             write_and_confirm(RegisterAddress::kGyroRange, static_cast<uint8_t>(range)));
 
-        // Switch the main power mode into normal mode.
+        // 把主电源模式切到正常模式。
         core::utility::assert_always(write_and_confirm(RegisterAddress::kGyroLpm1, 0x00));
 
         spi_.unlock();
@@ -106,6 +106,12 @@ public:
         const utility::InterruptLockGuard guard;
         pending_capture_timestamp_quarter_us_ = capture_timestamp_quarter_us;
         has_pending_capture_timestamp_ = true;
+    }
+
+    // IMU 口挂起时丢掉还没读的样本(数据就绪线已屏蔽, 不会再有新的)。
+    void drop_pending() {
+        const utility::InterruptLockGuard guard;
+        has_pending_capture_timestamp_ = false;
     }
 
     bool service_pending_read() {
@@ -142,6 +148,8 @@ private:
 
     static void handle_uplink(
         core::protocol::Serializer& serializer, Data& data, uint32_t capture_timestamp_quarter_us) {
+        if (!uplink_enabled.load(std::memory_order_relaxed))
+            return;
         const auto result = serializer.write_imu_gyroscope({
             .x = data.x,
             .y = data.y,

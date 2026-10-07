@@ -2,13 +2,12 @@ include_guard()
 
 # 与 c_board、mc02 共用同一份 TinyUSB checkout。SoC、PHY 与寄存器头仍归 HPM SDK
 # 所有, 但其自带的 TinyUSB 源码不参与编译。
-set(libhcs_CURRENT_TINYUSB_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../c_board/bsp/tinyusb")
-cmake_path(ABSOLUTE_PATH libhcs_CURRENT_TINYUSB_ROOT NORMALIZE)
+set(libhcs_CURRENT_TINYUSB_ROOT "${libhcs_PROJECT_ROOT}/firmware/common/bsp/tinyusb")
 
 if(NOT EXISTS "${libhcs_CURRENT_TINYUSB_ROOT}/src/tusb.c")
     message(FATAL_ERROR
         "TinyUSB submodule is missing at ${libhcs_CURRENT_TINYUSB_ROOT}.\n"
-        "Initialize firmware/c_board/bsp/tinyusb before building hpm_board.")
+        "Initialize firmware/common/bsp/tinyusb before building hpm_board.")
 endif()
 
 function(libhcs_add_current_tinyusb)

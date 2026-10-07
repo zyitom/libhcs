@@ -9,10 +9,8 @@
 #include <hpm_ioc_regs.h>
 #include <hpm_iomux.h>
 #include <hpm_mcan_soc.h>
-#include <hpm_pmic_iomux.h>
 #include <hpm_soc.h>
 #include <hpm_soc_irq.h>
-#include <hpm_uart_regs.h>
 
 namespace libhcs::firmware::board {
 namespace {
@@ -35,14 +33,6 @@ uint32_t init_can_clock(MCAN_Type* ptr) {
     if (ptr == HPM_MCAN3) {
         clock_set_source_divider(clock_can3, clk_src_pll1_clk0, 10);
         return clock_get_frequency(clock_can3);
-    }
-    return 0;
-}
-
-uint32_t init_uart_clock(UART_Type* ptr) {
-    if (ptr == HPM_UART1) {
-        // 时钟来自 group1(见 board.c); 默认 24 MHz OSC 源。
-        return clock_get_frequency(clock_uart1);
     }
     return 0;
 }
@@ -89,25 +79,6 @@ mcan_msg_buf_attr_t can_message_ram(size_t can_index) {
     };
 }
 
-uint32_t init_uart(UART_Type* ptr) {
-    constexpr uint32_t tx_pad = IOC_PAD_PAD_CTL_PE_SET(1) | // 上拉使能
-                                IOC_PAD_PAD_CTL_PS_SET(1);  // 上拉选择: 上拉
-    constexpr uint32_t rx_pad = IOC_PAD_PAD_CTL_PE_SET(1) | // 上拉使能
-                                IOC_PAD_PAD_CTL_PS_SET(1) | // 上拉选择: 上拉
-                                IOC_PAD_PAD_CTL_HYS_SET(1); // 施密特触发使能
-    if (ptr == HPM_UART1) {
-        // PY 焊盘: 除 IOC 外还要经 PIOC 路由到 SoC 域。
-        HPM_IOC->PAD[IOC_PAD_PY07].FUNC_CTL = IOC_PY07_FUNC_CTL_UART1_TXD;
-        HPM_PIOC->PAD[IOC_PAD_PY07].FUNC_CTL = PIOC_PY07_FUNC_CTL_SOC_PY_07;
-        HPM_IOC->PAD[IOC_PAD_PY07].PAD_CTL = tx_pad;
-
-        HPM_IOC->PAD[IOC_PAD_PY06].FUNC_CTL = IOC_PY06_FUNC_CTL_UART1_RXD;
-        HPM_PIOC->PAD[IOC_PAD_PY06].FUNC_CTL = PIOC_PY06_FUNC_CTL_SOC_PY_06;
-        HPM_IOC->PAD[IOC_PAD_PY06].PAD_CTL = rx_pad;
-    }
-    return init_uart_clock(ptr);
-}
-
 void init_led_pins() {
     for (const auto& pin : {kLedRedPin, kLedGreenPin, kLedBluePin}) {
         pin.configure_controller();
@@ -133,8 +104,5 @@ void can2_isr() { can_irq_handler(2); }
 
 SDK_DECLARE_EXT_ISR_M(IRQn_MCAN3, can3_isr)
 void can3_isr() { can_irq_handler(3); }
-
-SDK_DECLARE_EXT_ISR_M(IRQn_UART1, uart0_isr)
-void uart0_isr() { uart_irq_handler(0); }
 
 } // namespace libhcs::firmware::board

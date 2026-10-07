@@ -281,6 +281,8 @@ void SystemClock_Config(void);
 #define LED_G_GPIO_Port GPIOH
 #define LED_B_Pin GPIO_PIN_10
 #define LED_B_GPIO_Port GPIOH
+#define BUZZER_Pin GPIO_PIN_14
+#define BUZZER_GPIO_Port GPIOD
 #define USER_BUTTON_Pin GPIO_PIN_0
 #define USER_BUTTON_GPIO_Port GPIOA
 #define CS1_ACCEL_Pin GPIO_PIN_4

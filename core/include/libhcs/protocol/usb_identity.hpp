@@ -25,7 +25,7 @@ namespace libhcs::core::protocol::usb_identity {
 
 // DM USB2FDCAN ids from DMTool's FDCAN_DEVICE_ID table, one per HPM5321 PCB.
 // DMTool treats every entry of that table the same; which PCB answered is also
-// reported over EP0 (kGetInterface can_count), the PID just makes it visible
+// reported over EP0 (the CAN entries of kGetPortList), the PID just makes it visible
 // before the device is opened (dfu-util, udev, lsusb).
 inline constexpr uint16_t kDmtoolVendorId = 0x34B7;
 inline constexpr uint16_t kHpm5321SingleCanProductId = 0x6877;

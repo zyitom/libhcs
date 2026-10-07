@@ -13,8 +13,8 @@
 #include "firmware/c_board/app/src/spi/spi.hpp"
 #include "firmware/c_board/app/src/timer/timer.hpp"
 #include "firmware/c_board/app/src/usb/vendor.hpp"
-#include "firmware/c_board/app/src/utility/interrupt_lock.hpp"
-#include "firmware/c_board/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/interrupt_lock.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 
 namespace libhcs::firmware::spi::bmi088 {
 
@@ -75,34 +75,34 @@ public:
 
         core::utility::assert_debug(spi_.try_lock());
 
-        // Dummy read to switch accelerometer to SPI mode.
+        // 空读一次, 把加速度计切到 SPI 模式。
         read_register(RegisterAddress::kAccChipId);
         timer::timer->spin_wait(1ms);
 
-        // Reset all registers to reset value.
+        // 全部寄存器复位到默认值。
         write_register(RegisterAddress::kAccSoftReset, 0xB6);
         timer::timer->spin_wait(1ms);
 
-        // "Who am I" check.
+        // "Who am I" 核对。
         core::utility::assert_always(read_and_confirm(RegisterAddress::kAccChipId, 0x1E));
 
-        // Enable INT1 as output pin, push-pull, active-low.
+        // INT1 使能为输出脚, 推挽, 低有效。
         core::utility::assert_always(write_and_confirm(RegisterAddress::kInt1IoCtrl, 0b00001000));
-        // Map data ready interrupt to pin INT1.
+        // 数据就绪中断映射到 INT1。
         core::utility::assert_always(write_and_confirm(RegisterAddress::kIntMapData, 0b00000100));
 
-        // Set ODR (output data rate) = data_rate and OSR (over-sampling-ratio) = 1.
+        // 设 ODR(输出数据率)= data_rate、OSR(过采样率)= 1。
         core::utility::assert_always(write_and_confirm(
             RegisterAddress::kAccConf, 0x80 | (0x02 << 4) | static_cast<uint8_t>(data_rate)));
-        // Set accelerometer range.
+        // 设加速度量程。
         core::utility::assert_always(
             write_and_confirm(RegisterAddress::kAccRange, static_cast<uint8_t>(range)));
 
-        // Switch the accelerometer into active mode.
+        // 把加速度计切到工作模式。
         core::utility::assert_always(write_and_confirm(RegisterAddress::kAccPwrConf, 0x00));
-        // Turn on the accelerometer.
+        // 打开加速度计。
         core::utility::assert_always(write_and_confirm(RegisterAddress::kAccPwrCtrl, 0x04));
-        timer::timer->spin_wait(1ms); // Datasheet: wait >=450us after entering normal mode
+        timer::timer->spin_wait(1ms); // 数据手册: 进正常模式后等 >=450us
 
         spi_.unlock();
     }
@@ -111,6 +111,12 @@ public:
         const utility::InterruptLockGuard guard;
         pending_capture_timestamp_quarter_us_ = capture_timestamp_quarter_us;
         has_pending_capture_timestamp_ = true;
+    }
+
+    // IMU 口挂起时丢掉还没读的样本(数据就绪线已屏蔽, 不会再有新的)。
+    void drop_pending() {
+        const utility::InterruptLockGuard guard;
+        has_pending_capture_timestamp_ = false;
     }
 
     bool service_pending_read() {
@@ -147,6 +153,8 @@ private:
 
     static void handle_uplink(
         core::protocol::Serializer& serializer, Data& data, uint32_t capture_timestamp_quarter_us) {
+        if (!uplink_enabled.load(std::memory_order_relaxed))
+            return;
         const auto result = serializer.write_imu_accelerometer({
             .x = data.x,
             .y = data.y,

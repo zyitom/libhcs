@@ -13,7 +13,7 @@
 #include "core/src/protocol/constant.hpp"
 #include "core/src/protocol/protocol.hpp"
 #include "core/src/utility/assert.hpp"
-#include "firmware/c_board/app/src/utility/interrupt_lock.hpp"
+#include "firmware/common/app/src/utility/interrupt_lock.hpp"
 
 namespace libhcs::firmware::uart {
 
@@ -33,6 +33,10 @@ public:
     static_assert(kBufferSize % kIrqFragmentSize == 0);
     static_assert((kRxSlotCount & (kRxSlotCount - 1)) == 0);
 
+    // 不能像 mc02 那样(其 rx_buffer.hpp 的 kHoldCycles)简单换成时间门槛: 那边每趟
+    // 都从 NDTR 推导写位置, 这边只在 DMA 中断收满一个 kIrqFragmentSize 槽时推进
+    // (外加 IDLE), 未收满的槽里的字节对消费者不可见 -- 32 是中断粒度, 不只是攒批
+    // 门槛。要改它就得先改成从 NDTR 推导写位置。
     static constexpr size_t kMinFragmentSize = 32;
     static constexpr size_t kMaxFragmentSize = kMinFragmentSize + kIrqFragmentSize - 1;
     static constexpr size_t kProtocolMaxPayloadSize =
@@ -41,15 +45,23 @@ public:
 
     bool try_dequeue() {
         auto state = in_state_.load(std::memory_order::acquire);
+        // 接收在中断里重启过(restart_rx_dma): 还没转发的字节不要了, 从重启点接着收。读指针
+        // 只由这里写; 标志在写指针挪动之前置起, 所以读到挪动后的写指针时一定也看得见标志。
+        if (resync_.exchange(false, std::memory_order::acq_rel)) [[unlikely]] {
+            state = in_state_.load(std::memory_order::acquire);
+            out_.store(state.in, std::memory_order::release);
+            consumed_idle_count_ = state.idle_count;
+            return false;
+        }
         const auto out = out_.load(std::memory_order::relaxed);
         const auto readable = static_cast<size_t>(static_cast<IndexType>(state.in - out));
 
         if (readable > kBufferSize) [[unlikely]] {
-            // Abnormal condition: The circular queue has wrapped around.
-            // Fail-fast in debug builds to catch timing/interrupt issues early.
+            // 异常情形: 环队列已回绕。
+            // 调试构建快速失败, 尽早暴露时序/中断问题。
             core::utility::assert_debug_lazy([]() noexcept { return false; });
 
-            // Release fallback: discard the accumulated bytes to resync the stream.
+            // release 兜底: 丢弃已积累的字节, 让流重新对齐。
             out_.store(state.in, std::memory_order::release);
             consumed_idle_count_ = state.idle_count;
             return false;
@@ -77,10 +89,38 @@ public:
     }
 
 private:
-    explicit RxBuffer(UART_HandleTypeDef* hal_uart_handle)
-        : hal_uart_handle_(hal_uart_handle) {
+    // 上电时接收是停着的(口没声明): 接收器关着、DMA 不武装, 线上有什么都不进中断、不占
+    // DMA。声明了才 start_rx()。
+    explicit RxBuffer(
+        UART_HandleTypeDef* hal_uart_handle, std::array<std::byte, kBufferSize>& rx_ring)
+        : hal_uart_handle_(hal_uart_handle)
+        , ring_(rx_ring) {
         bind_rx_dma_callbacks();
+        ATOMIC_CLEAR_BIT(hal_uart_handle_->Instance->CR1, USART_CR1_RE);
+    }
+
+    // 声明了: 接收器打开, 从环的开头收。主循环调用, 此刻没有中断在碰读写指针。
+    void start_rx() {
+        if (rx_running_)
+            return;
+        resync_.store(false, std::memory_order::relaxed);
+        ATOMIC_SET_BIT(hal_uart_handle_->Instance->CR1, USART_CR1_RE);
         start_rx_dma();
+        rx_running_ = true;
+    }
+
+    // 没声明(会话结束、换声明): 关中断、停 DMA、关接收器。环里没转发的字节丢掉。
+    void stop_rx() {
+        if (!rx_running_)
+            return;
+        rx_running_ = false;
+        ATOMIC_CLEAR_BIT(hal_uart_handle_->Instance->CR1, USART_CR1_IDLEIE | USART_CR1_PEIE);
+        ATOMIC_CLEAR_BIT(hal_uart_handle_->Instance->CR3, USART_CR3_EIE | USART_CR3_DMAR);
+        auto* hal_dma_handle = hal_uart_handle_->hdmarx;
+        if ((hal_dma_handle->Instance->CR & DMA_SxCR_EN) != 0U)
+            core::utility::assert_always(HAL_DMA_Abort(hal_dma_handle) == HAL_OK);
+        ATOMIC_CLEAR_BIT(hal_uart_handle_->Instance->CR1, USART_CR1_RE);
+        hal_uart_handle_->RxState = HAL_UART_STATE_READY;
     }
 
     void bind_rx_dma_callbacks() {
@@ -95,20 +135,35 @@ private:
         hal_dma_handle->XferAbortCallback = nullptr;
     }
 
+    // 环从头开始, 读写指针都在 0(上电或 start_rx(): 此时没有中断在碰它们)。
     void start_rx_dma() {
-        auto* hal_dma_handle = hal_uart_handle_->hdmarx;
-        core::utility::assert_debug(hal_dma_handle->Init.Mode == DMA_CIRCULAR);
-
         auto in_state = in_state_.load(std::memory_order::relaxed);
         in_state.in = 0;
         in_state_.store(in_state, std::memory_order::relaxed);
         out_.store(0, std::memory_order::relaxed);
+        arm_rx_dma(0);
+    }
+
+    // 从环内偏移 base(kIrqFragmentSize 的整数倍)起把两块 DMA 目标接上并开始接收。
+    void arm_rx_dma(size_t base) {
+        auto* hal_dma_handle = hal_uart_handle_->hdmarx;
+        core::utility::assert_debug(hal_dma_handle->Init.Mode == DMA_CIRCULAR);
+        core::utility::assert_debug(base % kIrqFragmentSize == 0 && base < kBufferSize);
 
         const auto source =
             static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&hal_uart_handle_->Instance->DR));
-        const auto destination_0 = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ring_.data()));
-        const auto destination_1 =
-            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ring_.data() + kIrqFragmentSize));
+        const auto destination_0 =
+            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ring_.data() + base));
+        const auto destination_1 = static_cast<uint32_t>(
+            reinterpret_cast<uintptr_t>(ring_.data() + ((base + kIrqFragmentSize) & kBufferMask)));
+
+        // 双缓冲的 CR.CT(当前写哪一块)在中止后保留, HAL_DMAEx_MultiBufferStart_IT 又不清它:
+        // 出错时正写第二块的话, 重启后 DMA 先写 M1AR(base + 32), 下面按 CT 推写指针就错开
+        // 一块, 被当成回绕, 整个环(2048 字节)的旧内容当新数据发上去。CT 只在流停着时可写,
+        // 此刻正停着(上电或 restart_rx_dma 的中止之后)。[实测 2026-10-07, CBoardBench 速率
+        // 不符之后约一半复现]
+        core::utility::assert_debug((hal_dma_handle->Instance->CR & DMA_SxCR_EN) == 0U);
+        hal_dma_handle->Instance->CR &= ~DMA_SxCR_CT;
 
         core::utility::assert_always(
             HAL_DMAEx_MultiBufferStart_IT(
@@ -120,8 +175,8 @@ private:
         hal_uart_handle_->RxXferSize = static_cast<uint16_t>(kIrqFragmentSize);
         hal_uart_handle_->RxXferCount = static_cast<uint16_t>(kIrqFragmentSize);
 
-        // Clear stale RX/IDLE flags before enabling DMAR to avoid consuming fresh bytes
-        // through SR/DR reads while DMA reception is active.
+        // 使能 DMAR 前先清残留的 RX/IDLE 标志, 免得 DMA 接收期间经 SR/DR 读把
+        // 新鲜字节吃掉。
         __HAL_UART_CLEAR_IDLEFLAG(hal_uart_handle_);
         ATOMIC_SET_BIT(hal_uart_handle_->Instance->CR3, USART_CR3_EIE);
         if (hal_uart_handle_->Init.Parity != UART_PARITY_NONE)
@@ -131,18 +186,22 @@ private:
     }
 
     void uart_idle_event_callback() {
-        // The UART interrupt priority is set to the same as the DMA interrupt priority.
-        // Therefore, no locking is required.
+        // UART 中断优先级与 DMA 中断优先级相同, 因此无需加锁。
         update_in_and_switch_bank_if_requested(true, false);
     }
 
     void dma_tc_callback() { update_in_and_switch_bank_if_requested(false, true); }
 
+    // 线路错误(帧/噪声/溢出, 速率不符时成串出现)与 DMA 控制器故障都走这里: F4 的 HAL 把
+    // DMAR 置位时的任何接收错误都当阻塞错误, 先中止了 DMA, 只能重启。
     void rx_error_callback() {
-        core::utility::assert_debug_lazy([]() noexcept { return false; });
-        restart_rx_dma();
+        if (rx_running_)
+            restart_rx_dma();
     }
 
+    // 中断里重启接收。读指针 out_ 只归主循环写, 这里不碰: 重启点取写指针之后的下一个
+    // 分片边界, 先置 resync_ 再挪写指针, 主循环看到标志就把读指针拉到重启点(try_dequeue)。
+    // (原先这里把读写指针一起清零, 与主循环同写 out_。)
     void restart_rx_dma() {
         auto* hal_dma_handle = hal_uart_handle_->hdmarx;
 
@@ -153,7 +212,14 @@ private:
             core::utility::assert_always(HAL_DMA_Abort(hal_dma_handle) == HAL_OK);
         }
 
-        start_rx_dma();
+        auto state = in_state_.load(std::memory_order::relaxed);
+        const auto restart_at = static_cast<IndexType>(
+            (state.in + static_cast<IndexType>(kIrqFragmentSize - 1))
+            & static_cast<IndexType>(~(kIrqFragmentSize - 1)));
+        resync_.store(true, std::memory_order::release);
+        state.in = restart_at;
+        in_state_.store(state, std::memory_order::release);
+        arm_rx_dma(restart_at & kBufferMask);
     }
 
     void update_in_and_switch_bank_if_requested(bool is_idle, bool switch_bank) {
@@ -204,7 +270,11 @@ private:
 
     UART_HandleTypeDef* hal_uart_handle_;
 
-    alignas(uint32_t) std::array<std::byte, kBufferSize> ring_{};
+    // DMA 双 bank 直写的环形缓冲。由 UartDmaMemory(uart.hpp)持有并传入引用: 段属性
+    // 不能放在非静态数据成员上, 独立对象才进得去 .dmaram 非缓存区(app.cpp 的
+    // configure_dmaram_mpu_region())-- D-cache 开启后, 普通可缓存内存里的 DMA 写入
+    // 核会读到旧值。
+    std::array<std::byte, kBufferSize>& ring_;
 
     struct alignas(uint32_t) InState {
         IndexType in;
@@ -218,6 +288,9 @@ private:
     uint16_t consumed_idle_count_{0};
 
     std::atomic<IndexType> out_{0};
+    std::atomic<bool> resync_{false};
+    // start_rx() / stop_rx() 写, 主循环; 错误中断只读。
+    volatile bool rx_running_ = false;
 
     static_assert(std::atomic<InState>::is_always_lock_free);
     static_assert(std::atomic<IndexType>::is_always_lock_free);

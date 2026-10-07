@@ -1,5 +1,6 @@
 #include "firmware/hpm_board/boards/hpm6e8y/app/app.hpp"
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 
@@ -19,7 +20,7 @@
 #include "firmware/hpm_board/app/src/uart/uart.hpp"
 #include "firmware/hpm_board/app/src/usb/vendor.hpp"
 #include "firmware/hpm_board/app/src/utility/boot_mailbox.hpp"
-#include "firmware/hpm_board/app/src/utility/interrupt_lock.hpp"
+#include "firmware/common/app/src/utility/interrupt_lock.hpp"
 #include "firmware/hpm_board/app/src/watchdog/watchdog.hpp"
 
 int main() { libhcs::firmware::app.init().run(); }
@@ -57,8 +58,8 @@ App::App() {
         usb::vendor.init();
 
         // 必须在 usb::vendor.init() 之后, 不能更早: tud_init() -> dcd_init()
-        // 会整体重赋 USBINTR, 更早挂上的 SOF 使能会被覆盖。未编译时间基或
-        // SOF 探针时为 no-op。
+        // 会整体重赋 USBINTR, 更早挂上的 SOF 使能会被覆盖。只有 SOF 探针构建在这里
+        // 开 SOF 中断; 时间基准由主机的清单打开。
         sync::sof_init();
 
         // 上界是 can_count() 而非数组容量: hpm5321 镜像的表按双 CAN PCB 分配
@@ -93,15 +94,18 @@ bool host_session_established() { return usb::vendor->session_established(); }
     uint32_t last_tick = 0;
     while (true) {
         diag::note_main_loop();
-        tud_task();
+
+        // USB 协议栈: 事件队列里有东西才进。tud_task() 自己取事件时要先关、后开 USB
+        // 中断, 队列空着也照做; 而它除了处理事件之外没有别的职责, 所以先看一眼队列
+        // (无锁读两个下标)。看的瞬间刚好有事件入队也无妨, 下一趟就处理了。
+        if (tud_task_event_ready())
+            tud_task();
 
         // 紧随 tud_task() 排空 CAN 软件发送队列: 本轮的下行帧正是在这里由
         // TinyUSB 交付。若推迟到 1 kHz LED/遥测块之后, 那块的工作会插在帧
         // 到达与帧上线之间。
         for (size_t i = 0; i < can::can_count(); ++i)
             can::can_array[i]->try_transmit();
-
-        usb::poll_dfu_runtime_reboot();
 
         // LED 记账放在这里按 1 kHz tick 节奏跑, 而不在 mchtmr ISR 里: MTIP
         // 绕过 PLIC 优先级阈值, ISR 侧做这件事会连优先级 3 的 CAN ISR 都抢先,
@@ -114,9 +118,16 @@ bool host_session_established() { return usb::vendor->session_established(); }
             led::led->set_host_connected(host_session_established());
             led::led->update(tick);
 
-            // 共享时基: 重拟合微帧到本地定时器的直线, 并重新挂上 SOF 使能,
-            // 使钩子在控制器于背后被重建后仍存活。未编译时均为 no-op。
-            sync::timebase::poll(tick);
+            // 会话租约(4 s)、握手后等会话的时限(同长)与 DFU 重启(请求后延迟几十
+            // 毫秒): 毫秒一查足够, 不必每趟主循环都付(租约检查要读 64 位 MTIME)。
+            usb::vendor->poll_session();
+            usb::vendor->poll_ownership();
+            usb::poll_dfu_runtime_reboot();
+
+            // 共享时基(主机的清单要了才开): 重拟合微帧到本地定时器的直线, 并重新
+            // 挂上 SOF 使能, 使钩子在控制器于背后被重建后仍存活。
+            if (sync::time_sync_on())
+                sync::timebase::poll(tick);
             sync::pulse::poll(tick);
             sync::sof_rearm();
 
@@ -131,14 +142,16 @@ bool host_session_established() { return usb::vendor->session_established(); }
             diag::poll(tick);
         }
 
-        // CAN 中断送达看门狗。必须每轮都跑, 不能挂在 1 kHz tick 上: RX FIFO0
-        // 装得下 32 个元素, 按本板的转发速率算, 距帧丢失的余量不足两毫秒。
-        for (size_t i = 0; i < can::can_count(); ++i)
-            can::can_array[i]->poll();
+        // CAN 中断投递看门狗, 只查在总线上的控制器(libhcs 握手挂起的那些不在掩码里)。
+        // 必须每轮运行, 不能按 1 kHz tick: RX FIFO0 容 32 个元素, 按本板转发速率算,
+        // 距丢帧的余量不到两毫秒。
+        for (uint32_t running = can::Can::running_mask(); running != 0; running &= running - 1U)
+            can::can_array[static_cast<size_t>(std::countr_zero(running))]->poll();
 
         // 主机传输泵。
         usb::vendor->try_transmit();
 
+        // 串口发送泵。没有待发字节的口(包括主机没声明的)在里面只是几次内存读。
         for (auto& board_uart : uart::uart_array)
             board_uart->try_transmit();
 

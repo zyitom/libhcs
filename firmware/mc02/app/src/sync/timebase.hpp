@@ -11,7 +11,8 @@
 // 主机锚点只提供回绕(那些位属于 16384 的哪个倍数), 量化到 2.048 s, 误差须超过
 // +-1.024 s 才有影响。绝对准确需要主机时钟准确; 跨板一致性则完全不依赖主机时钟。
 //
-// 移植自 firmware/hpm_board/app/src/sync/timebase.{hpp,cpp}, 去掉 HPM 专属部分
+// 计数器、拟合、锚点与状态机的运算三块板共用一份: core/src/time/sof_timebase.hpp。
+// 本模块最初移植自 firmware/hpm_board/app/src/sync/timebase.{hpp,cpp}, 去掉 HPM 专属部分
 // (PTPC 捕获、硬件 SOF->PTPC 触发路由、CAN TSU 换算、GPTMR 脉冲层)。针对本芯片
 // 有三处改动, 也正是错误假设最容易藏身之处, 故在此说明而非留在 diff 里:
 //
@@ -21,8 +22,8 @@
 //     两板落在同一微帧轴、同一 16384 模数上 -- 见 .cpp 的 frame_scale()。
 //
 //  2. 本地时钟是周期计数器, 不是协议的 quarter-us tick。mc02 的 timer::Timer 是
-//     TIM5 预分频到 1 MHz、按 CNT << 2 上报, quarter-us 值以 4 为步进: 1 us 量化,
-//     与本模块要测的中断抖动同量级。拿与被测量同粗的尺子采样, 结果无法解读, 故
+//     TIM23(2026-10-05 前是 TIM5)预分频到 1 MHz、按 CNT << 2 上报, quarter-us 值以 4
+//     为步进: 1 us 量化, 与本模块要测的中断抖动同量级。拿与被测量同粗的尺子采样, 结果无法解读, 故
 //     拟合在 DWT->CYCCNT(550 MHz, 1.8 ns)上做, 仅在协议要求处换算成 quarter-us。
 //     关键方向的换算是精确的: 68750 cycles/microframe 恰为 500 quarter-us, 主机
 //     按标称 500 的算法无需改动。
@@ -31,18 +32,21 @@
 //     不存在; 实测记录在案, 以免重查)。实测 2026-09-07: 把 TIM2 的 SMCR.TS 在
 //     ITR0..ITR13 间扫描、CH2 映射到 TRC, 仅 ITR5 以 SOF 速率产生捕获, 其余来源
 //     读数恰为 0; 捕获间隔下限 999 个 TIM2 tick(当时 1 MHz), 即 1 ms 全速帧。
-//     USB1_OTG_HS_SOF -> TIM2 ITR5 属实, 是 HPM TRGM->PTPC 路由的直接对应物。TIM5
-//     无此来源: 其 ITR5 是 H723 没有的 USB2_OTG_FS, 且 TIM5 全扫描找不到 SOF 速率
-//     的信号。(注意这条路径无法靠 grep HAL 得到: STM32F4 有 TIM_TIM2_USBFS_SOF
+//     USB1_OTG_HS_SOF -> TIM2 ITR5 属实, 是 HPM TRGM->PTPC 路由的直接对应物。当时
+//     记下的"TIM5 无此来源"与手册矛盾: RM0468 Rev 3 Table 94 / Table 355 都写着
+//     USB1 SOF 也接 TIM5 的 ITR7, 那次扫描多半写错了 TS 编码(H7 上 ITR4 起不连续)。
+//     (注意这条路径无法靠 grep HAL 得到: STM32F4 有 TIM_TIM2_USBFS_SOF
 //     命名, H7 HAL 只暴露 TIM_TS_ITR0..13, 每个定时器的含义在 RM0468 的内部触发表。)
 //
-//     本地时钟仍是 CYCCNT: 捕获只告诉 ISR 边沿比它早到多少 TIM2 tick, 从周期计数
-//     里扣掉(sync/sof.cpp)。硬件捕获在边沿上精确, 但上限取决于被锁存的计数器 --
-//     精确边沿锁进粗计数器等于丢掉精确性, TIM2 @ 1 MHz 时强开修正实测毫无效果。故
-//     .ioc 把 TIM2 预分频设为 0(275 MHz, tick 3.6 ns), 与 PA0/PA2 的 50 Hz 舵机
-//     PWM 共用: TIM2 是 32 位定时器, 50 Hz 的 ARR 5499999 装得下。
+//     2026-10-05 起捕获在 TIM5 ITR7 上(32 位、不占引脚, 整个归共享时基, 275 MHz,
+//     满 32 位回绕), TIM2 完全还给 PA0/PA2 的 PWM, 理由见 sof.cpp。[TIM5 ITR7 未上板]
 //
-//     效果 [实测 2026-09-16, host/examples/mc02_time_sync_test 各 60 s, 同一块板
+//     本地时钟仍是 CYCCNT: 捕获只告诉 ISR 边沿比它早到多少定时器 tick, 从周期计数
+//     里扣掉(sync/sof.cpp)。硬件捕获在边沿上精确, 但上限取决于被锁存的计数器 --
+//     精确边沿锁进粗计数器等于丢掉精确性, 1 MHz 时强开修正实测毫无效果。故捕获用的
+//     定时器预分频为 0(275 MHz, tick 3.6 ns)。
+//
+//     效果 [实测 2026-09-16, 当时在 TIM2 上, host/examples/mc02_time_sync_test 各 60 s, 同一块板
 //     交替烧录, 开 4-5 组、关 2 组; "关"为只把捕获门控强制为 false 的对照镜像]:
 //
 //                   单样本 sigma (空载 / 灌满下行)    最差单样本
@@ -54,8 +58,7 @@
 //     连同常数入口延迟一起被扣除。入口延迟的均值本就不是误差 -- 那是拟合偏移吸收的
 //     常数, 且在跑同一代码的两板间完全抵消。
 //
-//     共用 TIM2 带来的约束(计数器不得复位、ARR/PSC 不得运行时改写、CH2 与从模式
-//     留给捕获)见 sof.cpp 的 capture_init()。
+//     TIM5 的约束(计数器不得复位、ARR/PSC 不得运行时改写)见 sof.cpp 的 capture_init()。
 //
 //     J-Link 挂接一次, 本模块就失效到复位为止: 测时间基期间不要连调试器, 读完寄存器
 //     先复位再测。[实测 2026-09-16, 两次复现: 一次只读 mem32 会话之后拟合始终无效,
@@ -66,11 +69,13 @@
 // 真实 delta 前进), 但拟合窗口作废, 缺口两侧样本会使直线倾斜。delta 为 0、或
 // 8 步及以上无法解释, 则计数器本身存疑: 时间线失效, 新锚点到来前不得对其调度。
 //
-// libhcs_APP_TIME_SYNC 未定义时整体编译剔除; 启用会给板子增加一个 1 kHz 中断。
+// 每个镜像都带, 但只在主机的清单要了时间基准时运行(sync::time_sync_start()): 它的
+// 输入是每秒 1000 次的 SOF 中断, 不要的板子不该付这笔账。
 
 #include <cstdint>
 
 #include "core/include/libhcs/data/datas.hpp"
+#include "core/src/time/sof_timebase.hpp"
 
 namespace libhcs::firmware::sync::timebase {
 
@@ -85,34 +90,18 @@ inline constexpr std::uint32_t kNominalCyclesPerMicroframe = kCyclesPerMicroseco
 static_assert(kNominalCyclesPerMicroframe * 4U % kCyclesPerMicrosecond == 0U);
 static_assert(kNominalCyclesPerMicroframe * 4U / kCyclesPerMicrosecond == 500U);
 
-#if defined(libhcs_APP_TIME_SYNC) && libhcs_APP_TIME_SYNC
-
-inline constexpr bool kEnabled = true;
-
 // 每 64 微帧取一个拟合样本, 128 样本环形窗口。全速下计数器每 SOF 前进 8 微帧,
 // 即每第 8 次中断取一个样本: 间隔 8 ms、基线 1.024 s、512 字节 RAM -- 与
 // hpm_board 高速下的间距和窗口一致, 两板的 residual 数值才可直接比较。
 //
 // 基线决定斜率精度(端点噪声除以窗口长), 样本数把相位噪声平均下去。窗口还须避开
 // 550 MHz 下周期计数器 7.81 s 的回绕, 1.024 s 对此有 7 倍余量。
-inline constexpr std::uint32_t kSampleDecimation = 64U;
-inline constexpr std::uint32_t kSampleCount = 128U;
+inline constexpr std::uint32_t kSampleDecimation = core::time::kSampleDecimation;
+inline constexpr std::uint32_t kSampleCount = core::time::kSampleCount;
 
-struct Snapshot {
-    data::TimeState state;
-    // kValid 时为绝对微帧; 其余情况为本板自身原点。
-    std::uint64_t microframe;
-    std::uint64_t timestamp_quarter_us;
-    // 拟合出的每微帧本地 tick 数, Q16, 单位为协议的 quarter-us(输出时由 cycles
-    // 换算)。拟合收敛前为 0。
-    std::uint32_t ticks_per_microframe_q16;
-    std::uint32_t anomaly_count;
-    // 自上次 report() 以来本板拟合的样本外预测误差, Q16 quarter-us。跨板偏差的
-    // 主体是均值; 极值为何不算见 data::TimeStatusView。
-    std::int32_t residual_mean_q16;
-    std::uint32_t residual_abs_max_q16;
-    std::uint32_t residual_count;
-};
+// 单位是协议的 quarter-us(拟合在周期计数器上, 输出时换算); 字段说明见
+// core::time::TimebaseSnapshot。
+using Snapshot = core::time::TimebaseSnapshot;
 
 // 当前端口速度下计数器每 SOF 中断前进的微帧数: 全速 8, 高速 1。微帧流的每个
 // 消费者都需要该步长, 故不只是本模块内部使用。
@@ -125,6 +114,10 @@ std::uint32_t microframes_per_sof();
 // [实测 2026-08-20, 一对 HS+FS 的 HPM 板: -2854 / -2764 / -2810 ns, 与计算的
 //  2.78 us 吻合, 误差 1% 以内。]
 std::uint32_t sof_packet_delay_ns();
+
+// 回到上电状态(计数器未播种、无拟合、未锚定)。只在 SOF 中断关着时调用:
+// sync::time_sync_start() 在打开它之前。
+void reset();
 
 // ISR 路径, 由 sync::sof_isr_entry() 以其读到的值调用。frame 为原样读出的
 // DSTS.FNSOF; now_cycles 为 DWT->CYCCNT。
@@ -149,45 +142,10 @@ Snapshot report();
 // 误调度到死时钟上。
 bool local_time_of(std::uint64_t microframe, std::uint32_t& out_quarter_us);
 bool microframe_at(std::uint32_t quarter_us, std::uint64_t& out_microframe);
-
-#else
-
-inline constexpr bool kEnabled = false;
-
-// 必须逐字段镜像启用版的 Snapshot: 本头文件之外的调用方会无条件读取这些成员,
-// stub 落后只在 TIME_SYNC=OFF 构建中出错 -- 恰是时间基开发期间最不易编到的配置。
-struct Snapshot {
-    data::TimeState state;
-    std::uint64_t microframe;
-    std::uint64_t timestamp_quarter_us;
-    std::uint32_t ticks_per_microframe_q16;
-    std::uint32_t anomaly_count;
-    std::int32_t residual_mean_q16;
-    std::uint32_t residual_abs_max_q16;
-    std::uint32_t residual_count;
-};
-
-inline void note_sof(std::uint32_t, std::uint32_t) {}
-inline void poll(std::uint32_t) {}
-inline std::uint32_t microframes_per_sof() { return 8; }
-inline std::uint32_t sof_packet_delay_ns() { return 0; }
-inline void apply_anchor(std::uint64_t) {}
-inline Snapshot snapshot() {
-    return {
-        .state = data::TimeState::kInvalid,
-        .microframe = 0,
-        .timestamp_quarter_us = 0,
-        .ticks_per_microframe_q16 = 0,
-        .anomaly_count = 0,
-        .residual_mean_q16 = 0,
-        .residual_abs_max_q16 = 0,
-        .residual_count = 0,
-    };
-}
-inline Snapshot report() { return snapshot(); }
-inline bool local_time_of(std::uint64_t, std::uint32_t&) { return false; }
-inline bool microframe_at(std::uint32_t, std::uint64_t&) { return false; }
-
-#endif
+// 同 microframe_at(), 另给出微帧内的小数(1/65536)。回答 kTimeAnchor 用这个:
+// 只报整数微帧等于把"此刻"量化到 125 us 的栅格上, 主机拿它与往返时刻配对时,
+// 这 0..125 us 的均匀误差原样进入主机一侧的估计。
+bool microframe_at(
+    std::uint32_t quarter_us, std::uint64_t& out_microframe, std::uint16_t& out_fraction_q16);
 
 } // namespace libhcs::firmware::sync::timebase

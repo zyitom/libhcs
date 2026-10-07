@@ -3,11 +3,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string_view>
+#include <variant>
 
 #include <libhcs/board/common.hpp>
-#include <libhcs/data/datas.hpp>
+#include <libhcs/data/callback.hpp>
 #include <libhcs/export.hpp>
+#include <libhcs/protocol/vendor_control.hpp>
+#include <libhcs/time/sample_time.hpp>
 
 namespace libhcs::host::protocol {
 
@@ -26,16 +30,18 @@ public:
 
         bool write_uart(data::DataId field_id, const data::UartDataView& view) noexcept;
 
-        bool write_uart_config(data::DataId field_id, const data::UartConfigView& view) noexcept;
-
+        // GPIO, addressed by the line of the board's GPIO port (data::DataId::kGpio).
         bool write_gpio_digital_data(
-            uint8_t channel_index, const data::GpioDigitalDataView& view) noexcept;
-
-        bool write_gpio_digital_read_config(
-            uint8_t channel_index, const data::GpioReadConfigView& view) noexcept;
+            std::uint8_t line, const data::GpioDigitalDataView& view) noexcept;
 
         bool write_gpio_analog_data(
-            uint8_t channel_index, const data::GpioAnalogDataView& view) noexcept;
+            std::uint8_t line, const data::GpioAnalogDataView& view) noexcept;
+
+        // Asks an input line for one sample now.
+        bool write_gpio_read(std::uint8_t line) noexcept;
+
+        // The tone the buzzer plays from now on.
+        bool write_buzzer_tone(const data::BuzzerToneDataView& view) noexcept;
 
     private:
         friend class Handler;
@@ -104,6 +110,30 @@ public:
 
     [[nodiscard]] LinkState link_state() const noexcept;
 
+    /// @brief A port's runtime status, from the most recent kPortStatus the
+    /// board pushed after a keepalive ack (one record per port whose status
+    /// changed, so this is at most one keepalive round old; every running port
+    /// once right after each session start). Lock-free and free of USB
+    /// traffic: callable from any thread, the control loop included. The
+    /// counts wrap at 2^16: take differences of two reads modulo 2^16. A port
+    /// this board does not have, or never declared, stays all-zero; one that
+    /// is no longer declared keeps its last snapshot.
+    ///
+    /// The variant holds the kind the port's DataId implies (std::monostate
+    /// before the first report, or for a port with no status kind). The link
+    /// itself is a port too: status<data::LinkStatusView>(DataId::kSession) is
+    /// the board's account of the downlink records it could not deliver.
+    [[nodiscard]] data::PortStatusVariant port_status(data::DataId port) const noexcept;
+
+    /// The same, as one kind: status<data::CanStatusView>(DataId::kCan1).
+    /// All-zero when the port has reported nothing of that kind.
+    template <typename View>
+    [[nodiscard]] View status(data::DataId port) const noexcept {
+        const data::PortStatusVariant any = port_status(port);
+        const View* view = std::get_if<View>(&any);
+        return view != nullptr ? *view : View{};
+    }
+
     PacketBuilder start_transmit() noexcept;
 
     /**
@@ -118,13 +148,46 @@ public:
     void send_pulse_schedule(uint64_t microframe) noexcept;
 
     /**
+     * @brief Runs the shared USB-SOF time base on this link from the next round on.
+     *
+     * Sends a kTimeAnchor alongside every keepalive and consumes the board's
+     * kTimeStatus reply, which is what every SampleTime the data callbacks
+     * receive is computed from. Call it only once the board has accepted a
+     * manifest that asked for the time base (hcs::Configuration::time_sync) --
+     * the board classes do so from the before-session hook, right after
+     * hcs::apply(), so that the two can never disagree. A board that was not
+     * asked does not answer the anchors.
+     */
+    void set_time_sync(bool on);
+
+    /**
+     * @brief The board's own clock, read backwards from a host instant.
+     *
+     * The inverse of what the data callbacks hand out: which instant on this
+     * board's quarter-microsecond timer is simultaneous with `when` on this
+     * machine's CLOCK_MONOTONIC. Costs one affine conversion, nothing else.
+     *
+     * Empty until both the controller's axis and this board's clock mapping
+     * are locked (the first seconds of a session), and on a board whose time
+     * base was never enabled. Call from the link's IO thread (a board class's
+     * callback, or an application that keeps its own ordering) -- the mapping
+     * it reads is owned by that thread.
+     */
+    [[nodiscard]] std::optional<libhcs::time::BoardClock::time_point>
+        board_time_at(libhcs::time::HostTime when) const;
+
+    /**
      * @brief Largest EP0 configuration payload this API will carry.
      *
-     * Every payload in libhcs/protocol/vendor_control.hpp fits well inside
-     * this; the bound exists so the implementation can stage the transfer in a
-     * fixed buffer instead of allocating per request.
+     * v10's port declaration (kApplyManifest) is sized for the largest board's
+     * port inventory and spans multiple EP0 packets -- TinyUSB's control
+     * machinery chunks it on the device side, and libusb handles multi-packet
+     * control transfers natively. The bound exists so the implementation can
+     * stage the transfer in a fixed buffer instead of allocating per request;
+     * it is derived from the protocol so the two cannot drift apart.
      */
-    static constexpr size_t kVendorControlPayloadMax = 64;
+    static constexpr size_t kVendorControlPayloadMax =
+        sizeof(core::protocol::vendor_control::ManifestPayload);
 
     /**
      * @brief Sends one EP0 vendor configuration request to the board.

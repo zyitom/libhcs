@@ -11,7 +11,7 @@
 #include <tim.h>
 
 #include "core/src/utility/assert.hpp"
-#include "firmware/c_board/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 
 namespace libhcs::firmware::timer {
 
@@ -29,7 +29,7 @@ public:
     using TimePoint = std::chrono::time_point<uint32_t, Duration>;
     using TimePoint48 = std::chrono::time_point<uint64_t, Duration48>;
 
-    // Keep the true-window at least half-cycle for stateless expiration checks.
+    // 无状态的过期判断要求真窗口至少留半个周期。
     static constexpr uint32_t kMaxDurationTicks = uint32_t{1} << 31;
     static constexpr uint64_t kMaxDuration48Ticks = uint64_t{1} << 47;
 

@@ -70,6 +70,19 @@ protected:
         return false;
     }
 
+    // 为一段阻塞的寄存器序列(configure())拿到 SPI: 上一次异步读可能还在途中, 它的
+    // DMA 完成中断会放锁, 等它。等不到(总线卡死)就放弃。
+    [[nodiscard]] bool lock_bus() {
+        using namespace std::chrono_literals;
+
+        const auto start = timer::timer->timepoint();
+        while (!spi_.try_lock()) {
+            if (timer::timer->check_expired(start, 2ms))
+                return false;
+        }
+        return true;
+    }
+
     bool read_async(RegisterAddressType addr, size_t size) {
         if (!spi_.try_lock())
             return false;

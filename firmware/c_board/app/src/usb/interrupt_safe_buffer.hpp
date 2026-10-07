@@ -99,7 +99,7 @@ public:
 
     static void release_batch(const Batch* batch) {
         const_cast<Batch*>(batch)->reset(); // NOLINT(cppcoreguidelines-pro-type-const-cast):
-                                            // Compromises made to maintain encapsulation.
+                                            // 为保持封装而做的妥协。
     }
 
     void clear() {

@@ -5,8 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "firmware/common/app/src/utility/lazy.hpp"
 #include "firmware/hpm_board/app/src/led/gpio_led.hpp"
-#include "firmware/hpm_board/app/src/utility/lazy.hpp"
 
 namespace libhcs::firmware::led {
 

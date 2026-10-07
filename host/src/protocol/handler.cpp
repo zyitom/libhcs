@@ -21,6 +21,7 @@
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <variant>
 
 #include <libhcs/protocol/vendor_control.hpp>
 
@@ -30,10 +31,14 @@
 #include "core/src/utility/assert.hpp"
 #include "host/src/logging/logging.hpp"
 #include "host/src/protocol/stream_buffer.hpp"
+#include "host/src/time/board_timebase.hpp"
+#include "host/src/time/sample_timer.hpp"
+#include "host/src/time/usb_frame_axis.hpp"
 #include "host/src/transport/transport.hpp"
+#include "host/src/utility/seqlock.hpp"
 #include "libhcs/board/common.hpp"
 #include "libhcs/data/datas.hpp"
-#include "libhcs/time/timeline.hpp"
+#include "libhcs/spec/port.hpp"
 
 namespace libhcs::host::protocol {
 
@@ -44,7 +49,7 @@ public:
     // Also the anchor period for the shared time base. It must sit well under
     // the SHORTEST board lease, which is not the same everywhere: 4 s on
     // hpm_board (link/host_session.hpp) and mc02 (usb/vendor.hpp), but 1 s on
-    // c_board (usb/vendor.hpp) and ch32_board (link/host_session.hpp).
+    // c_board (usb/vendor.hpp).
     //
     // WHY IT WAS 50 ms. Each anchor exchange contributed one sample to the
     // Timeline's fit of (microframe -> host time), whose error falls as sqrt(N)
@@ -69,7 +74,7 @@ public:
     // lease equal to the period, hpm lost ~70% of its rounds at the expiry
     // boundary. (The 09-13 hpm ack loss that briefly blamed the period was a
     // board left on stale firmware; see firmware/hpm_board/SOF_TIMEBASE.md.)
-    // The c_board and ch32_board leases were not raised and are still 1 s --
+    // The c_board lease was not raised and is still 1 s --
     // that same boundary. 250 ms gives every board at least 4x margin without
     // touching firmware, for three more rounds a second (a keepalive, plus an
     // anchor with time sync on, each way) -- noise beside a 1 kHz control
@@ -79,13 +84,10 @@ public:
     // board keeps driving a dead host's GPIO outputs.
     static constexpr auto kSessionRefreshInterval = std::chrono::milliseconds{250};
 
-    Impl(
-        std::unique_ptr<transport::Transport> transport, data::DataCallback& callback,
-        bool enable_time_sync)
+    Impl(std::unique_ptr<transport::Transport> transport, data::DataCallback& callback)
         : callback_(callback)
         , deserializer_(*this)
         , expected_session_nonce_(generate_session_nonce())
-        , time_sync_enabled_(enable_time_sync)
         , expected_session_start_ack_(make_session_start_ack(expected_session_nonce_))
         , transport_(std::move(transport))
         , logger_(transport_->serial()) {
@@ -206,96 +208,86 @@ public:
         core::protocol::FieldId id, const data::CanDataView& data) override {
         if (!session_established())
             return true;
-        if (!guard_callback([&] { return callback_.can_receive_callback(id, data); })) {
-            logger_.error("Unexpected can field id: {}", static_cast<int>(id));
-            return false;
-        }
-        return true;
+        // A refused record is reported once, with its field id and reason, by
+        // error_callback(); no separate log per port kind.
+        return guard_callback([&] {
+            return callback_.can_receive_callback(
+                id, data, time::time_of_stamped(data.sof_stamp, arrival_, axis()));
+        });
     }
 
     bool uart_deserialized_callback(
         core::protocol::FieldId id, const data::UartDataView& data) override {
         if (!session_established())
             return true;
-        if (!guard_callback([&] { return callback_.uart_receive_callback(id, data); })) {
-            logger_.error("Unexpected uart field id: {}", static_cast<int>(id));
-            return false;
-        }
-        return true;
-    }
-
-    // UART config is a downlink-only channel: the host emits it, boards never
-    // send it back. Receiving one on the uplink means the peer is confused, so
-    // report it as a routing error rather than silently ignoring it.
-    bool uart_config_deserialized_callback(
-        core::protocol::FieldId id, const data::UartConfigView& data) override {
-        (void)data;
-        if (!session_established())
-            return true;
-        logger_.error("Unexpected uart config field on uplink: {}", static_cast<int>(id));
-        return false;
+        // A serial line carries no stamp of its own; the arrival time is the
+        // honest answer (SampleTime::Source says so).
+        return guard_callback([&] {
+            return callback_.uart_receive_callback(
+                id, data, libhcs::time::SampleTime{.host = arrival_});
+        });
     }
 
     bool gpio_digital_data_deserialized_callback(
-        uint8_t channel_index, const data::GpioDigitalDataView& data) override {
+        std::uint8_t line, const data::GpioDigitalDataView& data) override {
         if (!session_established())
             return true;
-        if (!guard_callback(
-                [&] { return callback_.gpio_digital_read_result_callback(channel_index, data); })) {
-            logger_.error("Unexpected gpio channel index: {}", static_cast<int>(channel_index));
-            return false;
-        }
-        return true;
+        return guard_callback([&] {
+            std::optional<libhcs::time::BoardClock::time_point> board;
+            if (data.timestamp_quarter_us)
+                board = board_timebase_.extend(*data.timestamp_quarter_us);
+            return callback_.gpio_digital_read_result_callback(
+                line, data,
+                time::time_of_board_ticks(board, arrival_, axis(), board_timebase_.map()));
+        });
     }
 
     bool gpio_analog_data_deserialized_callback(
-        uint8_t channel_index, const data::GpioAnalogDataView& data) override {
+        std::uint8_t line, const data::GpioAnalogDataView& data) override {
         if (!session_established())
             return true;
-        if (!guard_callback(
-                [&] { return callback_.gpio_analog_read_result_callback(channel_index, data); })) {
-            logger_.error("Unexpected gpio channel index: {}", static_cast<int>(channel_index));
-            return false;
-        }
-        return true;
+        return guard_callback([&] {
+            return callback_.gpio_analog_read_result_callback(
+                line, data, libhcs::time::SampleTime{.host = arrival_});
+        });
     }
 
-    bool gpio_digital_read_config_deserialized_callback(
-        uint8_t channel_index, const data::GpioReadConfigView& data) override {
+    // A read request is downlink-only: the host emits it, boards never send it
+    // back. Receiving one on the uplink means the peer is confused, so report it
+    // as a routing error rather than silently ignoring it.
+    bool gpio_read_deserialized_callback(std::uint8_t line) override {
         if (!session_established())
             return true;
-        (void)channel_index;
-        (void)data;
-        logger_.error("Unexpected gpio digital read config field in uplink");
+        (void)line;
         return false;
     }
 
-    bool gpio_analog_read_config_deserialized_callback(
-        uint8_t channel_index, const data::GpioReadConfigView& data) override {
+    // A buzzer tone is downlink-only, like a read request.
+    bool buzzer_tone_deserialized_callback(const data::BuzzerToneDataView& data) override {
+        (void)data;
         if (!session_established())
             return true;
-        (void)channel_index;
-        (void)data;
-        logger_.error("Unexpected gpio analog read config field in uplink");
         return false;
     }
 
     void accelerometer_deserialized_callback(const data::ImuAccelerometerDataView& data) override {
         if (!session_established())
             return;
-        guard_callback([&] { callback_.accelerometer_receive_callback(data); });
+        guard_callback(
+            [&] { callback_.accelerometer_receive_callback(data, imu_sample_time(data)); });
     }
 
     void gyroscope_deserialized_callback(const data::ImuGyroscopeDataView& data) override {
         if (!session_established())
             return;
-        guard_callback([&] { callback_.gyroscope_receive_callback(data); });
+        guard_callback([&] { callback_.gyroscope_receive_callback(data, imu_sample_time(data)); });
     }
 
     void temperature_deserialized_callback(const data::ImuTemperatureDataView& data) override {
         if (!session_established())
             return;
-        guard_callback([&] { callback_.temperature_receive_callback(data); });
+        guard_callback(
+            [&] { callback_.temperature_receive_callback(data, imu_sample_time(data)); });
     }
 
     void session_control_deserialized_callback(const data::SessionControlView& data) override {
@@ -326,21 +318,29 @@ public:
         if (data.nonce != expected_session_nonce_)
             return;
 
-        // Midpoint of the round trip, not the arrival instant: the board sampled
-        // its counter somewhere between our send and this arrival, and splitting
-        // the difference cancels the bulk of the USB transit bias. What is left
-        // is the down/up asymmetry, which is the floor on how well this host can
-        // place a microframe on its own clock -- and it is irrelevant to
-        // cross-board agreement, which never goes through this clock at all.
-        const auto now = time::Timeline::Clock::now();
+        // Both ends of the round trip that carried this report: the board wrote
+        // its position somewhere between our send and this arrival. The axis
+        // uses the midpoint for its own fit and the two ends as hard bounds for
+        // the controller source. None of it matters to cross-board agreement,
+        // which never goes through this clock at all.
+        const auto now = time::UsbFrameAxis::Clock::now();
         const auto sent = time_anchor_sent_at_.load(std::memory_order_acquire);
-        const auto sampled_at =
-            sent.time_since_epoch().count() == 0 ? now : sent + (now - sent) / 2;
 
         // Only an anchored board is on the shared axis; before that it reports
-        // its own boot-relative origin, which would poison the fit.
-        if (data.state == data::TimeState::kValid)
-            time::timeline().observe(data.microframe, sampled_at);
+        // its own boot-relative origin, which would poison the fit. And only a
+        // report that answers an anchor this handler actually sent has a round
+        // trip to bound it with.
+        if (timeline_ && data.state == data::TimeState::kValid
+            && sent.time_since_epoch().count() != 0) {
+            const double position = static_cast<double>(data.microframe)
+                                  + (static_cast<double>(data.microframe_fraction_q16) / 65536.0);
+            timeline_->observe(position, sent, now);
+        }
+
+        // Whatever the axis does, this report is one more pairing of the
+        // board's own clock with the axis: the mapping every board-stamped
+        // SampleTime of this link converts through.
+        board_timebase_.observe(data);
 
         guard_callback([&] { callback_.time_status_callback(data); });
     }
@@ -351,8 +351,92 @@ public:
         guard_callback([&] { callback_.pulse_report_callback(data); });
     }
 
-    void error_callback() override {
-        logger_.error("Deserializer encountered an error while parsing input");
+    // 端口运行时状态(kPortStatus)。接收线程是唯一的写者。快照从不清零: 板子在每个
+    // kStart 之后把每个在跑的口重发一遍, 覆盖即可; 不清零, 应用取的计数差就不会跳。
+    void port_status_deserialized_callback(
+        std::uint32_t nonce, data::DataId port, const data::PortStatusVariant& status) override {
+        if (nonce != expected_session_nonce_ || !port_status_slot(port))
+            return;
+        auto& slot = port_status_[std::to_underlying(port)];
+        const data::PortStatusVariant previous = slot.load();
+        slot.store(status);
+        log_status_change(port, previous, status);
+    }
+
+    [[nodiscard]] data::PortStatusVariant port_status(data::DataId port) const noexcept {
+        return port_status_slot(port) ? port_status_[std::to_underlying(port)].load()
+                                      : data::PortStatusVariant{};
+    }
+
+    // The reverse of what the data callbacks hand out: a host instant -> this
+    // board's clock. Needs both the axis and the board-clock mapping locked;
+    // empty otherwise. Same thread as the data callbacks (see the header).
+    [[nodiscard]] std::optional<libhcs::time::BoardClock::time_point>
+        board_time_at(libhcs::time::HostTime when) const {
+        if (!timeline_)
+            return std::nullopt;
+        const time::Affine<libhcs::time::BoardClock, time::HostClock> board_to_host =
+            time::compose(timeline_->map(), board_timebase_.map());
+        if (!board_to_host.valid())
+            return std::nullopt;
+        return board_to_host.inverse()(when);
+    }
+
+    // 少见又要紧的变化在这里打一行: 按种类重载 note_change(), 没有重载的种类不打。计数的
+    // 增量由应用按自己的节奏看(HCS 的 1 Hz 健康检查)。before 为空 = 本连接第一次收到这个
+    // 口的状态(板子在 kStart 后发的基线)。
+    void log_status_change(
+        data::DataId port, const data::PortStatusVariant& previous,
+        const data::PortStatusVariant& now) {
+        std::visit(
+            [&]<typename View>(const View& current) {
+                if constexpr (requires {
+                                  this->note_change(port, std::get_if<View>(&previous), current);
+                              })
+                    note_change(port, std::get_if<View>(&previous), current);
+            },
+            now);
+    }
+
+    // 链路: 板子有下行记录没能交付 -- 主机或固件的帧定界 bug, 或主机发错了口。
+    void note_change(
+        data::DataId, const data::LinkStatusView* before, const data::LinkStatusView& now) {
+        const bool moved = before != nullptr ? now.downlink_errors != before->downlink_errors
+                                             : now.downlink_errors != 0;
+        if (!moved)
+            return;
+        logger_.error(
+            "Board reports {} downlink record error(s) since boot; last: {} in downlink transfer "
+            "{} of this session, {}",
+            now.downlink_errors, libhcs::spec::channel_name(now.last_field), now.last_transfer,
+            data::downlink_error_name(now.last_reason));
+    }
+
+    // CAN: 总线状态的跳变(error-active / warning / error-passive / bus-off)。
+    void note_change(
+        data::DataId port, const data::CanStatusView* before, const data::CanStatusView& now) {
+        const std::uint8_t previous_flags = before != nullptr ? before->flags : 0;
+        if (now.flags == previous_flags)
+            return;
+        logger_.warn(
+            "{}: bus state {} -> {} (tec={} rec={} last={})", libhcs::spec::channel_name(port),
+            can_state_name(previous_flags), can_state_name(now.flags),
+            static_cast<unsigned>(now.tec), static_cast<unsigned>(now.rec),
+            data::last_error_name(now.last_error));
+    }
+
+    void error_callback(
+        const core::protocol::FieldId field, const data::DownlinkError reason) override {
+        // 这台板子发来的上行流解析失败, 或一条上行记录被本机的口表拒收 --
+        // 固件/SDK 的线格式或口表漂移时最直接的表现。1st/2nd/4th... 限频, 一块
+        // 持续出错的板子不至于埋掉日志。
+        static std::atomic<uint64_t> occurrences{0};
+        const uint64_t count = occurrences.fetch_add(1, std::memory_order::relaxed) + 1;
+        if (!logging::should_log_occurrence(count))
+            return;
+        logger_.error(
+            "Uplink stream error at field {} ({}): {}", static_cast<int>(field),
+            libhcs::spec::channel_name(field), data::downlink_error_name(reason));
     }
 
 private:
@@ -414,6 +498,11 @@ private:
     // A reopened transport may still complete queued bytes from the previous
     // session. Only this Handler's nonce identifies a safe field boundary.
     void receive_stream(std::span<const std::byte> buffer) {
+        // One clock read per transfer, not per record: every SampleTime handed
+        // out while this buffer is decoded shares it, as the fallback arrival
+        // time and the reference for unwrapping CAN stamps alike.
+        arrival_ = time::UsbFrameAxis::Clock::now();
+
         // Every call of this function runs on the transport's receive thread,
         // the one thread the deserializer may be touched from -- which is what
         // makes consuming the deferred link restart here safe without any
@@ -471,8 +560,12 @@ private:
                     lock, kSessionAckTimeout, [this, previous_session_start_ack_count] {
                         return stop_keepalive_.load(std::memory_order_relaxed)
                             || session_start_ack_count_ > previous_session_start_ack_count;
-                    }))
+                    })) {
+                // A new kStart reboots the board's own time fit; the extension
+                // base and the board-clock mapping start over with it.
+                board_timebase_.reset();
                 return;
+            }
         }
 
         throw std::runtime_error{"Timed out waiting for SESSION_ACK"};
@@ -532,6 +625,17 @@ public:
     // Asks this board to fire a hardware pulse at an absolute microframe. The
     // caller must send the SAME value to every board -- that is what makes the
     // two-way difference cancel the path delay.
+    // From the before-session hook: during construction, before the keepalive
+    // thread exists, or on that thread before it opens the session -- the
+    // thread that reads the flag. The atomic only spares the reader a proof.
+    void set_time_sync(bool on) {
+        if (on && !time_source_attached_) {
+            attach_time_source();
+            time_source_attached_ = true;
+        }
+        time_sync_enabled_.store(on, std::memory_order_relaxed);
+    }
+
     void send_pulse_schedule(uint64_t microframe) {
         StreamBuffer buffer{*transport_};
         core::protocol::Serializer serializer{buffer};
@@ -565,12 +669,52 @@ public:
     }
 
 private:
+    // The time axis this board converts against: one per host controller (the
+    // registry keys it on the controller's PCI address), read from the
+    // controller's own counter when that is possible and from the USB
+    // round-trip fit underneath otherwise. Failing the counter read is not an
+    // error -- but it is worth one line, because the two differ by an order of
+    // magnitude in what a timestamp is worth. Boards on two controllers each
+    // get their own axis, which is the honest answer: they never shared one.
+    void attach_time_source() {
+        const int bus = transport_->usb_bus_number();
+        timeline_ = time::UsbFrameAxis::for_usb_bus(bus);
+        if (timeline_->controller_status()) {
+            logger_.info("Time sync: reading the microframe counter of USB bus {}", bus);
+        } else {
+            logger_.warn(
+                "Time sync: the host controller's microframe counter on USB bus {} cannot be "
+                "read (needs read access to the controller's PCI resource0, x86 xHCI only); "
+                "timestamps fall back to the USB round-trip fit",
+                bus);
+        }
+    }
+
+    // The microframe axis -> host clock line, current as of the last publish.
+    // Invalid (rate 0) until a source locks; the sample timer treats that as
+    // "answer with the arrival time".
+    [[nodiscard]] time::Affine<time::FrameClock, time::HostClock> axis() const noexcept {
+        return timeline_ ? timeline_->map() : time::Affine<time::FrameClock, time::HostClock>{};
+    }
+
+    // An IMU record's time: the board's quarter-us reading extended to 64 bits
+    // (which always works), converted to host time when both mappings allow.
+    template <typename View>
+    [[nodiscard]] libhcs::time::SampleTime imu_sample_time(const View& data) noexcept {
+        return time::time_of_board_ticks(
+            board_timebase_.extend(data.timestamp_quarter_us), arrival_, axis(),
+            board_timebase_.map());
+    }
+
     void send_time_anchor() {
-        // One process-wide axis, queried per round: see libhcs/time/timeline.hpp
-        // for why a per-board origin would leave the boards mutually offset by
-        // whole seconds while each looked perfectly healthy on its own.
-        const auto now = time::Timeline::Clock::now();
-        const uint64_t microframe = time::timeline().anchor_for(now);
+        // One axis per host controller, queried per round: see
+        // host/src/time/usb_frame_axis.hpp for why a per-board origin would
+        // leave the boards mutually offset by whole seconds while each looked
+        // perfectly healthy on its own.
+        const auto now = time::UsbFrameAxis::Clock::now();
+        if (!timeline_)
+            return;
+        const uint64_t microframe = timeline_->anchor_for(now);
 
         core::protocol::Serializer::SerializeResult result;
         {
@@ -615,7 +759,7 @@ private:
 
                 // After the keepalive, so an anchor is only ever sent on a
                 // session the board has just confirmed is alive.
-                if (time_sync_enabled_ && session_established())
+                if (time_sync_enabled_.load(std::memory_order_relaxed) && session_established())
                     send_time_anchor();
 
                 consecutive_session_failures_ = 0;
@@ -689,8 +833,35 @@ private:
     uint64_t session_start_ack_count_ = 0;
     uint64_t session_keepalive_ack_count_ = 0;
     uint32_t expected_session_nonce_ = 0;
-    bool time_sync_enabled_ = false;
-    std::atomic<time::Timeline::Clock::time_point> time_anchor_sent_at_;
+
+    // 端口状态快照, 按 DataId(紧凑字段号 0..15)索引。接收线程写, 任意线程读。
+    static constexpr std::size_t kPortStatusSlots = 16;
+    [[nodiscard]] static bool port_status_slot(data::DataId port) noexcept {
+        return std::to_underlying(port) < kPortStatusSlots;
+    }
+    static const char* can_state_name(std::uint8_t flags) noexcept {
+        if ((flags & data::kCanBusOff) != 0U)
+            return "bus-off";
+        if ((flags & data::kCanErrorPassive) != 0U)
+            return "error-passive";
+        if ((flags & data::kCanWarning) != 0U)
+            return "warning";
+        return "error-active";
+    }
+    std::array<utility::Seqlock<data::PortStatusVariant>, kPortStatusSlots> port_status_{};
+
+    std::atomic<bool> time_sync_enabled_{false};
+    bool time_source_attached_ = false;
+    // Set once by attach_time_source(), before the first anchor goes out and
+    // so before any kTimeStatus (and any SampleTime) can exist on this link.
+    // The axis object itself is shared per host controller and outlives the
+    // session; the board clock mapping is this link's own.
+    std::shared_ptr<time::UsbFrameAxis> timeline_;
+    time::BoardTimebase board_timebase_;
+    // Arrival instant of the transfer being decoded; one read per transfer,
+    // written at the top of receive_stream() on the receive thread.
+    time::UsbFrameAxis::Clock::time_point arrival_{};
+    std::atomic<time::UsbFrameAxis::Clock::time_point> time_anchor_sent_at_;
     std::array<std::byte, kSessionStartAckSize> expected_session_start_ack_{};
     std::array<std::byte, kSessionStartAckSize> session_start_ack_window_{};
     size_t session_start_ack_window_size_ = 0;
@@ -738,25 +909,24 @@ struct PacketBuilderImpl {
     }
 
     [[nodiscard]] bool
-        write_uart_config(data::DataId field_id, const data::UartConfigView& view) noexcept {
-        return process_result(serializer_.write_uart_config(field_id, view));
-    }
-
-    [[nodiscard]] bool write_gpio_digital_data(
-        uint8_t channel_index, const data::GpioDigitalDataView& view) noexcept {
+        write_gpio_digital_data(std::uint8_t line, const data::GpioDigitalDataView& view) noexcept {
+        // A timestamp is something a board puts on a sample; a write carries none.
         if (view.timestamp_quarter_us.has_value()) [[unlikely]]
             return false;
-        return process_result(serializer_.write_gpio_digital_value(channel_index, view));
+        return process_result(serializer_.write_gpio_digital_value(line, view));
     }
 
-    [[nodiscard]] bool write_gpio_digital_read_config(
-        uint8_t channel_index, const data::GpioReadConfigView& view) noexcept {
-        return process_result(serializer_.write_gpio_digital_read_config(channel_index, view));
+    [[nodiscard]] bool
+        write_gpio_analog_data(std::uint8_t line, const data::GpioAnalogDataView& view) noexcept {
+        return process_result(serializer_.write_gpio_analog_value(line, view));
     }
 
-    [[nodiscard]] bool write_gpio_analog_data(
-        uint8_t channel_index, const data::GpioAnalogDataView& view) noexcept {
-        return process_result(serializer_.write_gpio_analog_value(channel_index, view));
+    [[nodiscard]] bool write_gpio_read(std::uint8_t line) noexcept {
+        return process_result(serializer_.write_gpio_read(line));
+    }
+
+    [[nodiscard]] bool write_buzzer_tone(const data::BuzzerToneDataView& view) noexcept {
+        return process_result(serializer_.write_buzzer_tone(view));
     }
 
     [[nodiscard]] bool
@@ -819,28 +989,24 @@ bool Handler::PacketBuilder::write_uart(
     return std::launder(reinterpret_cast<PacketBuilderImpl*>(storage_))->write_uart(field_id, view);
 }
 
-bool Handler::PacketBuilder::write_uart_config(
-    data::DataId field_id, const data::UartConfigView& view) noexcept {
-    return std::launder(reinterpret_cast<PacketBuilderImpl*>(storage_))
-        ->write_uart_config(field_id, view);
-}
-
 bool Handler::PacketBuilder::write_gpio_digital_data(
-    uint8_t channel_index, const data::GpioDigitalDataView& view) noexcept {
+    std::uint8_t line, const data::GpioDigitalDataView& view) noexcept {
     return std::launder(reinterpret_cast<PacketBuilderImpl*>(storage_))
-        ->write_gpio_digital_data(channel_index, view);
-}
-
-bool Handler::PacketBuilder::write_gpio_digital_read_config(
-    uint8_t channel_index, const data::GpioReadConfigView& view) noexcept {
-    return std::launder(reinterpret_cast<PacketBuilderImpl*>(storage_))
-        ->write_gpio_digital_read_config(channel_index, view);
+        ->write_gpio_digital_data(line, view);
 }
 
 bool Handler::PacketBuilder::write_gpio_analog_data(
-    uint8_t channel_index, const data::GpioAnalogDataView& view) noexcept {
+    std::uint8_t line, const data::GpioAnalogDataView& view) noexcept {
     return std::launder(reinterpret_cast<PacketBuilderImpl*>(storage_))
-        ->write_gpio_analog_data(channel_index, view);
+        ->write_gpio_analog_data(line, view);
+}
+
+bool Handler::PacketBuilder::write_gpio_read(std::uint8_t line) noexcept {
+    return std::launder(reinterpret_cast<PacketBuilderImpl*>(storage_))->write_gpio_read(line);
+}
+
+bool Handler::PacketBuilder::write_buzzer_tone(const data::BuzzerToneDataView& view) noexcept {
+    return std::launder(reinterpret_cast<PacketBuilderImpl*>(storage_))->write_buzzer_tone(view);
 }
 
 Handler::Handler(
@@ -848,8 +1014,7 @@ Handler::Handler(
     const board::AdvancedOptions& options, data::DataCallback& callback,
     const BeforeSession& before_session)
     : impl_(new Impl(
-          transport::usb::create_transport(usb_vid, usb_pids, serial_filter, options), callback,
-          options.enable_time_sync)) {
+          transport::usb::create_transport(usb_vid, usb_pids, serial_filter, options), callback)) {
     // The hook runs with the transport up but no session yet -- the only window
     // in which an out-of-band handshake can precede the first kStart.
     //
@@ -900,9 +1065,24 @@ Handler::LinkState Handler::link_state() const noexcept {
     return impl_->link_state();
 }
 
+data::PortStatusVariant Handler::port_status(data::DataId port) const noexcept {
+    return impl_->port_status(port);
+}
+
 void Handler::send_pulse_schedule(uint64_t microframe) noexcept {
     core::utility::assert_debug(impl_);
     impl_->send_pulse_schedule(microframe);
+}
+
+void Handler::set_time_sync(bool on) {
+    core::utility::assert_debug(impl_);
+    impl_->set_time_sync(on);
+}
+
+std::optional<libhcs::time::BoardClock::time_point>
+    Handler::board_time_at(libhcs::time::HostTime when) const {
+    core::utility::assert_debug(impl_);
+    return impl_->board_time_at(when);
 }
 
 bool Handler::vendor_control_out(

@@ -7,6 +7,8 @@
 
 #include "core/src/protocol/serializer.hpp"
 #include "firmware/mc02/app/src/diag/usb_rx_hist.hpp"
+#include "firmware/mc02/app/src/ports.hpp"
+#include "firmware/mc02/app/src/spi/bmi088/service.hpp"
 #include "firmware/mc02/app/src/utility/boot_mailbox.hpp"
 
 namespace {
@@ -28,6 +30,75 @@ volatile uint32_t g_dfu_runtime_reboot_requested_tick = 0U;
 namespace libhcs::firmware::usb {
 
 core::protocol::Serializer& get_serializer() { return vendor->serializer(); }
+
+// 每个口按自己的 suspend() 停: CAN 下总线、串口停收(待发字节照常发完)、IMU 停采样并
+// 忘掉"在跑"(下一个主机声明同样的设置时要重新启动它)、输出引脚拉低。口的全集就是
+// 注册表, 这里不另列一遍。
+void Vendor::stop_channels() {
+    ports::Registry::suspend_all();
+    // 时间基准同样随会话走: 下一个主机的清单要了才再开。
+    sync::time_sync_stop();
+}
+
+bool Vendor::dispatch_can(core::protocol::FieldId id, const data::CanDataView& data) {
+    return ports::Registry::dispatch<spec::PortKind::kCan>(id, [&data](auto, auto& bus) {
+        bus.handle_downlink(data);
+        return true;
+    });
+}
+
+void Vendor::report_port_status(core::link::PortStatusRound& round) {
+    core::link::offer_port_status<ports::Registry>(round);
+}
+
+bool Vendor::dispatch_uart(core::protocol::FieldId id, const data::UartDataView& data) {
+    return ports::Registry::dispatch<spec::PortKind::kUart>(id, [&data](auto, auto& port) {
+        // 只收不发的 DBUS 口没有下行: 发给它的数据与发给不存在的口同一回答。
+        if constexpr (requires { port.handle_downlink(data); }) {
+            port.handle_downlink(data);
+            return true;
+        } else {
+            return false;
+        }
+    });
+}
+
+namespace {
+// GPIO 记录按线号到 GPIO 口的那根线; 本口没有的线号与 CAN/UART 的未知口一样不认。
+template <typename F>
+bool dispatch_gpio_line(uint8_t line, F&& f) {
+    return ports::Registry::dispatch<spec::PortKind::kGpio>(
+        data::DataId::kGpio, [line, &f](auto, auto& port) {
+            gpio::Pin* pin = port.line(line);
+            if (pin == nullptr)
+                return false;
+            f(*pin);
+            return true;
+        });
+}
+} // namespace
+
+bool Vendor::dispatch_gpio_digital(uint8_t line, const data::GpioDigitalDataView& data) {
+    if (data.timestamp_quarter_us.has_value())
+        return false;
+    return dispatch_gpio_line(line, [&data](gpio::Pin& pin) { pin.handle_digital_write(data); });
+}
+
+bool Vendor::dispatch_gpio_analog(uint8_t line, const data::GpioAnalogDataView& data) {
+    return dispatch_gpio_line(line, [&data](gpio::Pin& pin) { pin.handle_analog_write(data); });
+}
+
+bool Vendor::dispatch_gpio_read(uint8_t line) {
+    return dispatch_gpio_line(line, [](gpio::Pin& pin) { pin.handle_read_request(); });
+}
+
+bool Vendor::dispatch_buzzer(const data::BuzzerToneDataView& data) {
+    return ports::Registry::dispatch<spec::PortKind::kBuzzer>(
+        data::DataId::kBuzzer, [&data](auto, auto& port) {
+            port.handle_tone(data);
+            return true;
+        });
+}
 
 bool uplink_session_active() { return vendor->session_established(); }
 
@@ -74,24 +145,22 @@ void tud_dfu_runtime_reboot_to_dfu_cb() {
 
 void tud_suspend_cb(bool remote_wakeup_en) {
     (void)remote_wakeup_en;
+    // 忘 EP0 握手在 session_deactivated_callback() 里, 与租约到期同一路径。
     usb::vendor->deactivate_session();
     usb::vendor->finish_downlink_transfer();
-    // 新主机必须自己完成 EP0 握手。
-    usb::vendor->set_ep0_handshake_done(false);
 }
 
 void tud_resume_cb() {}
 
 void tud_mount_cb() {
-    // 新主机必须自己完成 EP0 握手。
+    // 新主机必须自己完成 EP0 握手, 上一次握手声明过的通道随之作废。
     usb::vendor->set_ep0_handshake_done(false);
+    Vendor::stop_channels();
 }
 
 void tud_umount_cb() {
     usb::vendor->deactivate_session();
     usb::vendor->finish_downlink_transfer();
-    // 新主机必须自己完成 EP0 握手。
-    usb::vendor->set_ep0_handshake_done(false);
 }
 
 } // extern "C"

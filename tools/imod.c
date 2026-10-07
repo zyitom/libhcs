@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 int main(int argc, char** argv) {
@@ -38,9 +39,18 @@ int main(int argc, char** argv) {
         perror(path);
         return 1;
     }
-    // Map enough for cap regs + runtime regs (well inside one page).
+    // Map up to 16 KB, never past the end of BAR0. The runtime registers are NOT inside the
+    // first page on every controller: Intel PCH xHCI has RTSOFF = 0x2000, and an earlier
+    // version that mapped only 0x1000 read IMOD (and IMAN) as 0 there -- a bogus "no
+    // moderation" result. Same arithmetic as hcs_base MachineGuard::check_imod().
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        perror("fstat");
+        return 1;
+    }
+    const size_t length = (size_t) st.st_size < 0x4000 ? (size_t) st.st_size : 0x4000;
     volatile uint8_t* base =
-        (volatile uint8_t*) mmap(NULL, 0x1000, PROT_READ | PROT_WRITE,
+        (volatile uint8_t*) mmap(NULL, length, PROT_READ | PROT_WRITE,
                                  MAP_SHARED, fd, 0);
     if (base == MAP_FAILED) {
         perror("mmap");
@@ -51,6 +61,11 @@ int main(int argc, char** argv) {
     uint32_t rtsoff;
     memcpy(&rtsoff, (const void*) (base + 0x18), 4);
     const uint32_t rts = rtsoff & 0xFFFFFE0u;
+    if (rts == 0 || rts + 0x28 > length) {
+        fprintf(stderr, "runtime registers at 0x%x are outside the %zu-byte BAR0 mapping\n", rts,
+                length);
+        return 1;
+    }
     volatile uint32_t* imod = (volatile uint32_t*) (base + rts + 0x24);
     volatile uint32_t* iman = (volatile uint32_t*) (base + rts + 0x20);
 
@@ -63,7 +78,7 @@ int main(int argc, char** argv) {
         printf("wrote IMOD=%u (%u ns), readback %u (%u ns)\n", units, units * 256, *imod,
                *imod * 256);
     }
-    munmap((void*)base, 0x1000);
+    munmap((void*)base, length);
     close(fd);
     return 0;
 }

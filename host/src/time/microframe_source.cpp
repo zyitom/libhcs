@@ -1,3 +1,5 @@
+#include "host/src/time/microframe_source.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -14,8 +16,6 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
-
-#include <libhcs/time/microframe_source.hpp>
 
 namespace libhcs::host::time {
 namespace {

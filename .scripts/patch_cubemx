@@ -11,6 +11,7 @@ STALE_FILES = (
     Path("CMakeLists.txt"),
     Path("CMakePresets.json"),
     Path("STM32F407XX_FLASH.ld"),
+    Path("STM32F407xx_FLASH.ld"),  # CubeMX 6.18+ spells it this way
     Path("cmake/starm-clang.cmake"),
     Path("cmake/gcc-arm-none-eabi.cmake"),
 )

@@ -8,13 +8,13 @@
 
 #include "core/src/protocol/serializer.hpp"
 #include "core/src/utility/assert.hpp"
+#include "firmware/common/app/src/utility/interrupt_lock.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 #include "firmware/mc02/app/src/spi/bmi088/accel.hpp"
 #include "firmware/mc02/app/src/spi/bmi088/base.hpp"
 #include "firmware/mc02/app/src/spi/spi.hpp"
 #include "firmware/mc02/app/src/timer/timer.hpp"
 #include "firmware/mc02/app/src/usb/vendor.hpp"
-#include "firmware/mc02/app/src/utility/interrupt_lock.hpp"
-#include "firmware/mc02/app/src/utility/lazy.hpp"
 
 namespace libhcs::firmware::spi::bmi088 {
 
@@ -37,6 +37,15 @@ public:
         : Bmi088Base(spi, CS1_ACCEL_GPIO_Port, CS1_ACCEL_Pin)
         , next_probe_deadline_(timer::timer->timepoint() + kProbePeriod) {}
 
+    // IMU 启动时调用: 探询从现在重新计周期, 上一段会话留下的观测与上报记录作废。
+    void restart() {
+        const utility::InterruptLockGuard guard;
+        next_probe_deadline_ = timer::timer->timepoint() + kProbePeriod;
+        probe_pending_ = false;
+        has_last_observation_ = false;
+        has_last_report_ = false;
+    }
+
     void poll_pending_probe() {
         const auto now = timer::timer->timepoint();
 
@@ -49,9 +58,10 @@ public:
     }
 
     bool service_pending_read() {
-        const utility::InterruptLockGuard guard;
+        // probe_pending_ 只在主循环读写(毫秒杂务置位, 这里清除), 先看一眼再关中断。
         if (!probe_pending_)
             return false;
+        const utility::InterruptLockGuard guard;
         if (!read_async(RegisterAddress::kTempMsb, kTemperatureReadSizeBytes))
             return false;
 

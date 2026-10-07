@@ -2,354 +2,145 @@
 
 > **文档类型**：现行规范（板级）
 > **适用范围**：`firmware/hpm_board/`，HPMicro HPM6E8Y / HPM5321（Andes RISC-V）
-> **状态**：现行有效
-> **相关文档**：[仓库根 AGENTS.md](../../AGENTS.md) · [PITFALLS.md](PITFALLS.md)（选型与踩坑实录） · [USB_OPTIMIZATION_LOG.md](USB_OPTIMIZATION_LOG.md)（USB 调优实录） · [BUILD_ENVIRONMENT.md](BUILD_ENVIRONMENT.md)（完整环境搭建） · [SOF_TIMEBASE.md](SOF_TIMEBASE.md) · [CONTROL_TIMING.md](CONTROL_TIMING.md) · [DMTOOL_PROTOCOL.md](DMTOOL_PROTOCOL.md)（DMTool 兼容）
-
-> 本目录专属指南，叠加在仓库根 `AGENTS.md` 之上。完整编译环境（依赖清单、工具链下载、
-> 烧录）见 `BUILD_ENVIRONMENT.md`；实测过程与踩坑见 `PITFALLS.md` 与
-> `USB_OPTIMIZATION_LOG.md`，此处只列**现在该怎么做**。
+> **状态**：现行有效（2026-10-06 精简：只留命令与约束，实测与来龙去脉在下列 L3 文档）
+> **相关文档**：[仓库根 AGENTS.md](../../AGENTS.md) · [PITFALLS.md](PITFALLS.md) · [USB_OPTIMIZATION_LOG.md](USB_OPTIMIZATION_LOG.md) · [BUILD_ENVIRONMENT.md](BUILD_ENVIRONMENT.md) · [SOF_TIMEBASE.md](SOF_TIMEBASE.md) · [CONTROL_TIMING.md](CONTROL_TIMING.md) · [DMTOOL_PROTOCOL.md](DMTOOL_PROTOCOL.md) · [../../HOST_TUNING.md](../../HOST_TUNING.md)
 
 ## 摘要
 
-hpm_board 与其他三块板最大的不同：它是 **RISC-V（Andes 核）**、用 **HPM SDK 超级构建**。
-工具链是仓库外的预编译二进制，装在哪由环境变量决定——本机实际安装状态见
-[仓库根 AGENTS.md 开发机环境路径约定](../../AGENTS.md#开发机环境路径约定重要先读这条再看任何路径)。
+RISC-V（Andes 核）+ HPM SDK 超级构建，单核 USB vendor bulk 数据固件。下面每条是"现在该怎么做 /
+不要做什么"，括号里是理由所在的 L3 文档。本机工具链位置以 [ENV.md](../../ENV.md) 为准。
 
-## 芯片与工具链
-- MCU：**HPM6E8Y / HPM5321**（HPMicro，**Andes RISC-V 核，不是 ARM**）；HPM6E8Y 双核。
-- ISA/工具链：RISC-V，用 HPMicro GNU 工具链 `rv32imac_zicsr_zifencei_multilib_b_ext`
-  （带 B 扩展 multilib），需 `riscv32-unknown-elf-gcc`。**不要**用 arm-none-eabi-gcc
-  或 WCH 工具链。工具链留在仓库外，不入库、不做 submodule；下载与安装见
-  `BUILD_ENVIRONMENT.md`。
-- HPM SDK **v1.12.0 随仓库自带**（`bsp/hpm_sdk`，submodule），无需另装。submodule 指向
-  fork `zyitom/hpm_sdk`，当前提交 `v1.12.0-3-ge4347411`，分支 `migrate-v1.12.0`。
-- 所有 hpm_board 镜像（app、bootloader）统一编译共享的
-  `firmware/c_board/bsp/tinyusb` **v0.21.0**，接入点是 `cmake/current_tinyusb.cmake`；
-  HPM SDK 自带的 TinyUSB v0.20.0 及 fork 内旧补丁不再进入镜像。构建前必须初始化该
-  TinyUSB submodule；HPM SDK 仍提供 SoC、USB PHY 与寄存器驱动。
+## 1. 芯片、工具链、构建
 
-## 固件镜像
-
-`firmware/hpm_board/`（超级构建，默认）出 USB 数据固件（单核，USB vendor bulk）：
-**USB 延迟最低（p50 100us）**，core1 不释放。
-
-> 选型依据（5321 vs 6E8Y、多板方案、EtherCAT 为何被否）见
-> [PITFALLS.md](PITFALLS.md) 第 1-2 节。EtherCAT 桥固件已于 2026-09-08 移出本仓库，
-> 归档在 `~/Desktop/ethercat-archive-2026-09-08/`。
-
-## 主机侧延迟调优（每次重启都要重做）
+- **RISC-V，不是 ARM**：HPMicro GNU 工具链 `rv32imac_zicsr_zifencei_multilib_b_ext`
+  （`riscv32-unknown-elf-gcc`），**不要**用 arm-none-eabi-gcc。工具链在仓库外，见 `BUILD_ENVIRONMENT.md`。
+- HPM SDK v1.12.0 随仓库（`bsp/hpm_sdk`，fork `zyitom/hpm_sdk`，分支 `migrate-v1.12.0`），只读。
+- TinyUSB 用共享的 `firmware/common/bsp/tinyusb` v0.21.0（`cmake/current_tinyusb.cmake`），构建前初始化该 submodule。
+- 构建需 Python 3 + `PyYAML`、`jinja2`。preset `debug` / `debug-outside` / `release`（小写）。
 
 ```bash
-sudo ./host-tuning.sh          # 应用：governor=performance、RT 限流关闭、USB autosuspend 等
-sudo ./host-tuning.sh --check  # 只报告不改（还会打印本机的控制器、IRQ、P/E 核归属）
-sudo ./host-tuning.sh --pmqos  # 另开一个终端，测量期间持住（1 kHz 控制环下值 p99.9 约 9us）
+export PATH=~/3rd_party/hpm/bin:$PATH        # [前机路径]
+cmake --preset release -S firmware/hpm_board -B <build> -DBOARD=hpm5321   # 单 CAN / 双 CAN 共用一个镜像
+cmake --build <build> --target hpm_board_app                              # 或 hpm_board_bootloader
 ```
 
-**除内核 cmdline 外全部不持久化。** 逐项状态、证据等级、以及被实测否掉的做法见
-[../../HOST_TUNING.md](../../HOST_TUNING.md)（现行权威）第 1-3 节。测 USB 延迟前
-**必须**先把主机弄到高频状态；但**别拿压测（gap=0 紧凑 ping-pong）的结论去判断
-1 kHz 控制环的主机调优**——两种工况结论方向相反，判据见 `HOST_TUNING.md` 1.1 与
-`USB_OPTIMIZATION_LOG.md` 第 5 节。
+- 无 CubeMX。`app/src/xcore/` 与 `libhcs_APP_RELEASE_CORE1` 是 EtherCAT 遗留，默认编译为空，待清理。
 
-## 烧录
+## 2. 烧录
 
-App 走 USB DFU：`./tools/flash.sh hpm5321`（默认 release；末尾加 `debug`）。HPM5321 应用
-在跑时身份是 `0x34b7:0x6877`、进 bootloader 后才是 `0xa511:0x5321/0x5322`，脚本会自动拼出
-`-d 0x34b7:0x6877,0xa511:*`；手工 `dfu-util` 同样要写两段，见本文「构建」一节。
-`flash-ecat.sh` / `flash-ecat-swap.sh` 两个脚本随 EtherCAT 桥一并移出仓库（见归档）。
+在仓库根 `./tools/flash.sh hpm5321`（默认 release，末尾加 `debug`）。手工 DFU 要写两段身份：
 
-Windows 免驱：应用内置 MS OS 2.0 WCID 描述符（usb_descriptors.hpp，接口
-DM×3 + libhcs + DFU Runtime 声明 CompatibleID `WINUSB`，CDC 不参与），Windows
-8.1+ 首次插入即自动绑定 WinUSB，无需 Zadig/INF [推断，Windows 真机待核验；BOS/描述符集应答已于 2026-09-21
-在 Linux 侧 libusb 全链路实测]。
-
-## CAN 采样点：钉死 87.5%，不要动 [实测 2026-08-03]
-
-`can.hpp` 把仲裁域和数据域的采样点都钉死在 87.5%，**不要改回 SDK 默认（实测恒为
-75.0%），也不要照厂商推荐表改**：
-
-```cpp
-config.can20_samplepoint_min = 875U;   config.can20_samplepoint_max = 875U;
-config.canfd_samplepoint_min = 875U;   config.canfd_samplepoint_max = 875U;
+```bash
+dfu-util -d 0x34b7:0x6632,0xa511:* -a 0 -D <build>/app/output/hpm_board_app_hpm5321.dfu   # 多块板加 -p <USB 路径>
 ```
 
-症状签名：采样点不一致时 **classic 双向通、FD 单向不通**（`PSR.DLEC = ACK error`）。
-真实电机（DJI、达妙 MIT、瓴控）全是 87.5%。为什么必须对齐总线而不是推荐表、
-判读与自查方法见 [PITFALLS.md](PITFALLS.md) 第 3 节。
+USB 身份（唯一来源 `core/include/libhcs/protocol/usb_identity.hpp`）：应用 `0x34B7:0x6632`（双 CAN）/
+`0x6877`（单 CAN）；bootloader `0xA511:0x5321/0x5322`。libhcs 按产品串 `HCS Agent v<版本>` 认板。
 
-**更一般的硬约束**：本板 CAN 的协议（classic / FD）、仲裁与数据段速率、采样点，上限
-全部由总线对端的**电机硬件**决定（DJI、达妙 MIT、瓴控的电机固件在仓库之外，无法
-修改）`[硬件事实，用户确认 2026-09-12]`。所以帧型与速率是接线事实，写在 host 代码里经 EP0
-下发（见下「EP0 配置通道」约束 1），固件只保留采样点与 TDC 策略。吞吐/延迟优化**不要**以「升级 CAN-FD /
-提高波特率 / 改采样点」为建议方向——总线参数没有可动的余地；可行杠杆在主机侧协议、
-成帧与软件路径，见 [USB_OPTIMIZATION_LOG.md](USB_OPTIMIZATION_LOG.md) 与
-[HOST_TUNING.md](../../HOST_TUNING.md)。
+## 3. 主机侧调优（每次重启重做）
 
-## CAN 消息 RAM：只在一处改 [2026-09-21 上板运行正常；burst 过载门槛未测]
+在仓库根 `sudo ./host-tuning.sh`（`--check` 只报告，`--pmqos` 测量期间另开终端持住）。除内核 cmdline 外不持久化。
+测 USB 延迟前必须先调；压测（gap=0）与 1 kHz 控制环结论方向相反，别混用（`HOST_TUNING.md` 1.1）。
 
-三处 `mcan_init` 配置（libhcs 的 `Can::libhcs_config()`——构造、会话还原、EP0 应用设置共用；
-DMTool 重配 `reconfigure_timing`；其失败救援）共用 `Can::apply_message_ram_layout()`，深度常量与预算
-`static_assert` 都在 `can.hpp`。**不要在某一处单独改 `ram_config`**：超出每控制器 640 词
-`mcan_init` 静默失败、两路一起死，而四处不一致又会让一次 DMTool 会话之后 libhcs 跑在另一套
-深度上——两种错此前都真实存在过。现行 RX 16 / TX 12 / TX event 12 / 过滤器 16+16 =
-2304/2560 字节。来龙去脉见 [DMTOOL_PROTOCOL.md](DMTOOL_PROTOCOL.md) 6.1 的更正。
+## 4. CAN
 
-## UART 运行时改波特率：快照，不回读 [实测 2026-08-05]
+- **采样点钉死 87.5%**（仲裁与数据段，`can.hpp` 的 `*_samplepoint_min/max = 875`），不要改回 SDK
+  默认 75%，也不要照厂商推荐表改。症状：classic 双向通、FD 单向不通（`PITFALLS.md` 第 3 节）。
+- **协议、速率、采样点由对端电机决定**，不是可调参数：优化不要往"升 FD / 提波特率 / 改采样点"走。
+- 帧型与速率由主机 EP0 声明下发（`hcs::kClassic1M` / `hcs::kFd1M5M`）；经典模式让控制器
+  `CCCR.FDOE=0`，经典总线上收不到 FD 帧是有意的。设置存在 `Can::libhcs_setting_`，挂起/恢复按它重建。
+- libhcs 路径的 `mcan_config_t` 只有一份：`Can::libhcs_config()`，不要另抄；DMTool 的
+  `reconfigure_timing` 是另一条路，保持原样。
+- **消息 RAM 只在 `Can::apply_message_ram_layout()` 改**（超 640 词 `mcan_init` 静默失败；见 `DMTOOL_PROTOCOL.md` 6.1）。
+- **CAN 单发**：libhcs 关自动重传，作废帧由 `send_to_fifo()` 按 `TXBCF` 计数（端口状态 `kPortStatus` 的 `tx_cancelled`）；
+  主机按 CAN ID 从大到小发（`PITFALLS.md` 第 9 节）。保持单发是用户决定。
 
-读 `DLL`/`DLM` **必须在 TX DMA 停稳之后**（DLAB=1 时 `DLL` 与 `THR` 共址，回读动作本身
-会把数据字节写进除数锁存器，端口从此不出声）。现行实现：`snapshot_divisor()` 只在
-init 和 `abort_transmit()` 之后采样，遥测只读快照；`uart_set_baudrate()` 求解失败时
-**不清 DLAB**，调用方必须无条件自己清一次。症状签名与修法见
-[PITFALLS.md](PITFALLS.md) 第 4 节。配置被拒要让主机看见，走下一节的 EP0，不走带内通道。
+## 5. UART
 
-## EP0 配置通道
+- 运行时改波特率：`DLL`/`DLM` 只在 TX DMA 停稳后读（DLAB=1 时与 `THR` 共址）。`snapshot_divisor()`
+  只在 init 与 `abort_transmit()` 之后采样；`uart_set_baudrate()` 求解失败时不清 DLAB，调用方必须自己清（`PITFALLS.md` 第 4 节）。
+- 速率一致性比分频器整数（`divisor`/`oversample`），不比波特率；百分比只作 10% 兜底。
 
-**结论先行：每帧的、周期性的、要和数据定序的 → bulk 数据管道（HPM5321 上是
-`0x04` / `0x84`，见「DMTool 兼容」）。构造期问一次的、失败必须让主机看见的 → EP0。**
-协议定义在 `core/include/libhcs/protocol/vendor_control.hpp`（主机与固件共用），板端实现
-在 `app/src/usb/vendor_control.cpp`，主机端封装在 `host/include/libhcs/board/hcs_config.hpp`。
+## 6. EP0 配置通道（协议在 `core/include/libhcs/protocol/vendor_control.hpp`）
 
-| bRequest | 方向 | wIndex | 载荷 | 语义 |
-|---|---|---|---|---|
-| `0x40 kGetInterface` | IN | 0 | `InterfacePayload` | 线格式指纹 `kVersion`（编译期折叠，禁止手改）、CAN/UART 路数、实时 FD 掩码、能力位 |
-| `0x41 kGetCanConfig` | IN | 总线号 | `CanConfigPayload` | 硬件事实：当前帧型 + 由 `NBTP`/`DBTP` 重构的速率与采样点；经典模式控制器关 FD，数据段报 0 |
-| `0x42 kSetCanConfig` | OUT | 总线号 | `CanConfigPayload` | 本板置 `kCapCanModeSettable` + `kCapCanRateSettable`：`kCanConfigApply` 切帧型，`kCanConfigApplyTiming` 按 host 下发的速率（非零即新值，零即沿用）重解位时序，二者都重初始化控制器（见约束 1）；不带时对应字段是核对。采样点永远是核对。板端应用后自己回读，帧型/速率/采样点不符即 `kConfigErrorVerifyFailed`，解不出即 `kConfigErrorRateUnrepresentable` 且救回原设置 |
-| `0x43 kGetUartConfig` | IN | 端口号 | `UartConfigPayload`（12 字节） | 硬件事实：**实际写入**的分频器 `DLM:DLL` 与过采样倍数（OSCR 解码，0→32）+ 由二者反推的波特率 + 活寄存器解码的帧格式 + 接收极性（`rx_polarity`，本板恒报 1=正常） |
-| `0x44 kSetUartConfig` | OUT | 端口号 | `UartConfigPayload`（12 字节） | 稀疏 patch（波特率 + 字长/校验/停止位/接收极性，0=不动）；接收极性 2=反相只有 mc02 接受，本板与 c_board 无 RX 反相硬件，报 `kConfigErrorFramingUnsupported`；`divisor`/`oversample` 非零即**断言**。求解与断言全部前置，STALL 严格等于寄存器不动；写入后回读分频器不符报 `kConfigErrorVerifyFailed`(7) |
-| `0x45 kGetCanStatus` | IN | 丝印编号 | — | 控制器错误寄存器回读，判读表见 [PITFALLS.md](PITFALLS.md) 第 5 节 |
-| `0x47 kGetLatencyBreakdown` | IN | — | — | 延迟拆解埋点，恒开（见下） |
-| `0x48 kGetLastConfigError` | IN | 0 | `LastConfigErrorPayload` | 最近一次 STALL 的请求码、下标、原因（`ConfigErrorReason`）、值；粘滞到下次拒绝或复位。每条 STALL 路径都先记再返回 |
+- **分工**：每帧的、要和数据定序的走 bulk（`0x04`/`0x84`）；构造期问一次、失败必须让主机看见的走 EP0。
+  `kSession`（keepalive）不搬 EP0：它证明的是 bulk 管道活着。
+- 逻辑在 core：`core/src/link/ep0.hpp`（分发 + 清单两阶段提交）、`session.hpp`（nonce 握手 + 4 s 租约）、
+  `ownership.hpp`（归属）。本板只给注册表（`boards/<board>/app/ports.hpp`，绑错是编译错误）与板级上下文
+  （`app/src/usb/vendor_control.cpp`：归属交接、时延分解、时间基准开关）。
+- **会话胶水在 common（2026-10-06）**：kStart/kKeepalive 应答、租约、断联下线、kTimeAnchor 应答与批量缓冲宿主
+  在 `firmware/common/app/src/link/host_session.hpp` 的 `link::HostSession` 模板（三板同一份；原
+  `app/src/link/host_session.hpp` 已删）。本板 Vendor 只剩传输形态、归属交接、脉冲交换与 TimeSync 策略；
+  `UplinkAllocFailed` 必须留在 `link` 命名空间（hpm5321 链接脚本的 ILM tripwire 按修饰名点名它）。
+- 请求：`0x4A kGetPortList`（纯读，含线格式指纹 `kVersion` 与 `board_caps`）、`0x4B kGetPortConfig`、
+  `0x4D kApplyManifest`、`0x4E kGetManifestResult`、`0x47 kGetLatencyBreakdown`、
+  `0x48 kGetLastConfigError`。wIndex = DataId（丝印号）。退役编号（`0x40`–`0x46`、`0x49`、`0x4C`）不复用。
+- **运行时状态不走 EP0**：CAN/串口的错误与丢帧随 keepalive 应答推送（`kPortStatus`，
+  [PROTOCOL.md](../../core/PROTOCOL.md) 1.3）；驱动只提供 `read_status()`，串口的 `LSR` 只在那里读。
+- **配置即声明，一次事务**：校验判完一切可预见的拒绝且不碰硬件 → 先从 DMTool/CDC 接手（端口全挂起）
+  → 应用 → 全部生效才落定；中途失败所有口挂起、板子还给原主人。没声明的口不工作。
+- **ACK = 已生效，STALL = 拒绝**：每条 STALL 路径先记锁存（`0x48` 粘滞）再返回。
+- EP0 不受会话门控；清单没被接受的主机开不了会话（`PITFALLS.md` 第 5 节）。
 
-> 曾用于分端点协商的 `0x46 kSetEndpointMode` 已随分端点拆除（2026-09-05），
-> **编号空出不复用**——老主机来问会拿到 STALL，而不是被当成某个后加的请求重新解释。
+## 7. USB 现行约束（数据见 `USB_OPTIMIZATION_LOG.md`）
 
-三条必须知道的约束：
+- **下行不背压**：`CFG_TUD_VENDOR_RX_MANUAL_XFER` 不设；手动重挂、水位、逃生阀已删，不要加回。
+- **主循环里不加无条件的工作**：周期性检查放 1 kHz tick 块，"声明了才有"的挂在掩码后；每趟路径先用内存
+  状态判断有没有活，再碰外设寄存器（一次寄存器读约 30 周期，整趟只有 150–220）。
+- 主循环里 CAN 排在 bulk 前面；UART 与 CAN 共用一条 bulk 管道。
+- 测包率前 `lsof /dev/ttyACM*`：挂着任何 IN（开着的串口也算）包率上限就从 11 降到 8 个/微帧。
+- 调不动的旋钮别再 A/B：`CFG_TUD_TASK_EVENTS_PER_RUN`、host transfer 池深、`CFG_TUD_VENDOR_RX_NEED_ZLP`、multi-qTD。
+  `CFG_TUD_VENDOR_RX_ARM_FIRST`（先挂下一块 OUT 再回调）只本板打开，保留。
+- **不要把 TinyUSB 热路径放 ILM**（`TU_ATTR_FAST_FUNC` 加在 `tud_task_ext` 一类上是净倒退）。
+- **每帧热路径不许碰 flash**：每帧执行的代码与只读表必须在 ILM，新增每帧调用要在
+  `boards/hpm5321/linker/app_flash_uf2.ld` 补规则（失配即链接期 `ASSERT` 失败）。
+- 共享 TinyUSB 里本板依赖的改动（动之前先读 `USB_OPTIMIZATION_LOG.md`）：ChipIdea SETUP tripwire（正确性
+  修复，必须保留）、`CFG_TUD_MEM_DCACHE_ENABLE=0` 编掉 dcache 调用、ISR 只扫 `ENDPTCOMPLETE` 置位、
+  无 sof 驱动时跳过 SOF 遍历、`CFG_TUD_VENDOR_RX_ARM_FIRST`。CLEAR_FEATURE(HALT) 每次都复位 toggle，不要门控。
 
-1. **libhcs 的 CAN 帧型与速率由 host 下发，应用 = 重初始化控制器，经典模式关掉 FD
-   （2026-09-30 起本板置 `kCapCanModeSettable` + `kCapCanRateSettable`）。** 帧型与速率是
-   接线事实，host 代码写死（`hcs::kClassic1M` / `hcs::kFd1M5M`，放进 `Configuration::can`
-   或 `configure_canN()`），固件的 `kArbitrationBaudrate`/`kCanFdDataBaudrate` 只是上电默认值。
-   经典总线只支持 2.0，任何 FD 位上线都会让总线崩溃，所以不学 mc02 只翻 Tx 元素的
-   FDF/BRS，而是让控制器 `CCCR.FDOE=0`，由硬件保证。代价是经典模式收不到 FD 帧（实测
-   0/50），纯 2.0 总线上正合适 `[用户确认 2026-09-30]`。
-   - libhcs 的设置存在 `Can::libhcs_setting_`（帧型 + 两段速率），会话建立时的
-     `restore_default_timing()` 按它还原，**不会**把 EP0 的选择冲回上电默认值。
-   - 速率在钉死的 87.5% 采样点上由 SDK 求解；求解器按 `src_clk / baudrate` 整除，除不尽会
-     落在近似速率，所以 `init_controller()` 要求寄存器回读**精确**等于所求，数据段分频还必须
-     为 1（TDC 自动 TDCO 的前提），否则判解不出、救回原设置。80 MHz 下 FD 数据段实际可用的
-     只有 80M/(8k) 一类速率（5M、2.5M…）`[推断，由求解器约束推出；未上板]`。
-   - 87.5% 采样点、TDC、PTPC 喂 TSU、sync 过滤器这整套实测配置在 libhcs 路径只有一份：
-     `Can::libhcs_config()`。**不要**在 libhcs 路径另抄一份 `mcan_config_t`；DMTool 的
-     `reconfigure_timing` 是另一条路径，保持原样。
-   - 经典与 FD 的仲裁段由同一钉死窗口解出同一 `NBTP`，只切帧型不动仲裁段 `[推断，SDK 两组
-     TQ 上限相同；未上板]`。
-   - 应用设置会丢弃该路软件发送队列（旧设置下的过期帧）。与已排队数据不定序，主机先静默链路。
-   - **推论：每帧 `IsFdCan` 头部位已在协议中废弃（2026-09-12）**，帧型跟随总线；要知道
-     某条总线是什么模式，读 `canN_is_fd()`，改设置用 `configure_canN(hcs::CanSetting)`。
-2. **速率一致性比分频器整数，不比波特率。** `effective_baudrate()` 由实际写进去的分频器
-   反推，115200 读回 114942，921600 读回 909090；主机不知道板端内核时钟，无法复算。
-   所以判据是 `kGetUartConfig` 回报的 `divisor`/`oversample`（SET 时回显即断言），
-   百分比只作宽松兜底（10%，抓离谱值，板端写入前检查）。来龙去脉见
-   [UART_EP0_MIGRATION.md](../../UART_EP0_MIGRATION.md) 第 2 节。
-4. **一次 SET 就是全部：ACK = 已生效，STALL = 拒绝。** 主机成功路径不回读——板端先全量
-   校验再写，写后自己回读（UART 分频器与帧格式、CAN 帧型与仲裁段时序），不符即 STALL
-   `kConfigErrorVerifyFailed`。只有 STALL 时主机才读一次 `0x48` 取原因。所以**每条 SET 的
-   STALL 路径都必须先记锁存**：锁存是粘滞的，漏记会让主机把更早那次的原因当成本次原因。
-   构造期实测：`0x40` 握手 + 每路一个 SET，无任何读 `[实测 2026-09-30，UART_EP0_MIGRATION.md 3.6]`。
-3. **EP0 通道不受 session 门控。** 主机在板对象构造期就下发，那时 keepalive 线程还
-   没开出 session；session 掉线后回读也必须继续可用。
+## 8. DMTool 兼容（HPM5321，代码在 `app/src/dmtool/`，协议见 `DMTOOL_PROTOCOL.md`）
 
-**没做 EP0 握手的主机开不了 session。** 板端记住"这个主机读过我的接口描述符没有"
-（`kGetInterface` 即握手），没读过就不应答 `kStart`，主机在自己的 ack 超时后约 1 秒抛
-`Timed out waiting for SESSION_ACK`。它挡的是**旧版 SDK 连新固件**；正常路径下版本串
-校验已经把旧 SDK 挡住了，所以门控只在 `dangerously_skip_version_checks=true` 时才真正
-生效——而仓库自己的全部测量工具都开着它，正是最容易混用镜像的那一群。落地时的坑
-（握手时序、旧主机蹭握手）见 [PITFALLS.md](PITFALLS.md) 第 5 节。
-
-**`kSession` 不搬 EP0**，三条理由，按硬度排：
-
-1. **keepalive 要证明的是数据管道活着。** EP0 健康不等于 bulk 健康——本板出现过 bulk OUT
-   在总线复位后没重新 arm、发得出收不到、而 EP0 一路正常应答的故障。
-2. **控制传输是带外的，没有定序。** 现在"session 关了"和"这一帧数据"的先后由字节流免费
-   保证；搬走之后要么接受竞态，要么自己补一套 quiesce/drain。
-3. **同步控制传输把掉线检测拖慢。** bulk + 条件变量超时 200 ms；EP0 路超时 1000 ms，
-   且会占住 keepalive 线程。
-
-**延迟拆解埋点恒开**（`libhcs_LATENCY_PROBE` 开关 2026-09-05 已删除）：`diag/latency.hpp`
-的四个时间戳实测至多 0.5% 包率（`USB_OPTIMIZATION_LOG.md` 第 11 节），落在够不到的余量
-上，而替代方案 `-Dlibhcs_CAN_DIAG=ON` 会污染 `kUart0` 上行流（见
-[PITFALLS.md](PITFALLS.md) 第 8 节）。EP0 并发请求对 bulk 包率免费到 kHz 量级
-（`USB_OPTIMIZATION_LOG.md` 第 11 节）。
-
-## USB 现行约束（机制与全部数据见 [USB_OPTIMIZATION_LOG.md](USB_OPTIMIZATION_LOG.md)）
-
-- **下行不背压**（2026-09-14 起）：`CFG_TUD_VENDOR_RX_MANUAL_XFER` 不再设置，取 TinyUSB
-  默认 0，类驱动在接收回调返回后自行重挂 bulk OUT 端点。下行是周期性控制命令，背压会把
-  旧命令憋在主机与板上队列里、过载缓解后按序补发，且 NAK 作用于整个端点，连带卡住 UART
-  下行与会话保活；过载时改为 CAN 软件发送队列（64 深）满即丢帧 + LED。**原背压代码
-  （手动重挂、48/64 迟滞水位、20 ms 逃生阀、端点审计钩子）已删除，不要加回**；要加回
-  先重做 `USB_OPTIMIZATION_LOG.md` 第 2 节的洪泛测量和 HCS `HcsLinkProbe` 的 `burst`
-  过载对照。`[实测 2026-09-14，三板 hcs_link：正常工况无退化；5321 以 30 帧/拍过载时
-  新旧固件丢帧同为约 32%，出队帧年龄 p50 4.31 ms 对旧版 4.65 ms]`
-- **主循环里 CAN 要排在 bulk 前面。** 一趟主循环内的调用顺序是板端唯一的优先级机制：
-  92 kB/s 下 CAN 优先 p99 123.7，bulk 优先 128.4。
-- **UART 会顶掉 CAN 的尾部延迟**（head-of-line blocking，p99 +40us 量级）：分端点方案
-  已于 2026-09-05 拆除，此代价当前无条件存在。机制、定价与还剩的杠杆见
-  `USB_OPTIMIZATION_LOG.md` 第 12-13 节。
-- **调不动的旋钮别再 A/B**（全部实测否掉，见 `USB_OPTIMIZATION_LOG.md` 第 3 节）：
-  `CFG_TUD_TASK_EVENTS_PER_RUN`（惰性）、host transfer 池深度（无关）、multi-qTD
-  （turnaround 不在关键路径；`libhcs_COPY_THEN_ARM` 开关已删，恒为"处理完再 arm"）、
-  xHCI IMOD（非瓶颈）。
-- **不要把 TinyUSB 热路径放进 ILM**：`TU_ATTR_FAST_FUNC` 加在 `tud_task_ext` 一类
-  "入口在热路径、被调方散落在 flash"的函数上是净倒退（包率 +0.11%、主循环 −4.0%）。
-  `.fast` 只适合叶子函数或自成闭环的调用子图。机制见 `USB_OPTIMIZATION_LOG.md` 3.2。
-- **每帧热路径不许碰 flash（2026-09-21 起，链接期强制）**：每帧真正执行的代码与只读表——libc 块移动
-  （`memcpy`/`memmove`/`memset`）、4 个 MCAN 叶子函数、自有 4 个收发回调（`tud_vendor_rx_cb`、
-  `can_deserialized_callback`、`uplink_usb.cpp` 两个）、protocol rodata 与 `CSWTCH` 查找表——必须留在 ILM。
-  新增每帧调用要在 `boards/hpm5321/linker/app_flash_uf2.ld` 同步补规则，链接期 `ASSERT` 失配即链接失败。
-  背景：违规时 RTT 由整个镜像的布局决定，任何无关改动都能让 RTT 漂移几 µs；现象、数据与检查方法见
-  `USB_OPTIMIZATION_LOG.md` 第 14 节。
-
-同批落在共享 `firmware/c_board/bsp/tinyusb` 里的改动（**动它之前先读**）：
-
-| 改动 | 位置 | 结论 |
-|---|---|---|
-| 恢复 ChipIdea SETUP tripwire（SUTW 信号量重试环） | `dcd_ci_hs.c` | **保留**，正确性回归修复（见下） |
-| `CFG_TUD_MEM_DCACHE_ENABLE=0` 时把 `dcd_dcache_*` 编译掉 | `dcd.h` / `usbd.c` | 保留，与下一项合计 +1.24% 包率 |
-| ISR 端点扫描改为只遍历 `ENDPTCOMPLETE` 的置位 | `dcd_ci_hs.c` | 保留，同上（两者缺一都更差） |
-| ~~USB 热路径加 `TU_ATTR_FAST_FUNC` 进 ILM~~ | — | **已撤销**：包率 +0.11%，主循环 −4.0% |
-| 跳过无 sof 驱动的 SOF 遍历（`_usbd_has_sof_driver`） | `usbd.c` | 保留：TIME_SYNC 构建每 125 us 省一次 3 驱动空指针迭代 |
-| CLEAR_FEATURE(HALT) toggle 复位按主机类型门控（MS OS 2.0 探测，6.4 方案②） | `usbd.c` / `usbd.h` | 保留：健康端点的 clear_halt 不再无条件复位设备侧 toggle；Windows 经取 MS OS 2.0 集识别，语义不变 |
-
-tripwire 那项是**真回归修复，不是上游老毛病**：HPM SDK 自带的 `dcd_hpm.c` 实现了
-`set_sutw`/`get_sutw` 重试环，而 0.21 通用的 `dcd_ci_hs.c` 清完 `ENDPTSETUPSTAT` 就直接
-把 qhd 指针交出去——`USBCMD_SETUP_TRIPWIRE`（`ci_hs_type.h`，HPM 上是 `USBCMD` bit 13
-[RM]）在该文件里定义了却没人用。删掉它，背靠背 SETUP 会让 usbd 拿到撕裂的 8 字节。
-
-## DMTool 兼容（HPM5321 应用）
-
-HPM5321 应用同时是一块达妙 USB2FDCAN 适配器：HCS 不跑时可以直接用 DMTool 2.1.6.7 打开
-本板收发 CAN、看时间戳、经 CDC 串口读写板上 UART。协议、实现取舍、对 libhcs 的逐指令核对
-见 [DMTOOL_PROTOCOL.md](DMTOOL_PROTOCOL.md)。代码在 `app/src/dmtool/`。
-
-- **USB 身份**：应用枚举为 `0x34B7:0x6877`（DMTool 只认它编译进去的 VID:PID 表）；libhcs
-  主机靠产品串 `HCS Agent v<版本>` 认板，两块 PCB 靠 EP0 `can_count` 区分。DFU bootloader
-  不变，仍是 `0xA511:0x5321/0x5322`。常量只有一份：
-  `core/include/libhcs/protocol/usb_identity.hpp`，主机与固件共用。
-- **端点**：接口 0-2、端点 `0x01-0x03` / `0x81-0x83` 归 DMTool（写死在其二进制里）；libhcs
-  管道在接口 3、`0x04` / `0x84`；CDC 在接口 4-5；DFU runtime 在接口 6。
-- **libhcs 优先，握手后 DMTool 零开销**：libhcs 会话一建立，DMTool 采集与 CDC 桥全部
-  关闭、队列清空，**DMTool 的 6 个端点全部 STALL**（`dmtool::on_libhcs_session()`）——
-  否则主机上开着的 DMTool 会让主机控制器持续 NAK 轮询，libhcs RTT 实测右移约 7 µs。会话
-  结束（租约 4 s 到期）时自动解除（`on_libhcs_session_end()`）。两者按约定不同时用：
-  HCS 接管时开着的 DMTool 会报 USB 故障，退出后重新打开。详见
-  [DMTOOL_PROTOCOL.md](DMTOOL_PROTOCOL.md) 第 4 节与 6.4。
-- **热路径不为 DMTool 付代价**：CAN / UART RX ISR 的 libhcs 分支必须与没有 DMTool 时逐条
-  相同，无会话分支只许调用 FLASH 里的冷函数。改 `can.cpp`、`uart.hpp`、`vendor.cpp`、
-  `app.cpp` 里的接入点后，对照同版本号的旧镜像比一遍反汇编（方法与基线见
-  DMTOOL_PROTOCOL.md 第 5 节）。
-- **只转发**：设备端重复发送与自增、自测、适配器自身的固件升级（IAP，命令 0x02/0x03）、
-  写 SN 一律回失败。**但总线参数是 DMTool 说了算**：SETUP_BUARD 按命令重配控制器并切换
-  FD/经典（与 `kSetCanConfig` 的立场不同——那是 libhcs 通道），保存配置（0x10）写 flash，
-  会话首条命令自动套用"保存值或 1M/5M 预设"。帧型按请求逐帧走（端口模式是上限），
-  DMTool 会话期间开自动重传；两者都只影响仿真路径，libhcs 会话建立时
-  `restore_default_timing()` 全部还原。
-- **CDC 串口**：主机设的线路编码（波特率/字长/校验/停止位）会真下发到板上 UART（仅无
-  libhcs 会话时），桥在 DTR + 速率匹配时接通；DMTool 走串口的电机固件升级因此是通的。
-- **udev**：`a511` 规则管不到新身份，需另加（同时让 ModemManager 不探测 CDC 口）：
+- 本板同时是一块达妙 USB2FDCAN：接口 0-2 / 端点 `0x01-0x03`、`0x81-0x83` 归 DMTool（写死在其二进制里），
+  libhcs 在接口 3（`0x04`/`0x84`），CDC 在接口 4-5，DFU runtime 在接口 6。
+- **libhcs 优先，唯一入口是清单声明**：交接步骤是 `usb/vendor.hpp` 的 `BoardOwnership`
+  （`dmtool::Handoff` → `PortHandoff` → `sync::TimeSyncHandoff`），交还时倒序。交接是冷路径，留在 `vendor.cpp`。
+- 接手后 DMTool 的 6 个端点与 CDC bulk IN、通知端点**关使能位不应答**（`Adapter::isolate()`）：
+  不要改成 STALL；**CDC bulk OUT 不要关**；会话结束时 CDC bulk IN 的 halt 留给主机清；交还时按主机最近一次
+  的线路编码重写 UART（`Adapter::release()`）。（`DMTOOL_PROTOCOL.md` 第 4 节、5.1、6.4）
+- **CDC 桥不看 DTR**：DMTool 从不调 `setDataTerminalReady`（2.1.9.3 / 2.1.9.4 导入表核对），Windows 上
+  没人拉 DTR。桥在主机线路编码与 UART 实际速率一致、且板子不归 libhcs 时接通。LED 只在桥上最近 1 s
+  真有字节时才算会话（`dmtool::session_established(tick)`）：Linux 的 cdc_acm 枚举时就发
+  SET_LINE_CODING，只看桥会让闲置的板常亮绿。
+- **热路径不为 DMTool 付代价**：CAN / UART RX ISR 的 libhcs 分支与没有 DMTool 时逐条相同；改接入点后
+  对照旧镜像比反汇编（`DMTOOL_PROTOCOL.md` 第 5 节）。
+- 只转发：重复发送、自测、IAP、写 SN 一律回失败；总线参数由 DMTool 说了算（只影响仿真路径）。
+- udev（同时让 ModemManager 不探测 CDC）：
 
   ```text
-  SUBSYSTEM=="usb", ATTR{idVendor}=="34b7", ATTR{idProduct}=="6877", MODE="0666", TAG+="uaccess"
-  SUBSYSTEM=="tty", ATTRS{idVendor}=="34b7", ATTRS{idProduct}=="6877", ENV{ID_MM_DEVICE_IGNORE}="1"
+  SUBSYSTEM=="usb", ATTR{idVendor}=="34b7", MODE="0666", TAG+="uaccess"
+  SUBSYSTEM=="tty", ATTRS{idVendor}=="34b7", ENV{ID_MM_DEVICE_IGNORE}="1", MODE="0666"
   ```
 
-## 主机侧板类：一块芯片一个类 [2026-09-05]
+## 9. CAN 帧时间戳与共享时间基准（机制与实测见 `SOF_TIMEBASE.md` 第 8 节）
 
-`host/include/libhcs/board/hpm5321.hpp` 里的 `Hpm5321` **同时服务两块 PCB**（单 CAN 与
-双 CAN，应用的 USB 身份相同，见「DMTool 兼容」），**类名不编码总线数**——它是运行期
-事实，来自 EP0 `kGetInterface` 的 `can_count`（与固件读 OTP 第 25 字判板型是同一个事实
-来源）。
-三条实现约定：
+- **时间基准是声明，不是编译开关**（v14）：主机 `hcs::Configuration::enable_time_sync()`，本板在
+  `board_caps` 报 `kBoardCapTimeSync`。开着时每个收到的 CAN 帧带 3 字节 `SofStamp`；关着时 SOF 中断不开，
+  USB / CAN 中断只多读一次 `sync::time_sync_on()`（DLM）。`libhcs_TIME_SYNC` 已删，不要加回。
+- PTPC0 的输入捕获被占用（TRGM `USB0_SOF` → `MCAN_PTPC0_CAP`，双沿）：不要另作他用，CAN TSU 不换时基。
+- 捕获接通不在 boot 路径：`sof_capture::start()` 只由 `sync::time_sync_start()`（清单应用时）调（`PITFALLS.md` 第 8 节）。
+- 帧只用它附近的 SOF 锁存值定位，**不要改回长窗口拟合**（游走，8.7.8）；`note_sof()` 的两道归属检查不要删。
+- `stamp_of()` 在 `.fast`，环模板由链接脚本按名收进 ILM；改 `sof_capture_ring.hpp` 后看反汇编，只许 32 位 `divu`。
 
-1. **描述符表现在是"镜像的容量"，不是"某块板的配置"**。`spec::hpm5321`
-   固定两条，真实条数读 `interface().can_count`。
-2. **越界在运行期拦，不在编译期**。`can_transmit()` 用 `interface().can_count` 兜底，
-   在单 CAN 板上发 CAN2 会抛出并指明这块板只有 CAN1。
-3. **一个设备可以有多个 PID**。`DeviceScanner::select_device` / `create_transport` /
-   `Handler` 收 `std::span<const uint16_t>`；单 PID 的板走保留的便利重载。
+## 10. 主机侧板类
 
-来龙去脉见 [PITFALLS.md](PITFALLS.md) 第 7 节。
+`Hpm5321` 同时服务单 CAN 与双 CAN 两块 PCB：spec 口表是镜像容量，实有哪些口读 `kGetPortList`；接线表用了
+板上没有的口在构造时抛；一个设备可有多个 PID（`std::span<const uint16_t>`）。（`PITFALLS.md` 第 7 节）
 
-## 硬件中断与数据路径归属（6E8Y / 5321 共用同一份 app 代码）
+## 11. 中断与诊断
 
-**延迟相关的事件全部是中断驱动的，没有该用中断却在轮询的地方。**
-
-| 事件 | 上下文 | 优先级 | 备注 |
-|---|---|---|---|
-| CAN RX（MCAN0..3） | **ISR** | 3（最高） | 进 ISR 就排空 FIFO + 序列化，不甩给主循环 |
-| USB（USB0） | **ISR** | 2 | `dcd_int_handler` 在 ISR 里处理硬件；TinyUSB 的回调（`tud_vendor_rx_cb`）按其设计延到主循环的 `tud_task()`——**代价 < 0.85us，见下** |
-| UART RX/TX | **ISR** | 1 | |
-| 1 kHz tick | **ISR**（MTIP） | 绕过 PLIC | 故意只做一个计数器自增，LED 等工作甩到主循环，避免抢占 CAN ISR |
-| 跨核上行门铃 | **ISR**（MBX0B） | 低于 PDI | 核对调布局 |
-| 跨核 flash RPC | **ISR**（MBX1A） | — | 不依赖主循环，见 `xcore/flash_server.hpp` |
-| ESC PDI（core1） | **ISR** | 4 | |
-| CAN TX 完成 | **不启用中断** | — | 发完无事可做，启用只是白加中断 |
-| DMA | **数据路径未用** | — | `dma_mgr_init()` 调了但没接数据面；MCAN 确实是 DMAMUX 源（`HPM_DMA_SRC_MCAN0..5`） |
-
-主循环周期实测 0.72us（空闲）/ 0.85us（满载），"等下一趟主循环"最多值 0.85us；对照
-RTT p50 124.8us，板端整条路径不到 3%。完整论证与"哪些板端优化因此不值得做"见
-[../../HOST_TUNING.md](../../HOST_TUNING.md) 第 8 节。
-
-## 板上没有调试器时怎么看现场
-
-本板的调试口（FT2232：串口 + JTAG）**在实际使用的板子上只留了通孔焊盘，没有插座，
-不是对外接口**——它是调试预留，不要当数据/日志通道用（详见
-[boards/hpm6e8y/README.md](boards/hpm6e8y/README.md)「串口：只有调试通孔，不是接口」）。
-调试与烧录探针**只用 J-Link**，不使用 OpenOCD（见 [ENV.md](../../ENV.md)「宿主机调试
-工具」）。带内诊断通道已入库，都走 USB vendor 端点、
-编成 UART0 上行帧：
-
-| 想看什么 | 固件开关 | 主机工具 |
-|---|---|---|
-| CAN 转发是否在走：ISR 进入计数、MCAN `IR`/`RXF0S`/`PSR`/`ECR`、PLIC pending/enable/trigger | `-Dlibhcs_CAN_DIAG=ON` | `host/examples/can_stall_probe.cpp`（边压测边解码，转发停摆时打印前后快照） |
-| 主循环周期（板端 CPU 余量的直接读数） | `-Dlibhcs_CAN_DIAG=ON` | `host/examples/hpm5321_loop_probe.cpp` |
-| USB SOF 时间轴是否可信：相邻 FRINDEX 差值直方图、ISR 间隔、端口状态、跨板一致性 | `-Dlibhcs_SOF_DIAG=ON` | 主机解码工具 `sof_probe.cpp` 已于 2026-09-30 删除，需要时从 git `cf404b7` 取回（见 [SOF_TIMEBASE.md](SOF_TIMEBASE.md)） |
-| 跨板共享时间轴本身：各板状态、拟合出的晶振偏差、绝对微帧是否一致、到 Unix 时间的映射 | `-Dlibhcs_TIME_SYNC=ON` | `host/examples/time_sync_test.cpp`（主机侧还要 `AdvancedOptions::set_enable_time_sync(true)`） |
-| 跨板 skew 直接实测：两块板在同一微帧各发一个硬件脉冲，互相硬件捕获 | `-Dlibhcs_PULSE_TEST=ON`（**要和 `TIME_SYNC` 一起开**） | `host/examples/pulse_skew_test.cpp`（见 [SOF_TIMEBASE.md](SOF_TIMEBASE.md) 5.5 / 7.1） |
-
-> `can_stall_probe` **在 HPM5321 上跑不了**：它绑死 HPM6E8Y 的 PID `0x6E84`，并按
-> 单板自环驱动 CAN0->CAN1 与 CAN2->CAN3，假设四路总线。5321 只有两路，双板 rig 又是
-> 交叉对接而非自环。`hpm5321_loop_probe` 补的就是这个缺口——只解码遥测里的主循环
-> 计数，负载自带（两块板双向对发），因为压测工具会独占两块板，遥测读端再也开不进去。
-
-诊断开关的使用纪律（`CAN_DIAG`/`SOF_DIAG` 共占 `kUart0` 不得同开、`CAN_DIAG` 会让
-`dual_board_test uart` 必然 FAIL、A/B 前先对齐 CMakeCache、`PULSE_TEST` 借走 UART0
-引脚且外设初始化刻意推迟）见 [PITFALLS.md](PITFALLS.md) 第 8 节。
-
-## 构建
-```bash
-export PATH=~/3rd_party/hpm/bin:$PATH        # [前机路径] 确保 riscv32-unknown-elf-gcc 可见
-# USB 数据固件（超级构建，含 app + bootloader）
-cmake --preset debug -S firmware/hpm_board
-cmake --build firmware/hpm_board/build       # target: hpm_board_app / hpm_board_bootloader
-# 两块 HPM5321 板（单 CAN / 双 CAN-FD）共用 -DBOARD=hpm5321 这一个镜像，上电自己判板型
-cmake --preset release -S firmware/hpm_board -B <build> -DBOARD=hpm5321
-# 烧录：同一个 .dfu。应用在跑时先按 0x34b7:0x6877 detach, 再接 bootloader 的
-# 0xa511:0x5321（单 CAN）或 0x5322（双 CAN-FD）；已在 bootloader 里时只写后一段
-# dfu-util -d 0x34b7:0x6877,0xa511:* -a 0 -D <build>/app/output/hpm_board_app_hpm5321.dfu
-```
-- preset：`debug` / `debug-outside` / `release`（注意本板 `CMAKE_BUILD_TYPE` 用小写 `debug`/`release`）。
-- 构建需 Python 3 + `PyYAML`、`jinja2`（HPM SDK 代码生成用）。
-- 本机工具链的实际位置以根 `AGENTS.md`「开发机环境路径约定」/ `ENV.md` 为准。
-
-## 目录结构
-- `app/`、`bootloader/`：USB 固件两半。`app/src/xcore/`：core0 的跨核部分（环主机侧、
-  次核装载、flash RPC 服务端），默认单核构建下整体编译为空——见本文末「备注」。
-- `boards/`、`common/`：板级配置与共享代码。`bsp/hpm_sdk`：HPM SDK submodule（第三方，只读）。
-- 无 CubeMX，不适用 CubeMX 纪律。
-
-## 备注
-- 缺工具链的机器（如 build server）只能编 host SDK；固件需在装了 RISC-V 工具链的 PC 上编/烧。详见 `BUILD_ENVIRONMENT.md`。
-- **遗留**：`app/src/xcore/` 与 `libhcs_APP_RELEASE_CORE1` 是 EtherCAT-on-core1 的
-  残留，默认 OFF 时全部编译为空，不进镜像。EtherCAT 已于 2026-09-08 移出仓库
-  （归档 `~/Desktop/ethercat-archive-2026-09-08/`），这套开关待单独清理。
+- 延迟相关事件全部中断驱动：CAN RX 优先级 3（ISR 内排空 + 序列化）> USB 2 > UART 1；1 kHz tick（MTIP，绕过
+  PLIC）只自增计数，LED 等工作在主循环。CAN TX 完成中断不开。（`HOST_TUNING.md` 第 8 节）
+- 板上调试口只有通孔焊盘，不当数据/日志通道；探针只用 J-Link。
+- 带内诊断（都编成 UART0 上行帧）：`-Dlibhcs_CAN_DIAG=ON`（CAN 转发计数、主循环周期）、`-Dlibhcs_SOF_DIAG=ON`
+  （FRINDEX 直方图）、`-Dlibhcs_PULSE_TEST=ON`（跨板脉冲，借走 UART0）。`CAN_DIAG` 与 `SOF_DIAG` 不得同开，
+  A/B 前先对齐 CMakeCache（`PITFALLS.md` 第 8 节）。对应主机工具已随 `host/examples/` 删除。

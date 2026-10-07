@@ -4,7 +4,7 @@
 
 #include <main.h>
 
-#include "firmware/c_board/app/src/utility/interrupt_lock.hpp"
+#include "firmware/common/app/src/utility/interrupt_lock.hpp"
 
 namespace libhcs::core::utility {
 

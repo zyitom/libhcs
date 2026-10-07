@@ -21,7 +21,7 @@
 
 #include "core/include/libhcs/protocol/usb_identity.hpp"
 #include "core/src/utility/assert.hpp"
-#include "firmware/hpm_board/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 #include "firmware/hpm_board/common/board_identity.hpp"
 
 namespace libhcs::firmware::usb {
@@ -124,7 +124,7 @@ private:
 
     // 按 PCB 上报 PID: 单 CAN 板 0x6877、双 CAN 板 0x6632, 都在 DMTool 认的表里
     // (libhcs/protocol/usb_identity.hpp)。PID 让板型在打开设备之前就可见(lsusb、
-    // udev、dfu-util); 打开后 EP0 kGetInterface 的 can_count 报的是同一个事实。
+    // udev、dfu-util); 打开后 EP0 端口清单(kGetPortList)报的是同一个事实。
     // 单形态板子上是空操作: board::kOtpIdentityEnabled 为 false, 保留编译期值。
     //
     // 产品字符串刻意不随板变化: 主机对 "HCS Agent v<version>" 精确匹配。
@@ -202,9 +202,9 @@ private: // 设备描述符
     static constexpr tusb_desc_device_t kDeviceDescriptor = {
         .bLength = sizeof(tusb_desc_device_t),
         .bDescriptorType = TUSB_DESC_DEVICE,
-        .bcdUSB = 0x0210, // >= 0x0210: Windows 8.1+ reads BOS to discover the MS OS 2.0
-                          // WCID platform capability (see kBosDescriptor below). Other
-                          // hosts do not request BOS; behavior is otherwise unchanged.
+        .bcdUSB = 0x0210, // >= 0x0210: Windows 8.1+ 才会读 BOS 来发现 MS OS 2.0 WCID
+                          // 平台能力(见下面的 kBosDescriptor)。其他主机不请求 BOS;
+                          // 其余行为不变。
 
         .bDeviceClass = TUSB_CLASS_UNSPECIFIED,
         .bDeviceSubClass = 0x00,
@@ -431,12 +431,12 @@ public: // Windows WCID (MS OS 2.0): 免驱 WinUSB 绑定
             uint16_t set_end;                         // 走完全部层后的游标, 应等于集合总长
             uint16_t config_span;                     // 配置子集实际跨度, 应等于总长 - 集头 10
         };
-        std::size_t q = rd16(0);                      // set header wLength = 10
-        const uint16_t config_declared = rd16(q + 6); // config subset wTotalLength
-        q += 8;                                       // configuration subset header
+        std::size_t q = rd16(0);                      // 集合头的 wLength = 10
+        const uint16_t config_declared = rd16(q + 6); // 配置子集的 wTotalLength
+        q += 8;                                       // 配置子集头
         const std::size_t config_start = q;
         for (std::size_t i = 0; i < 5; ++i)
-            q += rd16(q + 6); // function subset wSubsetLength (header offset 6)
+            q += rd16(q + 6); // 功能子集的 wSubsetLength(头部偏移 6)
         return Result{
             .set_end = static_cast<uint16_t>(q + ((q - 10 == config_declared) ? 0 : 1)),
             .config_span = static_cast<uint16_t>(q - config_start + 8)};

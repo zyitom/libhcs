@@ -10,7 +10,12 @@
 namespace libhcs::firmware::flash {
 
 inline constexpr uint32_t kSramStartAddress = 0x20000000U;
-inline constexpr uint32_t kSramEndAddress = 0x20020000U;                 // Exclusive
+inline constexpr uint32_t kSramEndAddress = 0x20020000U; // Exclusive
+// The app keeps its stack at the top of CCM RAM, just below the boot mailbox
+// (STM32F407XX_APP.ld: _estack = 0x1000FFC0); no DMA reaches CCM, so nothing can
+// race the stack there. An initial MSP in CCM is as valid as one in SRAM.
+inline constexpr uint32_t kCcmStartAddress = 0x10000000U;
+inline constexpr uint32_t kCcmEndAddress = 0x10010000U;                  // Exclusive
 inline constexpr uint32_t kImageHashMagic = 0x48415348U;                 // "HASH"
 inline constexpr uint32_t kImageHashSuffixSize =
     sizeof(uint32_t) + static_cast<uint32_t>(crypto::kSha256DigestSize); // 36
@@ -20,10 +25,12 @@ inline bool is_vector_table_valid() {
     const uint32_t reset_handler =
         *reinterpret_cast<volatile const uint32_t*>(kAppStartAddress + 4U);
 
-    // Initial MSP from vector table is allowed to be exactly SRAM end.
+    // Initial MSP from vector table is allowed to be exactly the end of its RAM.
     // Cortex-M uses a descending stack, so reset code commonly sets SP to
     // one-past-the-last valid RAM address.
-    if (initial_msp < kSramStartAddress || initial_msp > kSramEndAddress)
+    const bool in_sram = initial_msp >= kSramStartAddress && initial_msp <= kSramEndAddress;
+    const bool in_ccm = initial_msp >= kCcmStartAddress && initial_msp <= kCcmEndAddress;
+    if (!in_sram && !in_ccm)
         return false;
 
     if ((initial_msp & 0x7U) != 0U)

@@ -8,8 +8,7 @@
 ## 摘要
 
 本文记录全仓库构建依赖、宿主机调试工具，以及**当前机器实际已安装工具的唯一权威清单**
-（见下方「本机实际安装状态」）。`ch32_board` 的正式构建要求独立的
-MounRiver WCH GCC15，当前机器和 `libhcs-ci` 镜像均已安装。
+（见下方「本机实际安装状态」）。
 
 > **本文不含任何内核调优。** 跑起来之后的主机侧设置——CPU governor、C-state / PM QoS、
 > USB autosuspend、`isolcpus`/`nohz_full`、xHCI 中断优先级、IOMMU、网卡参数——
@@ -24,22 +23,20 @@ MounRiver WCH GCC15，当前机器和 `libhcs-ci` 镜像均已安装。
 | [本机实际安装状态](#本机实际安装状态) | 当前机器已装工具与位置（**机器状态的唯一权威**） |
 | [版本要求](#版本要求) | 编译器、构建工具和基础依赖 |
 | [Docker 构建环境](#docker-构建环境) | CI / Dev Container 的工具链和职责边界 |
-| [宿主机调试工具](#宿主机调试工具可选不进-docker) | J-Link、Ozone 与 WCH-LinkE 的安装边界 |
+| [宿主机调试工具](#宿主机调试工具可选不进-docker) | J-Link 与 Ozone 的安装边界 |
 | [LLVM 20](#llvm-20clangd--clang-format--clang-tidy) | 本机与 CI 共用的编辑器、格式和静态分析工具 |
-| [构建命令](#构建命令) | host SDK 与 CH32 的常用命令 |
+| [构建命令](#构建命令) | host SDK 的常用命令 |
 
 ## 本机实际安装状态
 
 **机器相关状态只在这一节维护**，其他文档（根 `AGENTS.md`、各板文档）一律引用这里，
-不要复制。下表 2026-09-11 逐条 `ls` 复核；2026-09-12 复核了 ARM / HPM / WCH 三行
-（WCH 本机缺失，`ch32_board` 未能本机编译验证）。
+不要复制。下表 2026-09-11 逐条 `ls` 复核；2026-09-12 复核了 ARM / HPM 两行。
 
 | 工具 | 本机位置 | 状态 |
 |---|---|---|
 | ARM GCC 15.3.rel1 | `~/3rd_party/arm-gnu-toolchain-15.3.rel1-x86_64-arm-none-eabi`（不在 PATH，要手工加，见下方） | 已装 |
 | RISC-V GCC（HPM）13.2.0 | `~/3rd_party/rv32imac_zicsr_zifencei_multilib_b_ext-linux`（含 `bin/` 的工具链根，`GNURISCV_TOOLCHAIN_PATH` 指向它；注意在 `~/3rd_party/` 顶层，不在 `hpm/` 子目录） | 已装 |
 | HPM OpenOCD | 未找到（`~/3rd_party/hpm/` 下现只有 `HPMicro_Manufacturing_Tool_v0.6.0`）；如需重装见下方 HPM 一节 | **未装**（hpm 调试统一 J-Link，本仓库流程不使用） |
-| RISC-V GCC（WCH）15.2.0 | `~/3rd_party/MRS_Toolchain_Linux_X64_V240/Toolchain/RISC-V Embedded GCC15`；同包 `OpenOCD/OpenOCD` 是 WCH OpenOCD | **未装**，`ch32_board` 本机不可编 |
 | SEGGER | `/opt/SEGGER/JLink`（→ `JLink_V948`）、`/opt/SEGGER/Ozone_V340j` | 已装（J-Link V9.48 / Ozone V3.40j） |
 | LLVM 20 | 仅 `/usr/bin/clangd-20`（未建 `clangd` 软链）；`clang-format-20` / `clang-tidy-20` 未装 | 部分安装。lint 门禁在 Docker/CI 内执行；本机只有 VS Code cpptools 扩展附带的 clang-format 23.1 可做相对检查 |
 | 其他 | `~/3rd_party/Xuantie-900-*`（T-Head GCC）、`~/3rd_party/soem-1.4.0`（EtherCAT 归档遗留）、`nvtop` | 与仓库固件流程无关 |
@@ -56,7 +53,6 @@ MounRiver WCH GCC15，当前机器和 `libhcs-ci` 镜像均已安装。
 | GCC (x86) | **≥ 14** | 见下方 |
 | ARM GCC | **15.3.rel1** | `arm-none-eabi-gcc`，c_board / mc02，见下方 |
 | RISC-V GCC (HPM) | 13.2.0 | hpm_board，见下方 |
-| RISC-V GCC (WCH) | 15.2.0 | ch32_board，MounRiver，见下方 |
 | clangd / clang-format / clang-tidy | **20.x** | Ubuntu 24.04 官方 apt 源，见下方 |
 | libusb-1.0-dev | ≥ 1.0 | `sudo apt install libusb-1.0-0-dev` |
 | dfu-util | ≥ 0.9 | `sudo apt install dfu-util` |
@@ -83,8 +79,6 @@ export PATH="$HOME/3rd_party/arm-gnu-toolchain-15.3.rel1-x86_64-arm-none-eabi/bi
 
 ## RISC-V GCC
 
-两块板用两套工具链，**非常不建议混用**。
-
 ### hpm_board（HPM6E8Y / HPM5321）
 
 ```bash
@@ -96,27 +90,15 @@ export GNURISCV_TOOLCHAIN_PATH=~/3rd_party/hpm
 
 详见 `firmware/hpm_board/BUILD_ENVIRONMENT.md`。
 
-### ch32_board（WCH CH32H417）
-
-从 MounRiver 下载 WCH 工具链：<https://www.mounriver.com/download>
-
-详见 `firmware/ch32_board/AGENTS.md`。
-
 ## Docker 构建环境
 
 `zyi024424/libhcs-ci:latest` 是 GitHub Actions 和 Release 共用的 `linux/amd64` 构建
-环境，包含三套互相隔离的交叉工具链：
+环境，包含两套互相隔离的交叉工具链：
 
 | 目标 | 容器路径 | 编译器 |
 |---|---|---|
 | STM32 `c_board` / `mc02` | `/opt/arm-none-eabi` | ARM GNU 15.3.rel1 |
 | HPM `hpm_board` | `/opt/riscv32-none-elf` | HPM GCC 13.2.0 |
-| WCH `ch32_board` | `/opt/wch-gcc15` | MounRiver GCC 15.2.0 |
-
-WCH 工具链来自 MounRiver V240 官方 Linux X64 归档。Docker 构建通过官方 API 获取临时
-签名地址，固定资源 ID `2030114123741700098`、归档大小 `411269512` 字节和 SHA-256
-`1fae593d27e24466f17c2df0fd00f746143f587fe33e912a78e35142fef82a6d`，并且只提取
-`Toolchain/RISC-V Embedded GCC15`。[官网与归档实测 2026-08-05]
 
 本地构建镜像：
 
@@ -125,7 +107,7 @@ docker buildx build --platform linux/amd64 --target ci \
   -t zyi024424/libhcs-ci:latest --load .
 ```
 
-当前 Docker 镜像、固件 Release 和 SDK Debian 包都只发布 amd64；不再构建 arm64 变体。
+当前 Docker 镜像与固件 Release 都只发布 amd64；不再构建 arm64 变体。SDK 以源码包发布，由使用方自己编，与架构无关。
 
 日常开发直接拉取 `zyi024424/libhcs-develop:latest` 并使用仓库的 Dev Container 配置；
 提交 `Dockerfile` 到 `main` 后，`Docker Image CI` 会自动重新构建并推送 `ci` / `develop`
@@ -135,9 +117,8 @@ docker buildx build --platform linux/amd64 --target ci \
 ### 编译与硬件调试边界
 
 - Docker 负责 CMake、编译、clang-format、已启用目标的 clang-tidy 和生成 ELF/HEX/DFU；
-  GitHub Runner 没有实体板卡，也只执行这些步骤。`ch32_board` 当前强制执行格式与完整编译，
-  但 clang-tidy 因 WCH 厂商宏在调用点产生大量误报而显式禁用，状态会打印在 CI 日志中。
-- Ozone、SEGGER J-Link Software、MounRiver WCH OpenOCD 和连接实体 USB 的 `dfu-util`
+  GitHub Runner 没有实体板卡，也只执行这些步骤。
+- Ozone、SEGGER J-Link Software 和连接实体 USB 的 `dfu-util`
   在宿主机运行。Dev Container 默认不映射 `/dev`，避免 Docker Desktop USB/IP 和特权
   容器成为日常开发依赖。
 - 镜像内仍安装 `dfu-util`，目的是构建时使用 `dfu-suffix` 生成 DFU 产物，不表示容器负责
@@ -149,7 +130,7 @@ docker buildx build --platform linux/amd64 --target ci \
 
 **探针分工是硬约束** `[用户确认 2026-09-12]`：`c_board` / `mc02` / `hpm_board` 的调试
 与需要调试器的烧录**只用 J-Link**——不要建议 ST-Link，也不要建议 OpenOCD（HPM SDK
-自带的 OpenOCD 流程本仓库不使用）；`ch32_board` 只用 WCH-Link(E)，见本节末尾。
+自带的 OpenOCD 流程本仓库不使用）。
 
 SEGGER 工具只安装在需要连接实体调试器的 Linux x86_64 开发机上：
 
@@ -190,13 +171,7 @@ J-Link **V9.48** / Ozone **V3.40j**（以 `/opt/SEGGER/` 实际目录为准，�
 
 安装后，`./tools/jlink-debug.sh` 提供命令行 J-Link GDB Server 流程，`./tools/ozone-debug.sh` 打开
 仓库中预设的 Ozone 工程；可用 `--list` 查看目标。它们用于 `c_board`、`mc02` 和
-`hpm_board`，**不用于 `ch32_board`**。
-
-CH32H417 的当前官方/已验证链路是 **WCH-LinkE + MounRiver WCH OpenOCD + WCH GDB**。
-[SEGGER 当前支持设备页](https://www.segger.com/supported-devices/jlink/)在 WCH 下只列出
-CH32F1 / CH32F2，没有 CH32H417；本机 J-Link V9.48 设备库也没有该芯片。因此现阶段不能
-用 J-Link/Ozone 替代 WCH-LinkE。[官网与本机实测 2026-08-05] MounRiver 的 SDI 配置、
-烧录命令和双核注意事项见 `firmware/ch32_board/AGENTS.md`。
+`hpm_board`。
 
 ## LLVM 20（clangd / clang-format / clang-tidy）
 
@@ -223,14 +198,6 @@ clang-tidy --version
 ```bash
 # host SDK
 cmake --preset linux-debug -S host && cmake --build host/build
-
-# ch32_board
-export WCH_TOOLCHAIN_PATH="$HOME/3rd_party/MRS_Toolchain_Linux_X64_V240/Toolchain/RISC-V Embedded GCC15"
-export WCH_TOOLCHAIN_PREFIX=riscv32-wch-elf-
-cmake --preset debug -S firmware/ch32_board && cmake --build firmware/ch32_board/build
 ```
-
-在 `libhcs-ci` / `libhcs-develop` 容器内无需手动导出上述两个 WCH 变量，镜像已经固定为
-`/opt/wch-gcc15` 和 `riscv32-wch-elf-`。
 
 > `RAM: 100.00%` 是正常的，不是溢出。判断是否撑爆看 FLASH。

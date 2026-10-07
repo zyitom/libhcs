@@ -87,9 +87,12 @@ SECTIONS
 
     /* Tripwire for the mangled-name rules above. InterruptSafeBuffer::allocate is
      * virtual, so every build type emits it out of line: if it is not in ITCM, the
-     * rules no longer match what the compiler emits. */
+     * rules no longer match what the compiler emits. The class became a template
+     * (batch alignment + alloc-fail hook as parameters, 2026-10-05); the exact
+     * mangled name carries the template arguments, the collection rule above keeps
+     * matching on the class-name prefix. */
     ASSERT(
-        _ZN6libhcs8firmware3usb19InterruptSafeBuffer8allocateEj < ORIGIN(ITCMRAM) + LENGTH(ITCMRAM),
+        _ZN6libhcs8firmware3usb19InterruptSafeBufferILj32ENS1_17UplinkAllocFailedEE8allocateEj < ORIGIN(ITCMRAM) + LENGTH(ITCMRAM),
         ".itcm name rules matched nothing: InterruptSafeBuffer::allocate is outside ITCM. Recheck the mangled prefixes there against arm-none-eabi-nm.")
 
     .text :

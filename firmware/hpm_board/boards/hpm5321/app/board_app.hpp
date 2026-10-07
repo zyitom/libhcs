@@ -13,6 +13,7 @@
 #include <hpm_soc_irq.h>
 #include <hpm_uart_regs.h>
 
+#include "core/include/libhcs/spec/hpm5321/ports.hpp"
 #include "firmware/hpm_board/app/src/can/can_port.hpp"
 #include "firmware/hpm_board/app/src/gpio/gpio_pin.hpp"
 #include "firmware/hpm_board/app/src/uart/uart_port.hpp"
@@ -48,7 +49,7 @@ constexpr size_t kCanPortCapacity = 2;
 //
 // 表项是上电默认帧型: 两种板型都默认 CAN-FD, 表对两块 PCB 相同, 单 CAN 板只是少
 // 使能一路。发送方向不逐帧选择 -- 帧类型跟随总线(见 core/src/protocol/protocol.hpp
-// 中已废弃的 IsFdCan 头部位)。主机可经 EP0 kSetCanConfig 把某路切成经典 2.0: 控制器
+// 中已废弃的 IsFdCan 头部位)。主机可经 EP0 清单声明把某路切成经典 2.0: 控制器
 // 重初始化并关 FD, 2.0 总线上硬件层面不出现 FD 位(代价是经典模式收不到 FD 帧, 实测
 // FD 对端 0/50、经典帧 50/50, 纯 2.0 总线上正合适)。单 CAN 板收发器在 5 Mbit 数据段
 // 的时序仍待上板确认, 见 README.md。
@@ -56,11 +57,11 @@ constexpr CanPort kCanPorts[] = {
     {.base = HPM_MCAN0_BASE,
      .irq_num = IRQn_MCAN0,
      .mode = CanMode::kCanFd,
-     .data_id = data::DataId::kCan1},
+     .data_id = spec::hpm5321::Spec::Cans::kCan1.data_id},
     {.base = HPM_MCAN3_BASE,
      .irq_num = IRQn_MCAN3,
      .mode = CanMode::kCanFd,
-     .data_id = data::DataId::kCan2},
+     .data_id = spec::hpm5321::Spec::Cans::kCan2.data_id},
 };
 static_assert(std::size(kCanPorts) == kCanPortCapacity);
 
@@ -94,15 +95,14 @@ constexpr clock_name_t kMchtmrClockName = clock_mchtmr0;
 // UART 端口按逻辑序。两种板型都只有一个数据 UART(UART2), 无 DBUS 接收器。
 constexpr UartPort kUartPorts[] = {
     {
-        .base = HPM_UART2_BASE,
-        .irq_num = IRQn_UART2,
-        .dma_src_tx = HPM_DMA_SRC_UART2_TX,
-        .dma_src_rx = HPM_DMA_SRC_UART2_RX,
-        .data_id = data::DataId::kUart0,
-        .config_data_id = data::DataId::kUart0Config,
-        .baudrate = 921600,
-        .parity = parity_none,
-    },
+     .base = HPM_UART2_BASE,
+     .irq_num = IRQn_UART2,
+     .dma_src_tx = HPM_DMA_SRC_UART2_TX,
+     .dma_src_rx = HPM_DMA_SRC_UART2_RX,
+     .data_id = spec::hpm5321::Spec::Uarts::kUart0.data_id,
+     .baudrate = 921600,
+     .parity = parity_none,
+     },
 };
 
 uint32_t init_uart(UART_Type* ptr);

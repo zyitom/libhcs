@@ -6,7 +6,7 @@
 #include <main.h>
 
 #include "core/src/utility/immovable.hpp"
-#include "firmware/mc02/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 
 // GPIO 输入上的消抖按键。
 //

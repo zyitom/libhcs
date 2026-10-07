@@ -46,15 +46,11 @@ endif()
 # serial console attached. OFF keeps the CAN hot path free of the counters.
 option(libhcs_APP_CAN_DIAG "Emit CAN forwarding telemetry on the UART0 uplink" OFF)
 
-# Shared cross-board time base (src/sync/timebase.*, src/sync/sof.*): the USB
-# microframe counter, its fit against the local machine timer, and the session
-# field's kTimeAnchor / kTimeStatus exchange. See SOF_TIMEBASE.md.
-#
-# OFF by default because enabling it arms the device controller's SOF interrupt,
-# which is 8000 additional interrupts per second on a board whose whole design
-# is organised around USB and CAN interrupt latency. Turn it on for the boards
-# that actually need a shared clock, and re-measure latency when you do.
-option(libhcs_APP_TIME_SYNC "Run the shared USB-SOF time base" OFF)
+# The shared cross-board time base (src/sync/timebase.*, src/sync/sof.*) is in
+# every image and is not a build option: the host asks for it in its EP0
+# manifest (kManifestFlagTimeSync), and only then does the board arm the
+# device controller's SOF interrupt -- 8000 interrupts per second that a board
+# whose host did not ask never pays. See SOF_TIMEBASE.md.
 
 # Cross-board skew measurement by hardware pulse exchange (src/sync/pulse.*).
 # Uses GPTMR0 channel 1's compare output and capture input, which on this board
@@ -130,9 +126,6 @@ endif()
 
 if(libhcs_APP_CAN_DIAG)
     sdk_compile_definitions(-Dlibhcs_APP_CAN_DIAG=1)
-endif()
-if(libhcs_APP_TIME_SYNC)
-    sdk_compile_definitions(-Dlibhcs_APP_TIME_SYNC=1)
 endif()
 if(libhcs_APP_PULSE_TEST)
     sdk_compile_definitions(-Dlibhcs_APP_PULSE_TEST=1)

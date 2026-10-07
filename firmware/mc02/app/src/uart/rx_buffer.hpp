@@ -13,11 +13,16 @@
 #include "core/src/protocol/constant.hpp"
 #include "core/src/protocol/protocol.hpp"
 #include "core/src/utility/assert.hpp"
+#include "firmware/mc02/app/src/sync/timebase.hpp"
 
 namespace libhcs::firmware::uart {
 
-// 2 的幂 ring 上的连续 DMA 接收。单个循环 DMA 传输覆盖整个 ring, 启动后从不
-// 停止或重启: USART_CR3_DMAR 在端口生命周期内保持置位, 由硬件自行回绕。
+// 2 的幂 ring 上的连续 DMA 接收。单个循环 DMA 传输覆盖整个 ring, 端口运行期间
+// 从不停止或重启: USART_CR3_DMAR 保持置位, 由硬件自行回绕。
+//
+// 流只在主机声明了这一路之后才存在 (start_rx(), 由 EP0 清单声明触发), 会话
+// 结束即停 (stop_rx())。未声明的端口不武装 DMA、不开 IDLE 中断: 悬空 RX 脚上的
+// 毛刺进不了 ring, 也不产生任何中断。
 // 写位置不经中断维护: NDTR 对整个 ring 倒计数并在回绕时重载, 消费者在
 // try_dequeue() 里直接从它推导位置。由此带来三点:
 //   - 接收服务的截止期从一个 bank (32 字节时间)放宽到一整圈
@@ -38,25 +43,40 @@ namespace libhcs::firmware::uart {
 // buffer_size 即 ring, 唯一要满足的约束是消费者必须在 DMA 绕完一圈前回来。
 // 默认值适合连续流的端口, 只跑短请求/响应事务的端口可以小得多; 所有 ring 都
 // 从 32 KB 区域里扣除, 两个 RS-485 口的取值见 uart.hpp 末尾。
+//
+// ring 不在本对象里(DmaMemory, 构造时传进来): DMA 够得着的内存是非缓存的 D2 SRAM,
+// 每次访问都是一次总线事务, 而主循环每圈都要读写的只是下面几个下标和计数。把它们
+// 和 ring 分开放, 状态才能进零等待的 DTCM(见 uart.hpp 末尾的对象定义)。
 template <typename T, size_t buffer_size = 2048>
 class RxBuffer {
     friend T;
 
 public:
     static constexpr size_t kBufferSize = buffer_size;
+
+    // DMA 写、主循环读的那段内存, 必须放在 DMA1/DMA2 够得着的非缓存区(.d2_sram)。
+    struct DmaMemory {
+        alignas(uint32_t) std::array<std::byte, kBufferSize> ring{};
+    };
     static constexpr size_t kBufferMask = kBufferSize - 1;
     static_assert((kBufferSize & (kBufferSize - 1)) == 0);
     using IndexType = uint16_t;
     static_assert(kBufferSize <= std::numeric_limits<IndexType>::max());
 
-    static constexpr size_t kMinFragmentSize = 32;
     static constexpr size_t kProtocolMaxPayloadSize =
         core::protocol::kProtocolBufferSize - sizeof(core::protocol::UartHeaderExtended);
-    static_assert(0 < kMinFragmentSize && kMinFragmentSize <= kProtocolMaxPayloadSize);
-    // 低于该值时 ring 连 try_dequeue() 转发非 idle 片段前需凑齐的字节都容不下,
-    // 只会停滞而无法攒批; sample_write_position() 的落后断言也设在半圈处,
-    // 需与其拉开明显距离。
-    static_assert(kMinFragmentSize * 4 <= kBufferSize);
+
+    // 线路没空闲、也没攒满一条记录时, 最早那个还没发的字节等满这么久就发。按时间而不是
+    // 按字节数: 旧的"攒够 32 字节"在 115200 的裁判系统上每段要等约 2.8 ms, 9600 的连续流
+    // 要 33 ms。250 us 在 921600 下约 23 字节一段, 与旧门槛的 USB 开销同量级。
+    //
+    static constexpr uint32_t kHoldMicroseconds = 250;
+    static constexpr uint32_t kHoldCycles =
+        kHoldMicroseconds * sync::timebase::kCyclesPerMicrosecond;
+    // ring 必须装得下这段等待里到达的字节, 再留一倍余量: 最快的口是 RS-485 的 4.8 Mbaud
+    // (8N1 每毫秒 480 B), ring 只有 256 B。
+    static constexpr size_t kMaxBytesPerHold = 480U * kHoldMicroseconds / 1000U;
+    static_assert(kMaxBytesPerHold * 2U <= kBufferSize);
 
     bool try_dequeue() {
         // 先读 idle 计数再采样写指针: IDLE 中断在线路转静的瞬间发布计数, 先读
@@ -81,18 +101,32 @@ public:
 
         const bool is_idle =
             (readable <= kProtocolMaxPayloadSize) ? (idle_count != consumed_idle_count_) : false;
-        if (is_idle)
+        if (is_idle) {
             consumed_idle_count_ = idle_count;
-        else if (readable < kMinFragmentSize)
-            return false;
+        } else if (readable < kProtocolMaxPayloadSize) {
+            // 线路还在动、没攒满一条记录: 等最早那个字节满 kHoldCycles。CYCCNT 是核内
+            // 寄存器(不经总线), 而且只在有字节在等的这几趟读。
+            if (readable == 0U)
+                return false;
+            const uint32_t now = DWT->CYCCNT;
+            if (!holding_) {
+                holding_ = true;
+                hold_start_ = now;
+                return false;
+            }
+            if (now - hold_start_ < kHoldCycles)
+                return false;
+        }
+        holding_ = false;
 
         const auto size = std::min(readable, kProtocolMaxPayloadSize);
         const auto offset = out & kBufferMask;
         const auto first_size = std::min(size, kBufferSize - offset);
         const auto second_size = size - first_size;
 
+        const auto* ring = dma_.ring.data();
         static_cast<T*>(this)->handle_uplink(
-            {ring_.data() + offset, first_size}, {ring_.data(), second_size}, is_idle);
+            {ring + offset, first_size}, {ring, second_size}, is_idle);
 
         out_ = static_cast<IndexType>(out + static_cast<IndexType>(size));
         return true;
@@ -104,12 +138,34 @@ private:
     // DMA 错误中断里无限空转。
     static constexpr uint32_t kReceiverAckPollLimit = 1024;
 
-    explicit RxBuffer(UART_HandleTypeDef* hal_uart_handle)
-        : hal_uart_handle_(hal_uart_handle) {
+    RxBuffer(UART_HandleTypeDef* hal_uart_handle, DmaMemory& dma)
+        : hal_uart_handle_(hal_uart_handle)
+        , rx_dma_stream_(static_cast<DMA_Stream_TypeDef*>(hal_uart_handle->hdmarx->Instance))
+        , dma_(dma) {
         enable_fifo_mode();
         configure_rx_error_policy();
         bind_rx_dma_callbacks();
+        // 流不在此启动, 见 start_rx()。
+    }
+
+    [[nodiscard]] bool rx_running() const { return rx_running_; }
+
+    // 武装接收流。只在主循环调用(EP0 处理器经 tud_task() 到达)。
+    void start_rx() {
+        if (rx_running_)
+            return;
+        bind_rx_dma_callbacks();
         start_rx_dma();
+        rx_running_ = true;
+    }
+
+    // 停掉接收流。只在主循环调用。标志先落: 之后才到的 DMA 错误中断见到它就直接
+    // 返回(rx_error_callback), 不会把刚停下的流又重启起来。
+    void stop_rx() {
+        if (!rx_running_)
+            return;
+        rx_running_ = false;
+        halt_rx_dma();
     }
 
     // 所有端口都打开 16 项 RX/TX FIFO, 由驱动而非 .ioc 决定。CubeMX 对四口的
@@ -118,7 +174,7 @@ private:
     // CR3), 差别仅此一位。放在驱动里的两个理由:
     //   - TxBuffer::try_dequeue() 依据 ISR.TC 而非 DMA 完成来计时 idle 窗口,
     //     其前提正是 TXFIFO 可在 DMA 报完成后仍压着 16 字节(921600 baud 下约
-    //     173 us, 与 300 us 窗口同量级); 该推理只在 FIFO 开启时成立。不变量与
+    //     173 us, 是两字符 idle 窗口的八倍); 该推理只在 FIFO 开启时成立。不变量与
     //     依赖它的代码放在一起, CubeMX 重新生成时才不会悄然失效。
     //   - configure_rx_error_policy() 置 CR3.OVRDIS, 溢出完全不上报, DMA 一旦
     //     晚到而丢字节将是静默的; 16 字节 FIFO 正是针对此的缓冲。
@@ -132,11 +188,13 @@ private:
     }
 
     // STM32H7 把 DMA_HandleTypeDef::Instance 声明为 void*(F4 为
-    // DMA_Stream_TypeDef*), 寄存器访问必须经此转换。UART 的 RX 流是 DMA1/DMA2
+    // DMA_Stream_TypeDef*), 寄存器访问必须经转换。UART 的 RX 流是 DMA1/DMA2
     // 流而非 BDMA: BDMA 只服务 D3 域, 本板所有 UART 都在 D2。
-    [[nodiscard]] DMA_Stream_TypeDef* rx_dma_stream() const {
-        return static_cast<DMA_Stream_TypeDef*>(hal_uart_handle_->hdmarx->Instance);
-    }
+    //
+    // 构造时取一次存下: 主循环每圈都要读这条流的 NDTR, 而 HAL 的两个句柄都在
+    // 非缓存的 AXI SRAM 里, 每圈顺着 huart -> hdmarx -> Instance 走一遍就是两次
+    // 总线读。流与端口的对应关系由 CubeMX 在 HAL_UART_MspInit() 里连好, 之后不变。
+    [[nodiscard]] DMA_Stream_TypeDef* rx_dma_stream() const { return rx_dma_stream_; }
 
     // 由流自身计数器取下个写入位置的 ring 偏移, 并补上偏移承载不了的圈数位。
     //
@@ -224,8 +282,7 @@ private:
         core::utility::assert_debug(hal_dma_handle != nullptr);
 
         // 传输完成不携带任何信息: 流自行回绕, 写位置由消费者读 NDTR 获得。
-        // HAL_DMA_Start_IT 仍会开这个中断, 但 HAL_DMA_IRQHandler 对回调逐个
-        // 判空, 只清标志而已。每圈一次(921600 baud 下 22 ms), 不值得压制。
+        // HAL_DMA_Start_IT 仍会开这个中断, start_rx_dma() 随即把它关掉(见那里)。
         hal_dma_handle->XferCpltCallback = nullptr;
         hal_dma_handle->XferM1CpltCallback = nullptr;
         hal_dma_handle->XferErrorCallback = &T::hal_rx_dma_error_callback;
@@ -248,13 +305,21 @@ private:
         out_ = 0;
         idle_count_.store(0, std::memory_order::relaxed);
         consumed_idle_count_ = 0;
+        holding_ = false;
 
         const auto source =
             static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&hal_uart_handle_->Instance->RDR));
-        const auto destination = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ring_.data()));
+        const auto destination =
+            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(dma_.ring.data()));
 
         core::utility::assert_always(
             HAL_DMA_Start_IT(hal_dma_handle, source, destination, kBufferSize) == HAL_OK);
+        // HAL_DMA_Start_IT 总会打开传输完成中断。回调是空的, 那个中断每绕一圈就从 FLASH
+        // 跑一遍 HAL_DMA_IRQHandler(600 余条指令)只为清个标志, 高速率下每口每秒几百次。
+        // 关掉它与半传输中断; 传输/FIFO/直接模式错误中断保留, 控制器故障仍经
+        // hal_rx_dma_error_callback 到 restart_rx_dma()。
+        // 中断使能位不在 EN=1 时写保护之列, 流运行中直接清。
+        rx_dma_stream()->CR &= ~(DMA_SxCR_TCIE | DMA_SxCR_HTIE);
 
         // 把端口伪装成进行中的循环 ReceiveToIdle, 使 HAL_UART_IRQHandler 在
         // IDLE 时走 DMA_CIRCULAR 分支: 事件经 HAL_UARTEx_RxEventCallback 上报,
@@ -314,10 +379,15 @@ private:
         // ErrorCode 时仍可能路由到这里。
         // 刻意不加 debug 断言: mc02 承载 DBUS 与可热插拔端口, 端口必须自行恢复
         // 而非困死 debug 构建。
+        //
+        // 已停的端口不恢复: 流本来就不该在跑。
+        if (!rx_running_)
+            return;
         restart_rx_dma();
     }
 
-    void restart_rx_dma() {
+    // 关 IDLE 中断、撤 DMA 请求、中止流。之后端口不再产生任何 RX 事件。
+    void halt_rx_dma() {
         auto* hal_dma_handle = hal_uart_handle_->hdmarx;
 
         ATOMIC_CLEAR_BIT(hal_uart_handle_->Instance->CR1, USART_CR1_IDLEIE);
@@ -326,6 +396,10 @@ private:
         if ((rx_dma_stream()->CR & DMA_SxCR_EN) != 0U) {
             core::utility::assert_always(HAL_DMA_Abort(hal_dma_handle) == HAL_OK);
         }
+    }
+
+    void restart_rx_dma() {
+        halt_rx_dma();
 
         // HAL 的阻塞错误路径会把 UART_DMAAbortOnError 装为流的 abort 回调;
         // 重新绑定, 防止之后的 HAL_DMA_Abort 绕过我们弹回 HAL 错误机制。
@@ -334,12 +408,12 @@ private:
     }
 
     UART_HandleTypeDef* hal_uart_handle_;
+    DMA_Stream_TypeDef* rx_dma_stream_;
 
-    // 随外层端口对象放置, uart.hpp 把它放进 .d2_sram(0x30000000 的 D2 SRAM),
-    // 与写它的 DMA1 流同域。app.cpp 经 MPU region 1 把该区间映射为
-    // non-cacheable, DMA 写无需维护缓存。不可像 can.hpp 那样挪进 .dtcm:
-    // DMA1/DMA2 够不到 DTCM, 流会静默地什么都传不了。
-    alignas(uint32_t) std::array<std::byte, kBufferSize> ring_{};
+    // ring 所在的内存。uart.hpp 把它放进 .d2_sram(0x30000000 的 D2 SRAM), 与写它的
+    // DMA1 流同域; app.cpp 经 MPU region 1 把该区间映射为 non-cacheable, DMA 写无需
+    // 维护缓存。它不能进 .dtcm: DMA1/DMA2 够不到 DTCM, 流会静默地什么都传不了。
+    DmaMemory& dma_;
 
     // 仅消费者使用。in_ 承载 NDTR 读出的 ring 偏移放不下的圈数位; 两者均由
     // start_rx_dma() 复位, 它也在 DMA 错误中断里运行, 重启即按设计丢弃消费者
@@ -351,6 +425,14 @@ private:
     // 论证见 try_dequeue()。
     std::atomic<uint16_t> idle_count_{0};
     uint16_t consumed_idle_count_{0};
+
+    // try_dequeue() 看到还没发的字节、正在等它们满 kHoldCycles; hold_start_ 是第一次看到
+    // 它们时的 CYCCNT。发出一段即清。
+    bool holding_{false};
+    uint32_t hold_start_{0};
+
+    // 流是否在跑。只在主循环写; DMA 错误中断只读, 单字节读写在 M7 上是原子的。
+    bool rx_running_{false};
 
     static_assert(std::atomic<uint16_t>::is_always_lock_free);
 };

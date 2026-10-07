@@ -46,6 +46,21 @@ jobs:
       - name: Build host
         run: cmake --build host/build
 
+      # --no-tests=error: an image without GoogleTest builds no tests (host/tests
+      # only warns), and that must fail here rather than pass with nothing run.
+      - name: Run host tests
+        run: ctest --test-dir host/build --output-on-failure --no-tests=error
+
+      # The SDK ships as a source zip that projects pull with FetchContent (README.md). Pack it
+      # the way a release does and build an outside project against it with nothing else.
+      - name: Build a project against the released SDK source
+        run: |
+          zip=$(.scripts/package_sdk_source "${RUNNER_TEMP}/sdk")
+          cmake -S host/tests/fetchcontent -B "${RUNNER_TEMP}/consumer" -G Ninja \
+            -DLIBHCS_SDK_ZIP="${zip}"
+          cmake --build "${RUNNER_TEMP}/consumer"
+          "${RUNNER_TEMP}/consumer/consumer"
+
       - name: Configure firmware/hpm_board
         run: cmake --preset debug -S firmware/hpm_board
 
@@ -63,12 +78,6 @@ jobs:
 
       - name: Build firmware/mc02
         run: cmake --build firmware/mc02/build --target mc02_app mc02_bootloader
-
-      - name: Configure firmware/ch32_board
-        run: cmake --preset debug -S firmware/ch32_board
-
-      - name: Build firmware/ch32_board
-        run: cmake --build firmware/ch32_board/build
 
       - name: Run clang-tidy check
         run: .scripts/clang-tidy-check

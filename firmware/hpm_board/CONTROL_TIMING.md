@@ -76,7 +76,7 @@ Kd 差 1 ppm，毫无意义。所以"时钟准不准"对 PID 几乎无关。
 |---|---|---|---|
 | 微帧 -> 机器定时器（`sync/timebase.cpp`） | 板子主循环 | 20 ms | 128 点 |
 | 微帧 -> GPTMR（`sync/pulse.cpp`） | 板子主循环 | 64 ms | 128 点 |
-| 微帧 -> 主机 steady_clock（`libhcs/time/timeline.cpp`） | 主机 | **250 ms**（跟 keepalive） | 256 点 |
+| 微帧 -> 主机 steady_clock（`host/src/time/usb_frame_axis.cpp`） | 主机 | **250 ms**（跟 keepalive） | 256 点 |
 
 **主机侧一秒 4 次最小二乘，几微秒**；x86 上真正的开销是 1 kHz 的 executor 和 libusb
 事件线程。拟合不是算力问题。
@@ -133,7 +133,7 @@ Kd 差 1 ppm，毫无意义。所以"时钟准不准"对 PID 几乎无关。
 
 | 数据 | 时间戳 |
 |---|---|
-| CAN 帧 | 有，`timestamp_us`（硬件 TSU） |
+| CAN 帧 | 有（主机在声明里要时间基准时；v14 前需 `libhcs_TIME_SYNC` 固件），`sof_stamp`：硬件 TSU 锁存的帧起始时刻，已在共享微帧轴上，见 [SOF_TIMEBASE.md](SOF_TIMEBASE.md) 第 8 节 |
 | GPIO | 有，`timestamp_quarter_us` |
 | **UART** | **没有**（`UartDataView` 只有 `uart_data` / `idle_delimited`） |
 
@@ -142,9 +142,12 @@ Kd 差 1 ppm，毫无意义。所以"时钟准不准"对 PID 几乎无关。
 
 ### 6.2 板端：同一块板上有两个时基
 
-CAN 时间戳走 **PTPC**（挂 PLL0，分数分频 + 展频，几百 ppm 游走），IMU/GPIO 走
-**机器定时器**（晶振 / 6，1.8 ppm）。**两者直接相减是错的**——SOF_TIMEBASE.md 5.4 节
-五次失败都栽在这里。换算用现成的 `timebase::microframe_q16_at_ptpc()`。
+CAN 帧由 **PTPC** 打戳（挂 PLL0），IMU/GPIO 走**机器定时器**（晶振 / 6，1.8 ppm）。
+**两者的原始读数不能相减。** 2026-10-03 起 CAN 的时间戳不再把 PTPC 读数报上来：SOF 沿也由
+硬件锁进 PTPC，板端把帧起始时刻换成共享微帧轴上的位置再上报（[SOF_TIMEBASE.md](SOF_TIMEBASE.md)
+第 8 节，未上板）。IMU/GPIO 仍报机器定时器的 `quarter_us`，要与 CAN 的时间戳比，得先经
+`timebase::microframe_at()` 换到同一条轴上。原先这里提到的
+`timebase::microframe_q16_at_ptpc()` 已于 2026-09-13 随 5.4 节那条换算路一并删除。
 
 ### 6.3 上位机：PID 没有 dt，跳拍静默
 

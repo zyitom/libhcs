@@ -4,9 +4,9 @@
 
 #include <main.h>
 
+#include "firmware/common/app/src/utility/interrupt_lock.hpp"
 #include "firmware/mc02/app/src/led/led.hpp"
 #include "firmware/mc02/app/src/utility/boot_mailbox.hpp"
-#include "firmware/mc02/app/src/utility/interrupt_lock.hpp"
 
 // 生成代码 stm32h7xx_it.c 中四个 fault handler 共用的故障恢复。没有它时 fault 会
 // 让 CPU 停在主机永远够不到的 while(1) 里: USB 不再应答, 只能靠调试器或复位时按住

@@ -2,7 +2,7 @@
 
 > **文档类型**：过程记录（实测验证）
 > **适用范围**：`firmware/hpm_board/`，HPM5321 / HPM6E8Y 的 USB 数据固件；多块板挂同一个 USB 主机控制器的场景
-> **状态**：现行有效（第 1 步验证、第 2 步共享时间轴、第六条直接实测均已上板；"在第 k 微帧执行"的动作层未实现）
+> **状态**：现行有效（第 1 步验证、第 2 步共享时间轴、第六条直接实测均已上板；第 8 节"记录上轴"2026-10-05 三板台架实测：两块 5321 同一帧之差 σ 约 16 ns、mc02 对 5321 约 50 ns（8.7.8），扣填充位后约 24 ns（8.7.9）；v14 起时间基准由主机声明打开、不再是编译开关（8.7.10）；"在第 k 微帧执行"的动作层未实现）
 > **相关文档**：[AGENTS.md](AGENTS.md)（板级现行规范） · [CONTROL_TIMING.md](CONTROL_TIMING.md)（这条轴在控制环里到底用不用得上） · [../../HOST_TUNING.md](../../HOST_TUNING.md)（主机侧调优） · 固件 `app/src/sync/sof_probe.hpp` · 主机工具 `host/examples/sof_probe.cpp`（2026-09-30 已删除，git `cf404b7` 可取回）
 
 ## 摘要
@@ -26,6 +26,12 @@
 + 圈数状态机已实现并上板，锚点搭在**既有的 session 包**上。30 s 内 119 次上报全部
 `valid`、运行期异常 0、圈数错配 0。主机侧另有一条到 Unix 时间的映射，见第 5 节。
 第 3 步（"在第 k 号微帧执行"的动作语义与提前量）尚未实现。
+
+**记录上轴（第 8 节）：CAN 帧的硬件时间戳直接落在这条轴上，主机再把它换到
+`CLOCK_MONOTONIC`。** 做法是让 SOF 沿也由硬件锁进给 CAN 帧打戳的那个计数器（5321 是
+PTPC0），帧的位置从 SOF 锁存值上读出。第一版 2026-10-05 上板通过；同日的第二版（8.7）把
+线格式量化从 122 ns 降到 7.6 ns、改用穿过环里全部锁存值的直线、给 mc02 的 CAN 帧也打戳，
+待三板台架实测。
 
 ## 1. 验证做了什么
 
@@ -119,7 +125,7 @@ ISR 间隔均值 **125.0102 us**（理想 125.000），两块板一致到小数�
 export GNURISCV_TOOLCHAIN_PATH=~/3rd_party/rv32imac_zicsr_zifencei_multilib_b_ext-linux
 export PATH="$GNURISCV_TOOLCHAIN_PATH/bin:$PATH"
 
-# 验证探针（第 1、2 节）。共享时间轴用 -Dlibhcs_TIME_SYNC=ON，见第 4 节。
+# 验证探针（第 1、2 节）。共享时间轴自 v14 起不是编译开关，每个镜像都带、主机声明了才开，见 8.7.10。
 cmake --preset release -S firmware/hpm_board -B firmware/hpm_board/build_5321_sof \
       -DBOARD=hpm5321 -Dlibhcs_SOF_DIAG=ON
 cmake --build firmware/hpm_board/build_5321_sof --target hpm_board_app
@@ -136,11 +142,13 @@ cmake --build host/build --target sof_probe
 ./host/build/examples/sof_probe 45 10000     # 每板 10000 帧/s 的 CAN 负载
 ```
 
-共享时间轴（第 4、5 节）：
+共享时间轴（第 4、5 节）。v14（2026-10-05）起默认镜像就带，不用另编；主机在声明里要
+（`hcs::Configuration::enable_time_sync()`，见 8.7.10）。下面是当时的命令，那时要
+`-Dlibhcs_TIME_SYNC=ON`，这个开关已删除：
 
 ```bash
 cmake --preset release -S firmware/hpm_board -B firmware/hpm_board/build_5321_ts \
-      -DBOARD=hpm5321 -Dlibhcs_TIME_SYNC=ON
+      -DBOARD=hpm5321
 cmake --build firmware/hpm_board/build_5321_ts --target hpm_board_app
 IMG=firmware/hpm_board/build_5321_ts/app/output/hpm_board_app_hpm5321.dfu
 dfu-util -p 3-1 -a 0 -D $IMG && dfu-util -p 3-2 -a 0 -D $IMG
@@ -178,6 +186,8 @@ cmake --build host/build --target time_sync_test
 新增两个 `SessionType`（`kTimeAnchor = 4`、`kTimeStatus = 5`）。**它们在 session 头
 之后带载荷，所以不认识它们的旧固件无法跳过**，会把载荷当成下一个字段而丢帧。因此主机
 侧是**显式开关**：`AdvancedOptions::set_enable_time_sync(true)`，默认关。
+[v14 起改为声明：清单头一位（`kManifestFlagTimeSync`）。线格式指纹保证两端同版本，同版本
+的固件都认得这两种类型；板子报了能力才发，见 8.7.10]
 
 ### 4.2 圈数怎么定，以及为什么主机时钟不准也不会破坏同步
 
@@ -195,8 +205,9 @@ absolute = counter + 16384 * round((host_estimate - counter) / 16384)
 - 更强的一条：**即使主机估计得离谱，各板之间仍然一致**，错的只是绝对值。
   **绝对正确性依赖主机时钟，跨板一致性完全不依赖。** 这就是"并联而非串联"的实质。
 
-代价是主机的估计轴必须**全进程唯一**（`host/include/libhcs/time/timeline.hpp` 是单例）。
-每块板一个原点会让各板各自自洽、互相差整秒——这是最难发现的失败形态。
+代价是主机的估计轴必须**按主机控制器唯一**（`host/src/time/usb_frame_axis.hpp`，注册表按
+控制器的 PCI 地址发同一条轴；每块板一个原点会让各板各自自洽、互相差整秒——这是最难发现的
+失败形态）。
 
 ### 4.3 拟合与状态机
 
@@ -212,6 +223,21 @@ Q16 定点（1 ppm 在 5 ms 提前量上是 5 ns），相位取整到 1 tick = 0
 | 2~7 | 计数照补（计数器仍然正确），但**丢弃整个拟合窗口** |
 | 0 或 >=8 | 计数器不可信，**宣布失效**，等下一个锚点 |
 | 锚点解出的圈数与当前不同 | **宣布失效**，不静默接受 |
+
+**代码位置（2026-10-06 起）**：计数器、拟合、锚点、状态机与拟合线上的双向换算三块板共用一份
+`core/src/time/sof_timebase.hpp`（`SofTimebase<Policy>`），各板 `app/src/sync/timebase.cpp` 只剩芯片相关
+的事：读 SOF 帧号与端口速度、扣包时长和全速填充位、中断锁、hpm 喂 pulse 模块、STM32 两板在周期计数器与
+TIM 之间换算。策略只有三项：拟合时钟每微帧的标称 tick（hpm 500 quarter-us，mc02 68750、c_board 21000
+周期）、换算成 quarter-us 的方法、残差极值的上限（hpm 32 位）。
+
+搬家前后数值逐位相同 [实测 2026-10-06]：把重构前、后的三块板 `timebase.cpp` 都配上硬件桩编成主机
+程序，喂同一组 24 个场景（高速 / 全速、本地时钟跨 32 位回绕、漏中断、计数停住、帧号跳变、错圈锚点，
+每场景几万次 SOF），快照、报告与全部查询的输出各 17340 行，三块板 diff 都是 0。台架 Mc02Bench
+（5321 + mc02 刷重构后镜像）25 条 ×2 通过，时间戳 4 条 ×3 的分布与重构前一致。
+
+c_board 的时间基准第一次上板 [实测 2026-10-07，CBoardBench]：只在声明时报时间状态；声明后约 3 s 进入
+valid，晶振 +78.9 ppm，每轮样本外预测误差均值 20–30 ns、最大约 0.5 µs，0 异常（本板没有 SOF 硬件捕获，靠中断
+时间戳；CAN 帧不带时间戳）。
 
 ### 4.4 实测结果
 
@@ -733,7 +759,7 @@ export PATH="$GNURISCV_TOOLCHAIN_PATH/bin:$PATH"
 ./host/build/examples/dual_board_test link          # 只看两行 UART0，必须双向 PASS
 
 cmake --preset release -S firmware/hpm_board -B firmware/hpm_board/build_5321_pulse \
-      -DBOARD=hpm5321 -Dlibhcs_TIME_SYNC=ON -Dlibhcs_PULSE_TEST=ON
+      -DBOARD=hpm5321 -Dlibhcs_PULSE_TEST=ON   # v14 前还要 -Dlibhcs_TIME_SYNC=ON；现在主机声明时间基准
 cmake --build firmware/hpm_board/build_5321_pulse --target hpm_board_app
 IMG=firmware/hpm_board/build_5321_pulse/app/output/hpm_board_app_hpm5321.dfu
 dfu-util -p 3-1 -a 0 -D $IMG && dfu-util -p 3-2 -a 0 -D $IMG
@@ -784,16 +810,17 @@ cmake --build host/build --target pulse_skew_test
 
 | 文件 | 作用 | 开关 |
 |---|---|---|
-| `sof.{hpp,cpp}` | 共享的 SOF 钩子，一个入口喂两个消费者 | 随下面任一开启 |
+| `sof.{hpp,cpp}` | 共享的 SOF 钩子，一个入口喂两个消费者；v14 起也是时间基准的开关（`time_sync_start/stop`） | 随下面任一开启 |
 | `sof_probe.{hpp,cpp}` | 第 1 步验证探针：差值直方图、端口状态、跨板一致性 | `-Dlibhcs_SOF_DIAG=ON` |
-| `timebase.{hpp,cpp}` | 共享时间轴：计数器、拟合、圈数状态机、TRGM 捕获 | `-Dlibhcs_TIME_SYNC=ON` |
+| `timebase.{hpp,cpp}` | 共享时间轴：计数器、拟合、圈数状态机、TRGM 捕获 | 当时 `-Dlibhcs_TIME_SYNC=ON`；v14 起常驻，主机声明了才运行（8.7.10） |
 | `pulse.{hpp,cpp}` | GPTMR 硬件脉冲交换（代码齐备，未上板） | `-Dlibhcs_PULSE_TEST=ON` |
 
-主机（约 1930 行）：`libhcs/time/timeline.{hpp,cpp}`（进程唯一的微帧轴 + Unix 映射）、
-`host/examples/sof_probe.cpp`、`time_sync_test.cpp`、`sync_skew_test.cpp`、`topo_probe.cpp`（临时）。
+主机：`host/src/time/usb_frame_axis.{hpp,cpp}`（每个主机控制器一条的微帧轴 + Unix 映射，
+2026-10-07 起按 TIME_DESIGN.md 重构；换算结果经 `libhcs::time::SampleTime` 随回调交出）。
+`host/examples/sof_probe.cpp`、`time_sync_test.cpp`、`sync_skew_test.cpp`、`topo_probe.cpp`（临时）已删。
 
 协议：`SessionType` 新增 `kTimeAnchor`/`kTimeStatus`/`kSyncSample`/`kPulseSchedule`/`kPulseReport`，
-主机侧开关 `AdvancedOptions::set_enable_time_sync(true)`。
+主机侧开关 `AdvancedOptions::set_enable_time_sync(true)`（v14 起删除，改为声明，见 8.7.10）。
 
 2026-08-20 追加：
 
@@ -814,3 +841,360 @@ cmake --build host/build --target pulse_skew_test
 
 > **本机没装 clang-format / clang-tidy**，两个 lint 门禁未跑。已手工核过 100 列上限与 ASCII 限制，
 > 但格式化本身未验证，合入前需补跑。
+
+## 8. 记录上轴：CAN 帧时间戳直接落在微帧轴上 [2026-10-03 实现，2026-10-05 上板通过并改第二版]
+
+**结论先行：帧的锁存值与 SOF 的锁存值在同一个计数器里（5321 是 PTPC0），帧在轴上的位置
+就从 SOF 锁存值上读出来，全程不读"现在"、不经机器定时器，计数器的快慢由这些锁存值自己
+量出。** 第 5.4 节那五次失败都发生在"把 PTPC 换算到另一个时钟"上，这里没有这一步。
+
+状态：第一版（8.1-8.6，2026-10-03）在 2026-10-05 的 Mc02Bench 上端到端通过两轮；同日按
+上板数据与误差分析改成第二版（8.7）：线格式小数 10 位改 14 位、帧两侧两个锁存值的插值
+改成穿过环里全部锁存值的最小二乘直线、5321 改双沿捕获、mc02 的 CAN 帧也打戳、新增三板
+台架直接测跨板误差。**第二版只过了编译与主机测试，未上板**。8.1-8.6 保留第一版的原文，
+被第二版取代的地方在 8.7 里逐条写明。
+
+### 8.1 板端：同一个计数器锁两种沿
+
+| 事件 | 谁锁存 | 进哪里 |
+|---|---|---|
+| CAN 帧起始沿 | MCAN TSU（`capture_on_sof`） | PTPC0 的纳秒字，随帧存进 RX 元素 |
+| USB SOF 沿 | TRGM：`USB0_SOF → PTPC0 capture` | `ptpc_get_capture_ns()` |
+
+`app/src/sync/sof_capture.{hpp,cpp}`：SOF 中断里读锁存值并入环（16 条），CAN 接收中断里用
+帧的锁存值查环，得到 `libhcs::time::SofStamp`。运算本身是纯算术，放在
+`core/src/time/sof_capture_ring.hpp`，主机上能测。
+
+三条设计决定，各有来由：
+
+- **归属逐个判定，不推断。** SOF 中断里先读锁存值、再读 PTPC 自由计数器，两者之差就是
+  锁存值的年龄：小于半个微帧才算本次 SOF 的，否则跳过并计数；读完再看一次 FRINDEX，变了
+  也跳过（处理函数被推迟到下一个 SOF 之后）。于是环里每一条都是"这个 FRINDEX、这个锁存值"
+  的真配对。第五次尝试卡住的地方是用四舍五入去猜归属，然后把"相邻两条不差 1"当成故障。
+- **不要求每个 SOF 都有锁存值。** 区间由环里相邻的两条组成，两条之间差几个微帧就除以几。
+  全速端口（每 8 微帧一个 SOF）、触发信号隔一个 SOF 才动作一次、某次被跳过，都只是区间
+  变宽。
+- **硬件接通推迟到主机第一次发 `kTimeAnchor`。** 那时 USB 已枚举、会话已建立，这条路上出
+  任何问题都还能 DFU（5.5 节的教训）。
+
+环断了就重来：新入环的 FRINDEX 离上一条超过 16 个微帧，旧的全部作废。PTPC 的纳秒字约一秒
+回绕一次，留着挂起之前的旧锁存值，迟早会有一条"恰好排在某个不相干的帧前面"。
+
+每帧热路径：`sof_capture::stamp_of()` 在 `.fast`，环的 `locate()` 内联进去，四条 32 位
+`divu`、无库调用 [反汇编核对 2026-10-03]。链接脚本按名把 `libhcs::core::time` 收进 ILM。
+主机的清单没要时间基准时（v14 起），帧不带时间戳，也不每帧读 TSU 寄存器：接收中断只多一次
+读 DLM 里的开关（`sync::time_sync_on()`）。
+
+### 8.2 线格式：24 位，替掉原来的 32 位微秒
+
+`SofStamp` = FRINDEX 的 14 位 + 10 位小数（1/1024 微帧，122 ns），3 字节，见
+[core/PROTOCOL.md](../../core/PROTOCOL.md) 2.5。
+
+- **整数部分就是硬件计数器本身**，板子不需要知道绝对微帧号，于是打戳不依赖 anchor、不依赖
+  `timebase` 的状态机；高位由主机用自己的"现在"补全（跨度 2.048 s）。
+- **122 ns 已经低于 CAN 帧起始沿本身的确定度**：控制器对沿的同步粒度是一个时间量子，收发
+  器再加百纳秒量级的传播延迟 [通用知识，未查板上器件手册]。
+- 比原字段短 1 字节、细 8 倍，而且在一条主机能换算的轴上。原字段是板上自由运行的 PTPC
+  读数，HCS 板层一直是直接丢弃的。
+
+`kTimeStatus` 同批改了两处：微帧位置带小数（8.4 的第一条）；末尾加了两个计数——自上次
+上报以来锁存值新鲜/陈旧的 SOF 数，上板一看就知道 TRGM 的 SOF 信号是每个 SOF 锁一次还是
+隔一个锁一次。EP0 指纹 v9 = `0x9F98`，全部板要同批重刷。
+
+### 8.3 主机：微帧轴 → `CLOCK_MONOTONIC`
+
+入口是 `libhcs::host::time::Timeline::axis_map()`：返回一份 `AxisMap`（一条直线，值类型），
+不加锁、不进内核，实时线程可以调。`AxisMap::time_of(stamp, around)` 把帧上的时间戳换成
+`steady_clock` 时刻；没有锁定时返回空，不给"差不多"的值。
+
+主机控制器计数器这条路（`MicroframeTimebase`）由 `Timeline` 持有：开了时间同步的板一连上，
+`Handler` 就按它所在的 USB 总线去接（`use_controller_of_usb_bus()`），读不了就退回按 USB
+往返拟合，日志里有一行。
+
+HCS 一侧：板组件参数 `time_sync: true`；设备的 `feedback_time()` 给出最近一帧反馈在
+`steady_clock` 上的时刻，`tick.scheduled - *feedback_time()` 即数据年龄。
+
+### 8.4 读代码发现并改掉的两处原理问题
+
+**1. 板子在 `kTimeStatus` 里只报整数微帧。** `timebase::microframe_now()` 的插值结果在
+整除里丢了小数，报上去的等于"上一个 SOF 时的计数"，相对"此刻"落后 0..125 us 均匀分布。
+这个值有两个去处：主机按往返中点做的拟合（均值偏 62.5 us）；以及"主机计数器与板计数器差
+几个整数微帧"的判定——那里是对"板值 − 主机值"取中位数再四舍五入，已测的往返不对称度约
+三分之一个微帧，再加上这半个微帧的均值偏移，离舍入边界只剩很小的余量。现在板子报
+Q48.16，mc02 同改。[读代码得出；改前是否真的锁错过整数，没有数据]
+
+**2. 主机把控制器计数器直接对 `CLOCK_MONOTONIC` 拟合，窗口 21 s。** 噪声要求长窗口，而
+`CLOCK_MONOTONIC` 的速率被 NTP 随时调整，要求短窗口；一个窗口顾不了两头。速率阶跃 d ppm
+时，直线前端在窗口滑过阶跃点期间偏约 3·d us [计算，`time_axis_test` 的
+`FollowsMonotonicBeingReSteered` 复现：15 ppm 阶跃 2 s 后单直线仍偏 3 us 以上，两段式在
+250 ns 内]。现在分两段：微帧 → `CLOCK_MONOTONIC_RAW` 用长窗口稳健拟合（两者同一颗晶振，
+实测相差 0.1 ppm 以内）；`RAW → MONOTONIC` 只用最近一秒（两个时钟背靠背读，没有噪声）。
+
+同批还改了三件小事：整数偏移改由因果关系定（板子写下位置的时刻必在"主机发出"与"主机收到"
+之间，每次交换给出一对上下界，高速链路上很快只剩一个整数；不再假设往返对称，只有唯一时才
+锁定）；拟合前丢掉窗口宽度超过中位数 3 倍的沿，再做一遍剔除离群点的最小二乘；沿的时刻减去
+半次寄存器读的耗时（计数器是在读的过程中被采样的，时间戳取在读完之后）。
+
+### 8.5 验证了什么
+
+| 层 | 用例 | 状态 |
+|---|---|---|
+| 时间戳格式与还原、板端环的运算 | `host/tests/sof_stamp_test.cpp`（17 条） | 通过 |
+| 线格式（3 字节时间戳、`kTimeStatus`） | `host/tests/wire_protocol_test.cpp` | 通过 |
+| 主机拟合、整数偏移、无锁发布、往返拟合 | `host/tests/time_axis_test.cpp`（21 条） | 通过 |
+| HCS 板层换算 | `hcs_core/test/test_board.cpp` `FeedbackCarriesItsOwnTimeOnTheSteadyClock` | 通过 |
+| 固件编译 | 5321（开/关）、6e8y、mc02（开/关）、c_board | 通过 |
+| 上板端到端 | `test_bench_boards.cpp` `Mc02Bench.The5321PlacesReceivedFramesOnTheHostClock` | 通过（2026-10-05 两轮，数据见 8.7.1） |
+
+上板用例的判据：5321 收到的每一帧，换算出的帧起始时刻必须落在"主机把这帧交给 mc02 发"与
+"主机从 5321 收到这帧"之间；并打印新鲜/陈旧锁存的比例。固件没开 `libhcs_TIME_SYNC` 时跳过
+（v14 起时间基准由声明打开，报不出有效时间线即判失败）。
+
+本机（Alder Lake PCH xHCI，Bus 003）主机一侧单独实测过 [2026-10-03，未调优，governor
+`powersave`]：MFINDEX 免 root 可读、14 位；单次读 0.84~1.28 us；单沿离散度约 3 us、最差
+22~42 us；200 沿普通最小二乘的相位约 0.2 us；`MONOTONIC` 比 `RAW` 快 39 ppm（与
+`timedatectl timesync-status` 报的 +39.143 ppm 一致）。
+
+### 8.6 没有验证的假设
+
+- **TRGM 的 `USB0_SOF` 是每个 SOF 一个脉冲，还是逐 SOF 翻转的电平。** 旧代码注释认定是
+  单周期脉冲；第五次尝试的现象（一块板恒约 1 us、另一块恒约 126 us，全速率记录后每个 SOF
+  都"跳变"）与"隔一个 SOF 才锁一次"相符。固件两种都对，区别只是区间宽一倍；确认是后者
+  之后可把捕获改成双沿。[推断，未上板]
+- **TRGM 的 SOF 沿与 SRI 置位同刻。** 入环前按 `timebase` 同一约定减去了 SOF 包的传输
+  时间（高速 133 ns）。两者若差一个常数，各板相同，跨板无影响，对主机时钟是一个亚微秒的
+  固定偏置。[推断，未上板]
+- **PTPC 为什么比标称快约 0.18%（5.4 节 2026-09-13 的数据）。** 按时钟树 PLL0 是 24 MHz 的
+  整数 40 倍、`board.c` 没开展频，PTPC 对机器定时器应当严格 240:1。本节的做法不依赖它，但
+  这个矛盾没有解释。
+- **mc02 的小数上报**只过了编译。mc02 的 CAN 帧不带时间戳：它要先把 FDCAN 的外部时间戳
+  计数器与 TIM2 的 SOF 捕获放到同一个计数器上。
+- **串口数据没有时间戳**（`UartDataView` 里没有这一栏）。
+
+### 8.7 第二版（2026-10-05）：上板数据、误差预算与改动 [三板台架实测见 8.7.8]
+
+**结论先行：第一版的误差大头在线格式（35 ns RMS 的量化），改成 14 位小数后只剩 2.2 ns。
+第二版另把插值换成长窗口直线以平均锁存抖动，按"5 ns 一帧"的预算推断，但上板证明 5321 的
+SOF 锁存值相对 PTPC 在毫秒尺度上游走，长窗口直线反而把单板误差推到约 110 ns；第三版回到
+就地取速率，实测两块 5321 之差 σ 约 16 ns、mc02 对 5321 约 50 ns（8.7.8）。8.7.2 的预算
+表里"SOF 直线约 2 ns"一行因此不成立，实测的单次 SOF 锁存抖动约 16-20 ns。**
+
+#### 8.7.1 第一版的上板结果 [实测 2026-10-05，Mc02Bench，AD600 Bus 3]
+
+| | 第一轮 13:01 | 第二轮 13:24 |
+|---|---|---|
+| 时间轴来源 | 主机控制器计数器 | 同左 |
+| 帧起始在主机调发送之后（min / 中位 / max） | 28.6 / 35.7 / 69.0 us | 26.8 / 33.1 / 104.6 us |
+| 主机收到在帧起始之后（min / 中位 / max） | 67.6 / 123.2 / 223.9 us | 67.1 / 125.9 / 642.4 us |
+| 硬件 SOF 锁存 新鲜 / 陈旧 | 74548 / 74547（50.0%） | 6006 / 6006（50.0%） |
+
+新鲜率恰为 50.0%：TRGM 的 `USB0_SOF` 是逐 SOF 翻转一次的电平，不是脉冲（8.6 第一条的
+答案）。只取上升沿，于是隔一个 SOF 才锁一次。
+
+#### 8.7.2 误差预算：第一版差在哪
+
+| 环节 | 粒度 | 第一版随机误差 | 第二版 |
+|---|---|---|---|
+| CAN 帧起始沿 → MCAN 同步（CAN 时钟 80 MHz） | 12.5 ns | 3.6 ns | 同左（硬件下限） |
+| TSU 锁 PTPC0（160 MHz，6 ns 步进） | 6.25 ns | 1.8 ns | 同左 |
+| SOF → TRGM → PTPC0（SOF 事件出自 UTMI 60 MHz 域） | 16.7 + 6.25 ns | 约 5 ns | 同左，但被直线平均（见下） |
+| 插值：只用帧两侧两个锁存值，常常要把上一区间的速率外推 | — | 约 7 ns，最坏约 20 ns | 约 2 ns |
+| **线格式小数 10 位（122 ns）** | 122 ns | **35 ns** | 7.6 ns 一格，2.2 ns |
+
+[推断：各级粒度来自时钟树与手册，量化按均匀分布；未单独上板测]
+
+第一版注释说"122 ns 已经低于 CAN 帧起始沿本身的确定度"，这是错的：5321 的锁存粒度是
+6-12 ns，122 ns 的格子把它白白丢了。外推那一项来自 8.1 的设计本身：CAN 接收中断在帧尾
+之后才来，那时帧起始之后的那个 SOF 常常还没锁到（隔一个才锁一次时更常见），只能拿上一个
+区间（一两个锁存值定出的速率，误差几十 ppm）往后外推一两个微帧。
+
+#### 8.7.3 改动
+
+1. **线格式 10 + 14 位**（`core/include/libhcs/time/sof_stamp.hpp`，`kCanStampSemantics` 2，
+   EP0 v13 = `0x02ED`）：仍是 24 位、3 字节，线上不多一个字节；小数 7.6 ns 与 5321 的 PTPC
+   （6.25 ns）、mc02 的 TIM3（7.3 ns）一拍相当；整数 10 位跨度 128 ms，接收方还原的窗口是
+   "现在"之前 96 ms 到之后 32 ms。同日先写的是 11 + 13 位（15.3 ns），按误差预算它的量化
+   （4.4 ns RMS）仍是最大的一项，没刷过板就改成了 10 + 14。
+2. ~~环拟合直线 + 主循环拟合~~ **已被 8.7.8 取代**：曾用穿过环里全部锁存值（5321 31 个、
+   3.9 ms）的最小二乘直线，主循环 1 kHz 拟合、往前外推最多 24 个微帧；前提是"两台晶振的
+   速率比在毫秒尺度上恒定"。三板台架实测这个前提在 5321 上不成立（锁存值相对 PTPC 在几
+   毫秒里游走几百纳秒），两块 5321 对同一帧差 158 ns RMS。现行做法见 8.7.8：回到第一版
+   "就地取速率"，环只在 SOF 中断里入环、CAN 接收中断直接读环，不再有主循环拟合。
+3. （同上，已删除）
+4. **5321 双沿捕获**（`app/src/sync/sof_capture.cpp`）：每个 SOF 都锁到，新鲜率应接近 100%。
+5. **mc02 的 CAN 帧打戳**（`firmware/mc02/app/src/sync/sof_capture.{hpp,cpp}`）：FDCAN 的
+   外部时间戳（TSCC.TSS = 10）就是 `tim3_cnt[0:15]` [RM0468 Rev 3 61.5.8，手册还写明 CAN FD 下
+   只有外部计数器是恒定时基]。USB SOF 只接 TIM2 ITR5 与 TIM5 ITR7 [RM0468 Table 94、Table 355]。
+   取 TIM5：32 位、不占引脚、Prescaler 0、Period 0xFFFFFFFF，整个归时基；板上 1/4 us 计时器
+   挪到 TIM23，TIM2 完全还给 PWM。TIM3（Prescaler 1，7.3 ns）与 TIM5 吃同一个定时器时钟，
+   2^32 是 TIM3 一整圈的整数倍，所以 `TIM3 = ((TIM5 - k) >> 1) & 0xFFFF` 恒成立
+   （`core/src/time/counter_link.hpp`）。k 在启动时用 TIM3 TRGO -> TIM5 ITR2 捕获一次（晚一两个
+   同步时钟，常数），主循环每毫秒抽查。接收中断只读一次 TIM5，把帧的 16 位时间戳拼进去，
+   得到帧起始的 TIM5 读数，再进与 5321 同一个环。比起"中断里背靠背读 TIM3 与 TIM2"，省掉了
+   "此刻"的量化（4.2 ns）与两次读之间的抖动。本总线最长一帧装不进 TIM3 回绕窗口的 3/4
+   （357 us，标称速率低于约 620 kbit/s）时不打。mc02 每帧随机误差预算（CAN 时钟
+   同步 3.6、APB 同步 2.1、TIM3 量化 2.1、SOF 直线约 2、线格式 2.2，合计约 5.5）[推断]。
+   中间曾有一版用 TIM2 捕获 SOF、PSC 3 的 TIM3、中断里背靠背读两个计数器，同日被这一版取代。
+6. **mc02 旧问题顺带消失**：TIM2 计数器原本要等某根 GPIO 线声明成 PWM 输出才启动
+   （`gpio.hpp`），在那之前 SOF 捕获锁到的是停住的值，时间基对中断入口延迟的修正
+   （`sync/sof.cpp` 的 `capture_age_cycles()`）悄悄退化为零。捕获挪到 TIM5 后不再依赖 TIM2。
+   [读代码得出，未上板]
+
+#### 8.7.4 验证了什么
+
+| 层 | 用例 | 状态 |
+|---|---|---|
+| 格式、还原、环的直线拟合、离群、重来、外推、运行期配置的计数器；16 位戳拼到 32 位计数器（`CounterLink`） | `host/tests/sof_stamp_test.cpp`（27 条） | 通过 |
+| 主机换算（128 ms 跨度） | `host/tests/time_axis_test.cpp` | 通过 |
+| 线格式版本钉子 | `host/tests/ep0_declaration_test.cpp` | 通过（`0x02ED`） |
+| 固件编译 | 5321 TIME_SYNC 开；mc02 开 / 关；其余见 `tools/check.sh --firmware` | 通过 |
+| 三板跨板误差 | `test_bench_boards.cpp` `ThreeBoardBench.*` | **未跑** |
+
+#### 8.7.5 仍未验证
+
+- TIM5 ITR7 是否真有 SOF：手册两张表都这么写，2026-09-07 的扫描记录相反（多半写错了 TS 编码）。
+  上板看 `kTimeStatus` 的新鲜锁存计数。
+- FDCAN 采样 TIM3 是否会撕裂：手册框图里 `fdcan1_ts` 在 APB 时钟域被采样，TIM3 时钟与 APB1 同源
+  同步，推断不会；三板用例里 mc02 对 5321 的离群点数是答案。三个 FDCAN 共用这一路输入（框图），
+  也待上板确认。
+- mc02 与 5321 两条轴之间的常数（两种 USB IP / PHY 的 SOF 信号延迟不同）。三板用例的中位数
+  就是它，测出来之后固化进 mc02 固件，像全速 2.9 us 那样减掉。
+- 5321 双沿捕获时奇偶 SOF 之间有没有常数差（直线会把它平均成一半，三板用例的 sigma 会变大）。
+- 8.6 的第二、三条仍然成立（手册没写 TRGM 的 SOF 翻转与 SRI 置位的先后，也没写 PTPC 捕获经过
+  几级同步）。
+
+#### 8.7.7 HPM5300 用户手册核对 [UM Rev1.1，2026-10-05]
+
+- **8.6 第一条有了手册答案**：TRGM 这路输入的信号名就是 `usb0_sof_tog_sync`（34.5.9 TRGM_IN），
+  每个 SOF 翻转一次、已同步，与 8.7.1 的 50.0% 实测一致。双沿捕获是对的；某个 SOF 没翻转时，
+  之后的沿照样逐个配对。
+- **TSU 在帧起始锁存**：TSCFG.SCP = 1 是"在 SOF 捕获时间戳"，0 是在 EOF（49.5.50）。三处配置
+  （`libhcs_config()`、DMTool 重配、救援路径）都是 `capture_on_sof = true`，已核对。
+- **PTPC 捕获**：CTRL0 的 CAPT_SNAP_POS_EN / NEG_EN 两位可同开，即双沿（50.4.1）；数字模式下
+  纳秒字每个 PTPC 时钟加 SS_INCR（50.2.2），160 MHz 时加 6，所以一秒走 9.6 亿而不是 10 亿——
+  `kCanTimestampNsPerUs = 960` 的来历。环只用比值，不受影响。
+- **控制器自己补的 SOF**：USBSTS.SRI 的说明是"当 SOF 非常晚时，设备控制器将自动设置此位，以
+  指示预期 SOF"（51.6）。若 TRGM 的翻转也跟着这个补出来的 SOF 走，那一次锁存就不对齐主机的
+  真 SOF。环的离群剔除（偏离直线 0.49 us 以上即剔，四分之一以上偏离就不答）兜住它；补出来的
+  SOF 若与真 SOF 差得不到 0.49 us，误差也就那么大，且只在丢包时出现。
+- **CAN 时钟**：手册只给默认 80 MHz（10 章时钟表），上限在数据手册里。按寄存器范围，160 MHz 下
+  标称段 160 tq（采样点 140/160 = 87.5%）、数据段 32 tq（28/32）都放得下，帧起始沿的同步粒度
+  可从 12.5 ns 降到 6.25 ns（单板 σ 约 6.5 → 5.9 ns）。收益不到 1 ns，代价是改所有电机总线的
+  位时序，不做 [用户可另行决定]。
+
+#### 8.7.8 三板台架实测，以及第三版的环 [实测 2026-10-05，AD600 Bus 3，两块 5321 + mc02]
+
+**结论先行：第二版的长窗口直线在 5321 上错了，回到就地取速率后两块 5321 对同一帧
+σ 16-17 ns（最差 46-69 ns），mc02 对 5321 σ 约 50 ns（中位数 +198 ns 为两条轴之间的常数），
+三板用例 3/3 通过。** 手册与上板一致的几条：5321 双沿捕获 100% 新鲜；mc02 的 TIM5 ITR7
+确有 SOF（全速每秒约 1000 个、0 陈旧，2026-09-07 的扫描记录是错的）；mc02 的帧 500/500
+带时间戳，对 5321 无 1 us 以上的离群点（看不到 TIM3 撕裂）。
+
+| | 第二版（31 点直线，主循环拟合） | 第三版（就地取速率） |
+|---|---|---|
+| 两块 5321 同一帧之差 σ / 最差 | 158-161 ns / 510-580 ns | **16.3-17.1 ns / 46-69 ns** |
+| mc02 − 5321 σ（稳健）/ 最差 | 121-128 ns（113-124）/ 390-534 ns | **39-52 ns（23-34）/ 214-343 ns** |
+| 背靠背两帧（相隔几十 us）误差的相关系数 | 0.97 | 0.55 |
+
+定位过程（诊断镜像，已删）：
+- 背靠背两帧误差相关 0.97：误差在时间轴（直线）上，不在帧锁存上；帧锁存自身约 19 ns。
+- 5321 板上统计相邻两次 SOF 锁存的间隔：σ 22-30 ns、最大最小差 140-240 ns，即单次锁存
+  抖动约 16-20 ns（比预算的 5 ns 大，来源未查清）。
+- 用发布的直线去定位刚锁到的 SOF（真值是整数微帧）：预测误差 σ 100-145 ns、最大
+  350-890 ns。相邻间隔干净而毫秒尺度上偏离直线几百纳秒，就是 5.4 节记过的"PTPC 报告间
+  相位游走"。mc02 同期只有约 46 ns，故不是主机 SOF 在游走，是 5321 一侧（PTPC/PLL0 或
+  设备端 SOF 信号）。PLL0 是整数倍、未开展频，物理来源未查清 [推断]。
+
+第三版（`core/src/time/sof_capture_ring.hpp`）：帧落在两个锁存值之间时用这一段自己的速率
+插值；后一个还没锁到时用最新锁存值加最近 4 个微帧（`kRateBaselineMicroframes`）的速率往前
+推，最多 16 个微帧。SOF 中断只入环，CAN 接收中断直接读环（无锁，代号与序号校验），没有
+主循环拟合。5321 环 16 条、mc02 8 条。主机测试 `FollowsACounterThatWanders`：±300 计数、
+8 ms 周期的游走加 ±12 计数白噪声，误差 RMS < 2.5 格。
+
+mc02 的误差随帧离上一个全速 SOF 的距离增大（紧挨着 SOF σ 约 30 ns，快到下一个时约
+47 ns，含 5321 一侧约 12 ns）：全速下只能用上一段 1 ms 的速率往前推最多 1 ms，单次锁存
+约 15-20 ns 的抖动随距离放大。尾部（最差 200-340 ns）的一个可能来源是全速 SOF 包里的
+填充位：帧号里连续 6 个 1 会多插一位，每位 83 ns，若 TIM5 捕获在包尾，某些帧号的 SOF 沿
+就晚 83-167 ns [推断，未验证；可按帧号算出填充位数在 mc02 上减掉，A/B 一测便知]。
+
+#### 8.7.9 同晚的三项后续 [实测 2026-10-05，同一台架]
+
+**1. mc02：扣掉全速 SOF 包里的填充位。** 全速一位 83.3 ns；帧号与 CRC5 里连续 6 个 1 会多插
+一位，2048 个帧号里 212 个多 1 位、8 个多 2 位（`core/src/time/usb_sof_bits.hpp`，CRC5 用 USB-IF
+的例子核对过）。mc02 的 TIM5 在 SOF 包尾锁存，这些帧号的 SOF 沿就晚 83/167 ns，全速下再被
+"上一段 1 ms 的速率往前推 1 ms"放大。按帧号扣掉之后（`sof_capture.cpp`，时间基拟合
+`timebase.cpp` 同样扣）：
+
+| mc02 − 5321（各 3 遍） | 扣之前 | 扣之后 |
+|---|---|---|
+| σ（稳健） | 39-52 ns（23-34） | **24.2-24.7 ns（22.6）** |
+| 最差（离中位数） | 214-343 ns | **61-69 ns** |
+| 中位数 | +198 ns | +206 ns（多出的约 8 ns 正是 0.107 × 83 ns 的平均） |
+
+这同时证明 DWC2 的 SOF 触发在包尾。高速下一位 2.1 ns，5321 不扣。
+
+**2. 5321：外推用的速率基线。** `kRateBaselineMicroframes` 取 1 / 2 / 4 / 8 各刷两块 5321 测：
+σ 19.7-19.8 / 18.1-19.2 / **16.3-17.1** / 17.1-17.9 ns。短了单次锁存的抖动直接进速率，长了
+毫秒级的游走开始起作用，保留 4。
+
+**3. 板载 IMU 的时间戳换到本机时钟。** mc02 的 BMI088 样本带板上 1/4 us 时间戳（数据就绪中断
+读 1 MHz 的 TIM23）。主机侧（2026-10-07 起是 `host/src/time/board_timebase.hpp`）用板子
+`kTimeStatus` 里那对"微帧位置 + 同一时刻的 1/4 us 读数 + 拟合速率"把它换到共享轴，再换到
+`steady_clock`；换算在 SDK 的 IO 线程解码时做完，结果就是回调里 `SampleTime` 的 `host` 与
+`board` 两个字段（板层不再持有任何换算状态）。线格式不变，精度约 1 us（板上计时器的分辨率）。`ThreeBoardBench.TheMc02ImuSamplesLandOnTheHostClock`：
+2003 个陀螺仪样本全部落在主机收到之前（数据就绪到主机收到 min 37 / 中位 57 / max 881 us），
+主机时钟上的样本间隔均值 499.08 us（标称 500，BMI088 片内振荡器快约 0.2%）。时刻是数据就绪
+中断那一刻，传感器自己的滤波延迟不在内。
+
+mc02 − 5321 的 +206 ns 不补偿：它混着"两条时间轴之间的偏移"（两种 USB 控制器的 SOF 锁存延迟）
+和"两种 CAN 控制器加收发器的接收延迟之差"，IMU 时间戳只受前者影响，补哪一侧都会把另一项带偏；
+要分开需要一个不经 CAN、两块板都能打戳的事件。
+
+#### 8.7.10 时间基准改为声明（v14）[实测 2026-10-05，同一台架]
+
+**做法。** 编译开关 `libhcs_TIME_SYNC` / `libhcs_APP_TIME_SYNC` 与主机的
+`AdvancedOptions::set_enable_time_sync()` 删除，换成 EP0 清单的一部分，与 CAN、UART、IMU
+同一条"配置即声明"：
+- `kGetPortList` 的 `board_caps`（原"未定义、必须为 0"）报 `kBoardCapTimeSync`：5321、6e8y、
+  mc02 报，c_board 不报。
+- `kApplyManifest` 的头部最后一字节（原 `reserved`）改名 `flags`，`kManifestFlagTimeSync`
+  要时间基准。不是口：没有 DataId，也没有自己的记录流（它的数据走会话字段）。
+- 核心事务（`core/src/link/ep0.hpp`）：校验阶段拒不认识的位、拒板子没报的能力；应用阶段
+  **先于端口**调板级上下文的 `set_time_sync()`，开不起来按"应用失败"整体回滚；回滚时关掉；
+  没要它的清单把它关掉。主机侧 `hcs::apply()` 发清单前先按 `board_caps` 核对，
+  `Board` 的重连钩子在清单被接受后才让 `Handler` 发时间锚（`Handler::set_time_sync()`）。
+- 板上的开关是一个原子布尔（`sync::time_sync_on()`，hpm 在 DLM、mc02 在 DTCM）。关着时
+  SOF 中断不开；USB 中断入口、CAN 接收中断、主循环各多一次读这个布尔。会话结束（hpm 走
+  归属交还的 `TimeSyncHandoff`，mc02 走 `stop_channels()`）即关。时间锚只在开着时应答。
+- 打开时复位时间基准与 SOF 环（`timebase::reset()`、`sof_capture::start()/reset()`），旧的
+  锁存值不跨关掉的那段配对。mc02 的 TIM5 捕获与 TIM3 标定从上电挪到第一次打开时（那时 USB
+  已枚举，端口速度确定；`MX_TIM3_Init()` / `MX_TIM5_Init()` 改为上电总调，只写 PSC/ARR）。
+- 线格式指纹 `0x02ED` -> `0x4257`（`kTimeSyncDeclarationSemantics`），全部板子要重刷。
+
+**实测**（三块板刷当前树的默认 release 镜像）：
+
+| `ThreeBoardBench.TheTimeBaseRunsOnlyWhileDeclared` | 5321 收到的帧带戳 | mc02 收到的帧带戳 | 对时上报 |
+|---|---|---|---|
+| 声明 | 50/50 | 49/49 | 各 6 |
+| 不声明（紧跟在上一个开着的会话后） | 0/50 | 0/47 | 0 |
+| 再声明 | 50/50 | 47/47 | 各 6 |
+
+同一镜像下的精度与 8.7.9 一致：两块 5321 之差 σ 16.1 ns（稳健 11.3）、最差 53 ns；mc02 对
+5321 σ 23.5 ns、最差 69 ns、中位数 +198.4 ns（8.7.9 为 +206.0，差一个时间戳 LSB 7.6 ns）；
+IMU 样本落到主机时钟的用例照常通过。`Mc02Bench` / `Bench` 两组两板回归没在 v14 镜像上跑。
+
+#### 8.7.6 三板台架怎么跑
+
+形态与接线见 `hcs_core/test/test_bench_boards.cpp` 文件头（ThreeBoardBench：两块 5321 加
+mc02，三块的 CAN1 同一条总线，两端各一个 120 欧，三块插同一个 USB 主机控制器）。三块板都
+刷当前树编出的默认镜像（v14 起时间基准常驻、由用例自己声明），mc02 另要上面的 TIM3 配置。
+`TheTimeBaseRunsOnlyWhileDeclared` 验"要 / 不要 / 再要"三轮（8.7.10）。
+
+- `TwoHpmBoardsStampTheSameFrameAlike`：mc02 发 500 帧，两块 5321 各自打戳，差值的
+  sigma 判 25 ns、离中位数最远判 100 ns、中位数判 200 ns。
+- `TheMc02StampsTheSameFrameAsA5321`：5321 A 发，B 与 mc02 各自打戳，打印中位数（要标定的
+  常数）与稳健 sigma（判 60 ns），离中位数 1 us 以上的离群点一个都不许有；同时验 mc02 的
+  时间戳换到主机时钟后落在"发出"与"收到"之间。
+
+判据是按 8.7.2 的预算给的，第一次上板后按实测收紧。
+

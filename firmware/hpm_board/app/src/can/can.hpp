@@ -21,17 +21,23 @@
 
 #include "board_app.hpp"
 #include "core/include/libhcs/data/datas.hpp"
+#include "core/src/link/port.hpp"
 #include "core/src/protocol/protocol.hpp"
 #include "core/src/protocol/serializer.hpp"
 #include "core/src/utility/assert.hpp"
 #include "core/src/utility/immovable.hpp"
+#include "firmware/common/app/src/utility/event_counter.hpp"
+#include "firmware/common/app/src/utility/latched_bus_error.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/ring_buffer.hpp"
+#include "firmware/hpm_board/app/src/can/bit_timing.hpp"
 #include "firmware/hpm_board/app/src/can/can_port.hpp"
 #include "firmware/hpm_board/app/src/led/led.hpp"
 #include "firmware/hpm_board/app/src/link/uplink.hpp"
-#include "firmware/hpm_board/app/src/utility/lazy.hpp"
-#include "firmware/hpm_board/app/src/utility/ring_buffer.hpp"
 
 namespace libhcs::firmware::can {
+
+namespace vc = libhcs::core::protocol::vendor_control;
 
 using board::CanMode;
 using board::CanPort;
@@ -48,6 +54,13 @@ concept DownlinkFramePolicy = requires(const Policy& policy) {
 
 class Can : private core::utility::Immovable {
 public:
+    // 这个驱动作为 EP0 口能做什么(spec/port.hpp 的能力位, kGetPortList 原样上报): 主机
+    // 可切帧型(经典时控制器关 FD)、可设两段速率(按 87.5% 采样点求解, can/bit_timing.hpp)、
+    // 承载 64 字节长帧(RX 元素与 TX 缓冲按 64 字节配)。hpm5321 与 hpm6e8y 同一个驱动,
+    // 同一组能力。
+    static constexpr uint8_t kPortCapabilities =
+        spec::kCanCapModeSettable | spec::kCanCapFdLongFrames | spec::kCanCapRateSettable;
+
     // 仅凭逻辑 CAN 序号构造, CanPort 经 board::can_port() 推导。Lazy 的参数用
     // 序号而非 port: 每个构造点都不依赖端口表的内容。
     using Lazy = utility::Lazy<Can, data::DataId, size_t>;
@@ -59,7 +72,7 @@ public:
 
     // 两个位相的采样点, 全场钉在 87.5‰ -- 与总线上其他板一致, 而非 SDK 求解器
     // 的 75% 下限(那一档实测 FD 投递 0/40000, 见构造函数长注释)。EP0 的
-    // kGetCanConfig 读回与 kSetCanConfig 核对用的就是这两个编译期值。
+    // kGetPortConfig 读回与清单声明核对用的就是这两个编译期值。
     static constexpr uint16_t kNominalSamplePointPerMille = 875U;
     static constexpr uint16_t kDataSamplePointPerMille = 875U;
 
@@ -123,42 +136,68 @@ public:
         // 构造期初始化失败不停机: 其余端口与 USB 照常, 该路由 LED/can_status 暴露。
         (void)init_controller(libhcs_setting_, can_source_clock_freq);
 
-        mcan_enable_interrupts(can_base_, kEnabledInterrupts);
+        enable_interrupts();
         // CAN RX 是转发关键路径 (电机反馈 -> 主机)。优先级 3, 高于 USB (2) 与
         // UART (1) -- 保证 CAN 帧不被批量 USB 传输或 DMA 回调拖延。
         intc_m_enable_irq_with_priority(port.irq_num, 3);
+        // 上电即在总线上(没有 libhcs 主机时板子是 DMTool 的适配器)。
+        set_suspended(false);
+    }
+
+    // 每条 (重新) 初始化控制器的路径都以它结束: 使能本驱动的中断源, 并忘掉发送槽的
+    // 历史 (初始化后 TXBCF 全部置位, 不是真的作废; 见 send_to_fifo())。
+    void enable_interrupts() {
+        used_tx_slots_ = 0;
+        mcan_enable_interrupts(can_base_, kEnabledInterrupts);
+    }
+
+    // 往发送 FIFO 写一帧, 顺带数单发作废的帧: libhcs 关掉了自动重传, 输掉仲裁或出错的
+    // 发送就此作废, 不动 TEC/REC。一个槽只在上一次发送结束 (成功或作废) 后才被重新分配,
+    // 所以写入前读到的 TXBCF 那一位就是这个槽上一次的结果, 每次结果正好看一次。
+    // DAR 模式的自动作废不置 IR.TCF (实测: 打开 TCF 中断与 TXBCIE 后计数恒为 0),
+    // 所以不能靠中断数。代价: 每帧多读一次 TXBCF。
+    [[gnu::always_inline]] hpm_stat_t send_to_fifo(mcan_tx_frame_t* frame) {
+        const uint32_t cancelled_before = can_base_->TXBCF;
+        uint32_t slot = 0;
+        const hpm_stat_t status = mcan_transmit_via_txfifo_nonblocking(can_base_, frame, &slot);
+        if (status == status_success) {
+            const uint32_t bit = 1U << slot;
+            if ((cancelled_before & used_tx_slots_ & bit) != 0U) [[unlikely]]
+                ++cancelled_frames_;
+            used_tx_slots_ |= bit;
+        }
+        return status;
     }
 
     [[nodiscard]] data::DataId data_id() const { return data_id_; }
 
-    // 控制器错误状态, 供 EP0 状态查询 (usb/vendor_control.cpp)。每次直接读
-    // 寄存器而非缓存副本: PSR.LEC 读后自清为"无变化", 缓存副本会永远报旧
-    // 错误, 而重读则会对其他读者隐瞒错误。读者只有一个。
-    struct Status {
-        uint8_t tec, rec, last_error, data_last_error, flags;
-        uint32_t tx_occurred, tx_cancelled, rx_frames, rx_fifo_level;
-    };
-
-    [[nodiscard]] Status status() const {
+    // 运行时状态(core/src/link/port_status.hpp), 每个 keepalive 轮次在主循环读一次。
+    //
+    // PSR.LEC/DLEC 读后自清为"无变化", 而协议错误中断(kEnabledInterrupts)每次出错都会
+    // 进 ISR 读 PSR -- 错误码多半已被 ISR 读走。所以 ISR 把读到的错误码交给锁存
+    // (LatchedBusError, ISR 是它唯一的写者), 这里只读: 自己这次读到真实错误就用它,
+    // 否则用锁存的。
+    [[nodiscard]] data::CanStatusView read_status() const {
         const uint32_t psr = can_base_->PSR;
         const uint32_t ecr = can_base_->ECR;
         uint8_t flags = 0;
         if ((psr >> 5) & 1U)
-            flags |= 1U << 0; // error passive 态
+            flags |= data::kCanErrorPassive;
         if ((psr >> 6) & 1U)
-            flags |= 1U << 1; // warning 态
+            flags |= data::kCanWarning;
         if ((psr >> 7) & 1U)
-            flags |= 1U << 2; // bus off 态
+            flags |= data::kCanBusOff;
         return {
             .tec = static_cast<uint8_t>(ecr & 0xFFU),
             .rec = static_cast<uint8_t>((ecr >> 8) & 0x7FU),
-            .last_error = static_cast<uint8_t>(psr & 0x7U),
-            .data_last_error = static_cast<uint8_t>((psr >> 8) & 0x7U),
+            .last_error = last_bus_error_.latest(static_cast<data::CanLastError>(psr & 0x7U)),
+            .data_last_error =
+                last_data_bus_error_.latest(static_cast<data::CanLastError>((psr >> 8) & 0x7U)),
             .flags = flags,
-            .tx_occurred = can_base_->TXBTO,
-            .tx_cancelled = can_base_->TXBCF,
-            .rx_frames = forwarded_frames_,
-            .rx_fifo_level = can_base_->RXF0S & 0x7FU,
+            .tx_cancelled = static_cast<uint16_t>(cancelled_frames_),
+            .tx_dropped = tx_dropped_.count(),
+            .rx_dropped = rx_dropped_.count(),
+            .rx_lost = rx_lost_.count(),
         };
     }
 
@@ -225,48 +264,45 @@ public:
     [[nodiscard]] CanMode mode() const { return canfd_ ? CanMode::kCanFd : CanMode::kClassic; }
 
     // libhcs 的总线设置: 帧型与两段速率由 host 经 EP0 下发(接线事实, host 代码知道),
-    // 采样点与 TDC 是本板的实测策略, 不在其中。
-    struct BusSetting {
-        CanMode mode;
-        uint32_t arbitration_baudrate;
-        uint32_t data_baudrate; // FD 数据段; 经典模式下保留, 切回 FD 时沿用
-
-        friend constexpr bool operator==(const BusSetting&, const BusSetting&) = default;
-    };
+    // 采样点与 TDC 是本板的实测策略, 不在其中。类型是核心的统一设置(link::CanSetting),
+    // 主机测试的假驱动与固件驱动收同一个东西。
+    using BusSetting = core::link::CanSetting;
 
     [[nodiscard]] static constexpr BusSetting default_setting(CanMode mode) {
         return {
-            .mode = mode,
+            .fd = mode == CanMode::kCanFd,
             .arbitration_baudrate = kArbitrationBaudrate,
             .data_baudrate = kCanFdDataBaudrate};
     }
 
-    [[nodiscard]] const BusSetting& libhcs_setting() const { return libhcs_setting_; }
+    [[nodiscard]] const BusSetting& setting() const { return libhcs_setting_; }
 
-    // libhcs 经 EP0 应用总线设置(usb/vendor_control.cpp): 与硬件现状一致只记下选择, 否则丢弃
-    // 旧设置下排队的帧并重跑 libhcs 配置。解不出(87.5% 采样点下凑不出该速率)时救回原设置,
-    // 返回 false。
+    // libhcs 经 EP0 应用总线设置(核心 link::ep0 的清单阶段二): 与硬件现状一致只记下选择,
+    // 否则丢弃旧设置下排队的帧并重跑 libhcs 配置。解不出(87.5% 采样点下凑不出该速率)时
+    // 救回原设置, 返回 false。
     [[nodiscard]] bool apply_setting(const BusSetting& setting);
 
-    // 两个位相的速率与采样点(‰)。经典模式没有数据段, 两项报 0。
-    struct TimingIdentity {
-        uint32_t arbitration_baudrate;
-        uint32_t data_baudrate;
-        uint16_t nominal_sample_point;
-        uint16_t data_sample_point;
+    // 一份设置应用成功后应有的时序: 速率即所求, 采样点钉死在 87.5%。经典模式没有数据段,
+    // 两项报 0。
+    using TimingIdentity = core::link::CanTimingValue;
 
-        friend constexpr bool operator==(const TimingIdentity&, const TimingIdentity&) = default;
-    };
-
-    // 一份设置应用成功后应有的时序: 速率即所求, 采样点钉死在 87.5%。
-    [[nodiscard]] static constexpr TimingIdentity timing_of(const BusSetting& setting) {
-        const bool fd = setting.mode == CanMode::kCanFd;
+    [[nodiscard]] static constexpr TimingIdentity expected_of(const BusSetting& setting) {
+        const bool fd = setting.fd;
         return {
             .arbitration_baudrate = setting.arbitration_baudrate,
             .data_baudrate = fd ? setting.data_baudrate : 0U,
             .nominal_sample_point = kNominalSamplePointPerMille,
             .data_sample_point = fd ? kDataSamplePointPerMille : uint16_t{0},
         };
+    }
+
+    // 纯求解: 这份设置能不能原样落到本控制器上(bit_timing.hpp, 不碰寄存器)。0 = 能;
+    // 否则返回落不下的那一段速率。EP0 清单的校验阶段用它, 应用阶段的 init_controller()
+    // 走 SDK 写进去的是同一个解。
+    [[nodiscard]] uint32_t unrepresentable_rate(const BusSetting& setting) const {
+        return bit_timing::unrepresentable_rate(
+            can_clock_mhz_ * 1'000'000U, setting.fd, setting.arbitration_baudrate,
+            setting.data_baudrate, kNominalSamplePointPerMille, kDataSamplePointPerMille);
     }
 
     // 从 NBTP/DBTP 重构的硬件事实; 源时钟非整 MHz(未知)时速率报 0。
@@ -293,9 +329,35 @@ public:
     // 并切换 FD/经典模式。请求非法或硬件拒绝时端口保持原配置并返回 false。
     bool reconfigure_timing(bool fd, PhaseTiming nominal, PhaseTiming data);
 
-    // 按 libhcs_setting_ 重跑 libhcs 配置(初值为上电默认, EP0 可改)。libhcs 会话建立时
-    // 调用: DMTool 会话可能改过速率, 这里还原, 且不冲掉 host 经 EP0 下发的设置。
-    bool restore_default_timing();
+    // ---- 清单声明: 主机没声明的总线不上线 ----
+    //
+    // libhcs 主机的清单声明被完整应用时, 声明的总线以声明的设置上线(apply_setting),
+    // 未声明的总线留在挂起状态: 控制器进 INIT 模式撤下总线 -- 不应答别人的帧、不发
+    // 错误帧 -- 中断全关。归属交还(会话结束、挂起、重新枚举)时全部恢复(resume):
+    // 没有 libhcs 主机时板子是 DMTool 的适配器, 那条路不走 EP0, 总线必须是通的。
+    //
+    // 只在主循环调用(EP0 处理器与会话状态机都经 tud_task() 到达)。
+    [[nodiscard]] bool suspended() const { return suspended_; }
+    void suspend();
+    void resume();
+
+    // ---- 端口接口(core/src/link/ 的通用 CAN 操作按这一组原语工作) ----
+    //
+    // 全部是冷路径(EP0 与主循环的看门狗/挂起恢复), 不在转发热路径上。
+    [[nodiscard]] bool running() const { return !suspended_; }
+    // 此刻实际发送的帧型(硬件事实): 经典 = 控制器关 FD, 硬件上发不出任何 FD 位。
+    [[nodiscard]] bool fd_now() const { return canfd_; }
+    // 寄存器重构的位时序事实(timing_identity 的统一名)。
+    [[nodiscard]] TimingIdentity timing() const { return timing_identity(); }
+    // kGetPortConfig 的应答: 硬件事实而非"上次请求"。
+    void read_config(vc::CanConfigPayload& out) const;
+    // kGetPortList 的状态位。
+    [[nodiscard]] core::link::PortStatus describe() const {
+        return {.running = running(), .fd = canfd_};
+    }
+
+    // 在总线上的控制器, 每个一位(位号 = board_can_index): 主循环按它调 poll()。
+    [[nodiscard]] static uint32_t running_mask() { return running_mask_; }
 
     // 主循环看门狗, 处理 PLIC 已接受却从未送达的中断请求。健康路径仅两次寄存器
     // 读; 修复的故障及实测依据见 can.cpp。
@@ -389,7 +451,7 @@ private:
     // libhcs_config() 的时间戳单元与 sync 过滤器(实现见 can.cpp)。
     static void apply_timestamping(mcan_config_t& config) noexcept;
 
-    // libhcs 的整套控制器配置(建造者): 构造、会话还原、EP0 应用设置共用这一份, 各处逐字段
+    // libhcs 的整套控制器配置(建造者): 构造、resume()、EP0 应用设置共用这一份, 各处逐字段
     // 一致由此保证。速率来自 setting, 采样点/TDC/时间戳是本板策略。
     [[nodiscard]] mcan_config_t libhcs_config(const BusSetting& setting) const;
 
@@ -398,6 +460,7 @@ private:
 
     // 运行时重初始化到 mode(deinit -> 重挂消息 RAM -> init -> 开中断), 不检查发送队列。
     bool reinit(const BusSetting& setting);
+    void take_off_bus();
 
     // libhcs 的下行策略: 三个答案全是编译期常量。实例化后这些判断不留下任何
     // 指令 -- 尤其 explicit_dlc() 恒为空, "调用方给定 DLC"那条分支与它要占的
@@ -436,6 +499,20 @@ private:
     // drain_pending_transmits()。
     static inline constinit uint32_t transmit_pending_mask_ = 0;
 
+    // 在总线上(未挂起)的控制器按 board_can_index 置位。主循环的中断看门狗只走置位
+    // 的那些(running_mask()), 被 libhcs 握手挂起的总线在主循环里不占一次调用。
+    // 只由 set_suspended() 改写, 只在主循环读写。
+    static inline constinit uint32_t running_mask_ = 0;
+
+    // suspended_ 与 running_mask_ 的唯一写入点: 两者永远一致。
+    void set_suspended(bool suspended) {
+        suspended_ = suspended;
+        if (suspended)
+            running_mask_ &= ~(1U << can_index());
+        else
+            running_mask_ |= 1U << can_index();
+    }
+
     // 本控制器在 board::kCanPorts 中的位置。存下来而非从 data_id 推导: 6E8Y 用
     // kCan0..kCan3, 5321 用 kCan1..kCan2, 减去 kCan1 得不到板内序号。
     std::size_t can_index() const { return can_index_; }
@@ -443,7 +520,7 @@ private:
     // 读出并归一化一帧 RX FIFO。返回 `true` 表示消费了一个元素; `valid` 恒为
     // 归一化成功(FD 长帧 12-64 字节完整承载, 经典 DLC 9-15 钳到 8)。
     bool read_uplink(data::CanDataView& out, uint8_t storage[64], bool& valid);
-    static void serialize_uplink(
+    void serialize_uplink(
         core::protocol::FieldId field_id, const data::CanDataView& data,
         core::protocol::Serializer& serializer);
 
@@ -493,14 +570,29 @@ private:
     // poll() 用的中断记账。irq_count_ 仅 ISR 写、仅主循环读, 普通 32 位计数
     // 即可 -- RV32 上对齐的读写是原子的, 且只关心变化而非具体值。
     uint32_t irq_count_ = 0;
-    // 开机以来交给 serializer 的帧数。仅接收路径 (ISR 上下文) 写、仅主循环的
-    // EP0 状态查询读 -- RV32 上对齐的 32 位读写是原子的, 只关心变化, 无需同步。
-    uint32_t forwarded_frames_ = 0;
+    // 板子自己丢的帧(read_status() 报给主机): 下行撞上发送队列满(主循环写),
+    // 上行撞上上行批量池满(接收中断写)。
+    utility::EventCounter tx_dropped_;
+    utility::EventCounter rx_dropped_;
+    // RX FIFO0 溢出(IR.RF0L): 控制器里就丢了的帧, 每次 ISR 见到这个标志记一次(ISR 写)。
+    utility::EventCounter rx_lost_;
+    // ISR 从 PSR 读到的最近一次真实错误码(仲裁段 / 数据段), 只 ISR 写, read_status() 读。
+    utility::LatchedBusError last_bus_error_;
+    utility::LatchedBusError last_data_bus_error_;
+    // 开机以来作废的发送 (单发: 输掉仲裁或出错), 由 send_to_fifo() 在重用发送槽时清点;
+    // 最近还没被重用的槽 (至多 FIFO 深度个) 的结果要等下一次重用才计入。只在主循环
+    // (tud_task 与发送队列排空) 读写。
+    uint32_t cancelled_frames_ = 0;
+    // 本次初始化以来写过帧的发送槽。
+    uint32_t used_tx_slots_ = 0;
 
     // 接收中断进入时的 CSR_MCYCLE, 帧序列化完成后闭合。写与读都在同一中断内。
     uint32_t uplink_opened_at_ = 0;
     uint32_t watchdog_irq_count_ = 0;
     bool watchdog_armed_ = false;
+    // 见 suspend()。放在 watchdog_armed_ 之后的对齐空洞里: 不挪动其他成员的偏移。
+    // 仅主循环读写。
+    bool suspended_ = false;
 
     // 32 元素 MCAN TX FIFO 之前的软件发送队列, USB 突发超过总线消化速率时
     // 缓冲而非丢弃。生产者 handle_downlink、消费者 try_transmit, 都在主循环
@@ -519,8 +611,8 @@ private:
 
     utility::RingBuffer<QueuedFrame, kTransmitQueueSize> transmit_buffer_;
 
-    // host 经 EP0 下发的总线设置, restore_default_timing() 的还原目标。冷数据放类尾:
-    // 不挪动热路径成员的偏移。初值为端口表帧型 + 上电默认速率。
+    // host 经 EP0 下发的总线设置, resume() 的还原目标。冷数据放类尾: 不挪动热路径
+    // 成员的偏移。初值为端口表帧型 + 上电默认速率。
     BusSetting libhcs_setting_;
 };
 
@@ -564,6 +656,22 @@ consteval std::array<Can::Lazy, sizeof...(indices)>
 } // namespace internal
 
 inline constinit auto can_array = internal::make_can_array(std::make_index_sequence<kCanCount>{});
+
+// libhcs 握手开始 / 作废时对本 PCB 实有的全部控制器生效。以 can_count() 为界并用
+// try_get() 保护, 理由同下。
+inline void suspend_all() {
+    for (size_t i = 0; i < can_count(); ++i) {
+        if (Can* can = can_array[i].try_get())
+            can->suspend();
+    }
+}
+
+inline void resume_all() {
+    for (size_t i = 0; i < can_count(); ++i) {
+        if (Can* can = can_array[i].try_get())
+            can->resume();
+    }
+}
 
 // 本 PCB 实有控制器中最深的软件发送队列(Can::transmit_queues_empty() 用它)。以
 // can_count() 为界并用 try_get() 保护, 理由同其他对 can_array 的循环: 单路

@@ -2,197 +2,106 @@
 
 > **文档类型**：现行规范（板级）
 > **适用范围**：`firmware/mc02/`，DM-MC02 / CtrBoard-H7（STM32H723VGT6）
-> **状态**：现行有效
-> **相关文档**：[仓库根 AGENTS.md](../../AGENTS.md) · [本目录 README.md](README.md)（外设与低延迟设计） · [UART_RING_LOG.md](UART_RING_LOG.md)（UART 实录与实测） · [PACKET_RATE_LOG.md](PACKET_RATE_LOG.md)（USB 包率实测与已删开关） · [仓库根 README.md](../../README.md)（烧录流程）
-
-> 本目录专属指南，叠加在仓库根 `AGENTS.md` 之上。深入的外设/时钟/低延迟设计见本目录 `README.md`，此处只列 agent 关键点。
+> **状态**：现行有效（2026-10-06 精简：只留命令与约束，实测与来龙去脉在下列 L3 文档）
+> **相关文档**：[仓库根 AGENTS.md](../../AGENTS.md) · [README.md](README.md)（外设、低延迟设计、Generate 后的复原清单） · [UART_RING_LOG.md](UART_RING_LOG.md) · [PACKET_RATE_LOG.md](PACKET_RATE_LOG.md) · [../hpm_board/SOF_TIMEBASE.md](../hpm_board/SOF_TIMEBASE.md) · [../hpm_board/PITFALLS.md](../hpm_board/PITFALLS.md)
 
 ## 摘要
 
-mc02 是 Cortex-M7 @ 550 MHz 的高性能板，特点是 **CAN-FD 常驻 FD+BRS** 与 **热路径代码
-放 `.itcm`**；USB 受封装限制只能跑 Full-Speed，**瓶颈在 USB 还是在 CAN 取决于开几条
-总线**（分界线见下方「关键特性」）。改这块板之前必须知道两件事：外设配置回 CubeMX 改，以及**每次 CubeMX 重新 Generate 之后要手工
-复原一批改动**（清单在 [README.md](README.md)）。
+Cortex-M7 @ 550 MHz，CAN-FD 常驻 FD+BRS，热路径放 `.itcm`、状态放 `.dtcm`；USB 只能 Full-Speed。
+改之前必须知道：外设配置回 CubeMX 改，每次 Generate 之后按 [README.md](README.md) 末节手工复原。
 
-## 芯片与工具链
-- MCU：**STM32H723VGT6**（DM-MC02 / CtrBoard-H7），Cortex-M7 @ 550 MHz，LQFP100。
-- ISA/工具链：ARM，`cmake/gcc-arm-none-eabi.cmake`，需 `arm-none-eabi-gcc`。
+## 1. 构建与烧录
 
-## 构建
 ```bash
-cmake --preset debug -S firmware/mc02
+cmake --preset debug -S firmware/mc02          # 或 release
 cmake --build firmware/mc02/build --target mc02_app mc02_bootloader
 ```
-- preset：`debug` / `release`。target：`mc02_app`、`mc02_bootloader`。
-- 烧录与调试探针**只用 J-Link**（bootloader 首烧 / GDB / Ozone），不用 ST-Link /
-  OpenOCD；日常烧 app 走 DFU，见 [仓库根 README.md](../../README.md#固件编译与烧录)。
 
-### build 目录已存在时，`option()` 的默认值不生效 [实测 2026-08-12]
+- ARM 工具链 `cmake/gcc-arm-none-eabi.cmake`。日常烧 app 走 DFU（`0xA511:0x0723`，见仓库根 README）；
+  bootloader 首烧 / 调试只用 J-Link，不用 ST-Link / OpenOCD。
+- **已有 build 目录时 `option()` 默认值不生效**：改开关显式传 `-D...`，用
+  `grep libhcs_APP firmware/mc02/build/CMakeCache.txt` 核对。
 
-`cmake --preset debug` 在**已有** `firmware/mc02/build/` 上运行时**沿用旧 cache**，
-`app/CMakeLists.txt` 里 `option(... ON)` 的默认值不会被应用。曾经因此整整一轮测试都跑在
-一个自以为是 ON、实际是 OFF 的配置上，连带做出错误结论。
-
-改开关必须显式传：
-
-```bash
-cmake -Dlibhcs_APP_IMU_ENABLE=ON firmware/mc02/build && cmake --build firmware/mc02/build --target mc02_app
-```
-
-核对当前生效值：
-
-```bash
-grep libhcs_APP firmware/mc02/build/CMakeCache.txt
-arm-none-eabi-nm firmware/mc02/build/app/mc02_app.elf | grep -c bmi088   # IMU: OFF=3, ON=57
-```
-
-## 编译开关
-
-全部定义在 `app/CMakeLists.txt`，默认值即下表。**带 * 的三个都占用 `DataId::kUart0`，
-互斥。** kUart0 不是这块板的丝印 UART；丝印口是 UART1 / UART2 / UART3 / UART7 / UART10 加 DBUS
-（UART2 / UART3 就是 USART2 / USART3 的 RS-485，**永远编入**：原 `libhcs_APP_RS485_ENABLE` 开关已于
-2026-09-30 取消，代价是约 1.8 KB D2 SRAM 常驻，见 [UART_EP0_MIGRATION.md](../../UART_EP0_MIGRATION.md) 第 1 节）。
+## 2. 编译开关（`app/CMakeLists.txt`）
 
 | 开关 | 默认 | 作用 |
 |---|---|---|
-| `libhcs_APP_IMU_ENABLE` | ON | BMI088 初始化与采样 |
-| `libhcs_APP_USB_RX_XFER_SIZE` | 1024 | 一次 bulk OUT 传输请求的字节数（64 的倍数）。1024 是实测拐点，比旧的 64 高 59% |
-| `libhcs_APP_LOOP_BALLAST_CYCLES` | 0 | 每圈主循环插入的纯忙等周期数，**只是测量仪器**，出厂镜像永远是 0 |
-| `libhcs_APP_DEBUG_KNOBS` | OFF | 暴露调试器可写的调优旋钮（`diag/knobs`），配合 Ozone / J-Link 在线改参 |
-| `libhcs_APP_TIME_SYNC` | OFF | 运行共享 USB-SOF 时间基准做跨板对时，机制与实测见 [../hpm_board/SOF_TIMEBASE.md](../hpm_board/SOF_TIMEBASE.md) |
-| `libhcs_APP_USB_RX_HIST` * | OFF | 相邻两次 bulk OUT 完成的间隔直方图（DWT）在 kUart0 上输出 |
-| `libhcs_APP_LOOP_PROFILE` * | OFF | 主循环分段耗时（DWT）在 kUart0 上以 ASCII 输出 |
-| `libhcs_APP_CAN_DIAG` * | OFF | CAN 遥测记录在 kUart0 上输出 |
+| `libhcs_APP_USB_RX_XFER_SIZE` | 1024 | 一次 bulk OUT 传输的字节数（64 的倍数），1024 是实测拐点 |
+| `libhcs_APP_LOOP_BALLAST_CYCLES` | 0 | 测量仪器：每圈主循环忙等周期，出厂永远 0 |
+| `libhcs_APP_DEBUG_KNOBS` | OFF | 调试器可写的调优旋钮（`diag/knobs`） |
+| `libhcs_APP_USB_RX_HIST` * / `LOOP_PROFILE` * / `CAN_DIAG` * | OFF | 诊断输出，三者都占 `DataId::kUart0`，互斥 |
 
-**已删除、不要重新加回的开关**（都经过完整实测，判决与数据见
-[PACKET_RATE_LOG.md](PACKET_RATE_LOG.md)，要加回必须先重做那里的测量）：
+- 已删除、不要加回：`USB_DWC2_DMA`、`UART_RX_IN_ISR`（`PACKET_RATE_LOG.md`）、`IMU_ENABLE`（IMU 由声明决定）、
+  `RS485_ENABLE`（UART2/3 永远编入）、`APP_TIME_SYNC`（时间基准由声明决定）。旧 cache 里的这些变量已无作用。
+- 包率对主循环周期强非单调（±35%），USB 性能 A/B 不能只测一个工作点（`PACKET_RATE_LOG.md` 第 1 节）。
 
-- ~~`libhcs_APP_USB_DWC2_DMA`~~（2026-08-28）：小包包率 −3%、大包无收益，slave 模式是唯一支持的配置。
-- ~~`libhcs_APP_UART_RX_IN_ISR`~~（2026-08-31）：主循环省 0.5 us 但换不到包率，200 字节 RS-485 往返慢 26%。
+## 3. 配置即声明（EP0，核心在 `core/src/link/ep0.hpp`，本板 `app/src/usb/vendor_control.cpp` + `app/src/ports.hpp`）
 
-本板包率对主循环周期**强非单调**（±35% 相位摆幅），任何 USB 性能 A/B 只在一个工作点
-测都不可信——判据与工具见 [PACKET_RATE_LOG.md](PACKET_RATE_LOG.md) 第 1 节。
+- **会话胶水在 common（2026-10-06）**：kStart/kKeepalive 应答、租约、断联下线、kTimeAnchor 应答与批量缓冲宿主
+  （`deserializer_/serializer_/transmit_buffer_`）在 `firmware/common/app/src/link/host_session.hpp` 的
+  `link::HostSession` 模板（三板同一份；本文件里的旧副本已删）。本板 Vendor 只剩传输形态、EP0 门
+  （`session_allowed()`）、下行分发钩子（`dispatch_*`，经 Registry）与 TimeSync 策略。
+- **上电时所有口都是停的**：FDCAN 留在 INIT，UART 不武装 DMA，IMU 芯片不碰、数据就绪线屏蔽，蜂鸣器与
+  GPIO 通道不开。清单（`kApplyManifest`）声明了才启动；会话结束 / 挂起 / 重新枚举时
+  `Vendor::stop_channels()` 全停（发送环里已收下的字节照常发完）。
+- 口按 DataId 寻址，丝印号即身份（UART1/2/3/7/10、DBUS=`kUartDbus`、`kImu`、`kGpio` 的四根线、`kBuzzer`）。
+  身份只有一处来源：`spec/mc02/` 的具名描述符。**"按口列一遍"只有注册表一份**：停口
+  `Registry::suspend_all()`、下行分发 `Registry::dispatch<类型>()`、串口轮询 `ports::poll_uarts()`；新增口只改口表、
+  驱动对象、绑定三处，不要手写 switch 或下标表。
+- CAN：TX 帧型可经 EP0 切（只改 Tx 元素 FDF/BRS，不进 INIT）；仲裁/数据段速率与采样点是**核对不是配置**。
+- UART：声明必须给全速率、字长 7/8、校验、停止位、接收极性（缺项 `kConfigErrorIncomplete`），先全量校验后统一
+  提交；不提供 9 位字长。速率一致性比 `BRR` 整数。接收极性走 `CR2.RXINV`（DBUS/SBUS 正常、iBUS 反相，
+  主机 `Mc02::configure_dbus()`）。
+- 重放清单不碰设置没变的口（串口、IMU、GPIO）：接手或回滚之后挂起过的口才整份重写。
+- `handle_downlink()` 里的 `started_` 判断是没声明口的最后一道，不要删。
+- 改 `CR1` / `CR2` / `BRR` 这类只能在 `UE=0` 时写的寄存器：**先存进来时的 `CR1`，最后原样写回**，不要从新值里
+  掩掉 `UE`（`PACKET_RATE_LOG.md` 4.5）。
 
-## 目录结构
-- `app/`、`bootloader/`：两套独立镜像。`app/src/app.cpp` 提供自己的 `main()`，直接驱动生成的 `*_Config()` / `MX_*_Init()`。
-- `bsp/cubemx/`：CubeMX 生成产物。`bsp/linker/`：手维护链接脚本（如 `STM32H723VGTx_APP.ld`，含 `.itcm` 热路径段）。
-- `bsp/`：`cmsis-device-h7`、`stm32h7xx-hal-driver` 等第三方，视为只读。
+## 4. 主循环（`app/src/app.cpp` 的 `App::run()`）
 
-## 关键特性（改代码前须知）
-- USB：OTG_HS 跑 **Full-Speed**（LQFP100 无 HS PHY 引出）。**"瓶颈是 USB 还是 CAN"没有
-  统一答案，按跑满的总线条数分界**：上行每帧 15 B（`1 + 3 - 1 + 8 + 4`，见
-  [HOST_TUNING.md](../../HOST_TUNING.md) 9.3），CAN-FD 每条总线上限 19870 帧/s，而本板
-  USB 聚合上限约 800 KB/s。于是 **1-2 条总线跑满时卡在 CAN 线速**（298 / 596 KB/s），
-  **3 条一起跑满时才卡在 USB**（894 KB/s > 800）。分界点约 2.7 条总线，即聚合 53000 帧/s。
-  `[推断，基于 800 KB/s 与 19870 帧/s 两项实测]`
-- CAN：FDCAN1/2/3 控制器常驻 FD+BRS（收方向恒为超集）；**发送帧型默认跟随 `kCanPorts`
-  表（三条总线全 FD），且可由主机经 EP0 在构造期/运行时切换**——应用即改 Tx 元素的
-  FDF/BRS 标志，控制器不进 INIT 重配。每帧 `is_fdcan` 位已废弃（2026-09-12），设计
-  细节见 [README.md](README.md)「低延迟设计」。
-- **配置通道：EP0 vendor_control**（`app/src/usb/vendor_control.cpp`，版本是编译期线格式指纹）：kGetInterface
-  握手（握手完成前 kStart 被静默拒绝）+ CAN 模式配置（本板置 `kCapCanModeSettable`，
-  host 经 kSetCanConfig+apply 位切换 TX 帧型并经 kGetCanConfig 读回）/状态查询 +
-  UART 波特率与帧格式（字长 7/8、校验无/偶/奇、停止位 1/2，稀疏 patch + apply 位，
-  先全量校验后统一提交，STALL 严格等于零改动；9 位字长不提供——RX 环是字节 DMA）。
-  速率一致性比 `BRR` 整数（`divisor`，GET 回报、SET 回显即断言），不比波特率；写入后
-  回读 `BRR` 不符报 `kConfigErrorVerifyFailed`。
-  **接收极性**（`rx_polarity`，指 MCU 引脚上的极性）走 CR2.RXINV，是四块板里唯一能反相的：
-  DBUS 口板上已有硬件反相器，所以 DBUS/SBUS（线上反相）用正常，iBUS（线上不反相）用反相
-  把反相器抵消掉。host 侧用 `Mc02::configure_dbus(Mc02::DbusReceiver::kDbus/kSbus/kIbus)`，
-  预设把每个字段都写满，换接收机不会继承上一个的设置 `[仅编译验证，未上板 2026-09-30]`。
-  「DBUS 口有板载反相器」是推断：固件从未开 RXINV，而开源 MC02 框架用同样的
-  `NO_INIT` 配置接收 DT7。
-  payload 里的 CAN 仲裁/数据段速率与采样点字段是**核对不是配置**（位时序是本板
-  实测整定值、速率由对端电机硬件决定，只能断言）。请求码与 payload 见
-  [core vendor_control.hpp](../../core/include/libhcs/protocol/vendor_control.hpp)。
-  in-band `kUart*Config` 字段已退役（收到即拒绝并进 discard mode），运行时切波特率走
-  host 侧 `configure_uartN()`；EP0 的 UART 索引固定为 DBUS=0、UART1=1、UART2=2、
-  UART3=3、UART7=4、UART10=5，每个下标背后都有对象。
-- **CAN 的协议与速率由电机硬件决定，不是可调参数**：仲裁段 1 Mbit/s / 数据段
-  5 Mbit/s 的上限、能否上 FD，都由总线对端电机固件决定，本仓库**无法修改**
-  `[硬件事实，用户确认 2026-09-12]`。吞吐/延迟优化**不要**以「升级 CAN-FD /
-  提高波特率 / 改采样点」为建议方向；可行杠杆在成帧、软件路径与主机侧（见上方
-  「瓶颈」分析与 [PACKET_RATE_LOG.md](PACKET_RATE_LOG.md)）。
-- **DAR 发送请求卡死有软件守护**：`AutoRetransmission=DISABLE` 命中 ST 勘误
-  ES0491 §2.22.3——仲裁在前两个 ID 位失败时，发送请求可能既不发也不取消，槽位
-  永久挂起，反复命中会让该路 TX 静默瘫痪。`Can::recover_stuck_transmits()`
-  （`app/src/can/`）每 512 趟主循环查一次 TXBRP，挂起超 20 ms 且非 bus-off 就按
-  workaround 取消释放槽位，刻意不重发（槽位复用竞态，理由在 can.cpp 注释）。
-  `[实测 2026-09-12：烧录后 mc02<->5321 双总线延迟/48 帧深突发与改前持平，0% 丢帧]`
-- **下行 CAN 帧直写硬件 FIFO，只有 FIFO 满了才进队列** [2026-08-24 修复]。
-  `handle_downlink` 由 `tud_vendor_rx_cb` 在 `tud_task()` 里调用，与 `try_transmit()`
-  同线程，所以直写是安全的（队列非空时必须让路，否则会插队）。
-  **改之前是无条件入队**，于是每一帧都要等到主循环末尾的 `canN->try_transmit()` 才
-  进硬件，中间隔着 DFU poll、GPIO 采样、一次 BMI088 SPI 读和 LED poll；同时那个
-  16 深的环（继承自 c_board，那块板 bxCAN 只有 3 个发送邮箱，16 是净赚）架在 32 条
-  FDCAN FIFO **前面**，把单包突发上限从 32 砍到了 16。队列深度现在是 64
-  （`kTransmitQueueSize`，每路 1 KB DTCM），与 hpm_board 一致。
-  **实测效果**（交替烧录 A/B，三轮各 4000 帧，已跑 `host-tuning.sh`；
-  5321 -> mc02 方向作对照组，三轮 p50 131.2/131.1/131.1 -> 131.6/131.0/131.4，确认未动）：
+- 每趟固定只做：看 USB 事件队列（有才 `tud_task()`）、看毫秒翻没翻（翻了才做会话租约 / DFU / LED / CAN 卡死
+  守护）、泵一次上行、读一次位图 `loop::active`（`utility/loop_work.hpp`，位号 = DataId）。**不要加无条件的调用**；
+  "用到才跑"的东西往位图里加一位，**置位放在对象自己的 `start()` 里**。
+- 每圈要读写的状态放 `.dtcm`，不要放 `.d2_sram`，也不要放 `.data` / `.bss`（AXI SRAM 前 32 KB 非缓存）。
 
-  | mc02 -> 5321 | 改前（三轮） | 改后（三轮） |
-  |---|---|---|
-  | CAN-FD min | 94.6 / 95.0 / 94.7 us | **90.9 / 92.9 / 91.8 us** |
-  | CAN-FD p50 | 124.8 / 124.7 / 124.7 us | **123.6 / 123.7 / 123.7 us** |
-  | CAN-FD avg | 125.4 / 125.9 / 125.3 us | **121.7 / 122.8 / 122.5 us** |
-  | classic p50 | 180.5 / 180.5 / 180.5 us | **179.7 / 179.8 / 179.5 us** |
-  | classic p90 | 209.9 / 207.6 / 209.4 us | **206.7 / 206.7 / 206.2 us** |
-  | 单包突发 17/24/32/40/64 帧 | 丢 5.9/33/50/60/75% | **全部 0%** |
+## 5. CAN
 
-  **改后 avg 落到 p50 之下**（122.3 vs 123.7）：分布变成双峰，一部分帧真的走了直通路径
-  （min 掉到 91 us），把均值拉到中位数以下。这也是为什么均值改善 3.2 us 而中位数只有
-  1.1 us。
+- 协议与速率由对端电机决定（1M/5M），优化不要往"升 FD / 提波特率 / 改采样点"走。
+- 下行帧直写硬件 FIFO，只有 FIFO 满才进 64 深的软件队列（队列非空时必须让路）。
+- DAR 发送请求卡死（ES0491 §2.22.3）由 `Can::recover_stuck_transmits()` 每毫秒守护：挂起超 20 ms 且非 bus-off
+  就取消释放槽位，刻意不重发。不重传是用户决定（`../hpm_board/PITFALLS.md` 第 9 节）。
+- 中断入口不碰 FLASH：向量表启动时复制进 DTCM（`relocate_vector_table()`，`.dtcm` 复制之后、开中断之前），
+  三路 FDCAN 第 0 中断线指向 ITCM 的 `line0_isr<>`。`stm32h7xx_it.c` 的 `FDCANx_IT0_IRQHandler` 仍由 CubeMX
+  生成，不要删。热路径（`handle_uplink/handle_downlink`、发送队列排空）在 `.itcm`。
 
-  **p99 / max 没有可重现的改善**，且调优后 max 在**所有臂包括对照组**仍是 630-950 us。
-  那是主机侧的：`mixed_board_test` 经 `multi_board.hpp` 构造 session，**没有传
-  `thread_setup`，事件线程没绑核**，而这是 [HOST_TUNING.md](../../HOST_TUNING.md) 1.3
-  记的尾部最差一档。**要评估板级抖动，得先给测量工具加上绑核能力**，否则测的是主机调度。
-  `[实测 2026-08-24，mc02 <-> 5321，已调优主机、事件线程未绑核]`
-- **下行不背压**：与 hpm_board 统一的决定（2026-09-14，理由与实测见
-  [hpm_board AGENTS.md](../hpm_board/AGENTS.md)「USB 现行约束」）。`CFG_TUD_VENDOR_RX_MANUAL_XFER`
-  不设置，取 TinyUSB 默认 0。过载行为是 CAN 软件发送队列满即静默丢弃 + LED；
-  `diag::note_tx_fail()` 在默认构建下仍是空实现（`libhcs_APP_CAN_DIAG` 默认 OFF）。
-  **从 hpm 移植的背压代码（手动重挂、迟滞水位、20 ms 逃生阀、审计钩子、`DOEPCTL.SNAK`
-  写入）已删除，不要加回。** 硬件事实留作参考：本板 DWC2 **不重挂时照样把包 ACK 进接收
-  FIFO 然后在 dcd 层无声丢弃**（主机全速灌 24k 帧/s 零阻塞），显式写 `DOEPCTL.SNAK`
-  扣住端点则与 TinyUSB dcd 的状态机冲突，上电即死/USB 退化 `[实测 2026-09-12]`。
-- 热路径 `Can::handle_uplink/handle_downlink` 与排空发送队列的
-  `drain_transmit_queue`/`drain_pending_transmits_slow` 等放 `.itcm`，启动时从 FLASH 拷入；
-  `try_transmit()` 已改为头文件内联的空队列快测，主循环入口是 `drain_pending_transmits()`。
-  `[代码核对 main 1022f3e，2026-09-12]`
-- UART：六个口（USART1 / USART2 / USART3 / UART7 / USART10 / UART5-DBUS）各一条**永不停的整环 circular DMA**，写指针由主循环读 `NDTR` 推导，不由中断维护。端口对象（含 DMA 环）放 `.d2_sram`，启动时从 FLASH 拷入，MPU region 1 在 `app.cpp` 里设为非缓存。**不要给 UART 的 DMA 开 FIFO/burst**——`NDTR` 只统计到 DMA FIFO，写指针会算错。DataId 就是丝印号：UART1/2/3/7/10 加 DBUS。USART2 / USART3 永远编入（开关已取消）。
-- UART 错误策略：`CR3.OVRDIS=1`、**`CR3.DDRE=0`**、`CR3.EIE=0`。`DDRE` 是"出错时禁用 DMA"，**置 1 会让一个坏字符永久杀死端口**——细节见 [UART_RING_LOG.md](UART_RING_LOG.md) 第 1 章。
-- 实测吞吐天花板约 **800 KB/s 聚合**（USB Full-Speed 决定），781 KB/s 时零丢失；主循环在满过载下仍有约 10 倍余量。
+## 6. USB 与 UART
 
-- **代码级剩余空间判定 [实测综合 2026-09-22]：C++ 层已无可测优化余量，不要重开。**
-  `try_transmit()` 每趟一个 ≤64 B 块的写法不是瓶颈——上一行"满过载 10 倍余量"直接否掉
-  "按 `write_available()` 一次排空"的改型（已试编，语义等价、可构建，因无可见收益回退）。
-  "每帧一次 CAS 预留"的位置归属有误：`written_size_` 的 CAS 在 **c_board** 的
-  `interrupt_safe_buffer.hpp`（不在本板 can.cpp），且同为洪泛才可见，等洪泛复测出数据再议。
-  host 侧 `invoke_receive_callback` 的 std::function 间接调用与 `acquire_transmit_buffer`
-  的 mutex 对照每包 ~10 µs 线上时间是个位数 ns，不做。能改变数字的杠杆都在 C++ 外：
-  应用层批量策略与主机调度。
+- USB Full-Speed，聚合上限约 800 KB/s：1-2 条 CAN 总线跑满时卡在 CAN 线速，3 条才卡在 USB。
+- **下行不背压**：`CFG_TUD_VENDOR_RX_MANUAL_XFER` 不设；移植来的背压代码与 `DOEPCTL.SNAK` 写入已删，不要加回。
+- UART：每口一条整环 circular DMA，写指针由主循环读 `NDTR` 推导；DMA 缓冲在 `.d2_sram`（MPU 非缓存），端口对象在
+  `.dtcm`。**不要给 UART DMA 开 FIFO/burst**（`NDTR` 会算错）。接收 DMA 的 TC/HT 中断关掉、错误中断保留。
+- 错误策略：`CR3.OVRDIS=1`、**`CR3.DDRE=0`**（置 1 一个坏字符就永久杀死端口）、`CR3.EIE=0`（`UART_RING_LOG.md` 第 1 章）。
+- 转发按时间：最早未发的字节等满 250 µs 就转发（`rx_buffer.hpp` `kHoldCycles`）；`idle_delimited` 包后静默两个
+  字符时间（`tx_buffer.hpp`）。
+- **不要用 `HAL_RCCEx_GetPeriphCLKFreq()` 取 UART 内核时钟**（本版 HAL 对两个 UART 组返回 0）：用
+  `UART_GETCLOCKSOURCE()` 再按时钟源取频率（HSI 要按 `RCC_FLAG_HSIDIV` 右移）。别照抄 c_board 的写法。
+- C++ 层已无可测优化余量，不要重开（数据见 `PACKET_RATE_LOG.md`）；能改变数字的杠杆在应用层批量与主机调度。
 
-## 不要用 HAL_RCCEx_GetPeriphCLKFreq() 取 UART 内核时钟 [实测 2026-08-05]
+## 7. CAN 帧时间戳与共享时间基准（机制与实测见 `../hpm_board/SOF_TIMEBASE.md` 8.7）
 
-**结论先行：本版 HAL 的 `HAL_RCCEx_GetPeriphCLKFreq()` 对两个 UART 组都返回 0**
-（if/else 链只覆盖 SAI / SPI / ADC / SDMMC / SPI6 / FDCAN，`RCC_PERIPHCLK_USART16910`
-和 `RCC_PERIPHCLK_USART234578` 一个分支都没有；那两个宏本身存在，所以编译期没有任何
-提示）。后果是波特率求解路径（时名 `handle_config()`，现拆为 `solve_brr()` + `commit_brr()`）拿到 0 后提前返回，**`BRR` 一次都没写过**，运行时
-波特率请求被静默忽略，端口永远停在 CubeMX 的 115200。
+- **时间基准是声明，不是编译开关**（v14）：主机 `hcs::Configuration::enable_time_sync()`。第一次开时接通 TIM5
+  的 SOF 捕获、标定 TIM3 <-> TIM5（中断关着至多 0.5 ms），每次开都复位时间基准与 SOF 环；关着时 SOFM 不开，
+  `__wrap_dcd_int_handler` 与 CAN 接收中断只多读一次 `sync::time_sync_on()`（DTCM）。`stop_channels()` 即关。
+- 定时器分工（.ioc 是唯一来源，固件只检查不改写）：TIM5（PSC 0，ARR 0xFFFFFFFF）= SOF 捕获（ITR7）与整条时间轴；
+  TIM3（PSC 1，ARR 65535）= FDCAN 外部时间戳，CH4 = PB1 IMU 加热（不开）；TIM23（PSC 274）= 板上 1/4 µs 时间戳；
+  TIM2 只做 PWM。`MX_TIM3/5/23_Init()` 上电总调。
+- **TIM3 与 TIM5 的 CNT / PSC / ARR / UG 运行时一律不碰**：两者的整数关系（`core/src/time/counter_link.hpp`）每毫秒
+  抽查，一破就停打戳。加热 PWM 若要开，只写 CCR4。
+- SOF 锁存值按帧号扣掉全速填充位（`core/src/time/usb_sof_bits.hpp`），时间基拟合同样扣。`stamp_of()`、
+  `window_covers()` 在 ITCM，没有库调用。
+- 对 5321 的 +206 ns 常数不补偿（混着轴偏移与 CAN 接收延迟差，8.7.9）。
 
-**正确做法**（已改成这样）：用 HAL 自己的 `UART_GETCLOCKSOURCE(handle, src)` 宏——
-它按外设实例分派，正是 `UART_SetConfig()` 在 init 时算 `BRR` 用的同一个宏——
-再按 `UART_CLOCKSOURCE_*` 取 `HAL_RCC_GetPCLK1Freq()` / `PCLK2` / HSI（**要按
-`RCC_FLAG_HSIDIV` 右移**）/ CSI / LSE / PLL2Q / PLL3Q。不要自己手写"哪个口属于
-哪个时钟组"的判断。**别看着 c_board 的两行实现（F407 上是对的）就照抄过来**——
-H7 在中间插了每组可选时钟源 + 预分频器。
+## 8. CubeMX 纪律
 
-**为什么很难发现**：`UART7 <-> UART10` 自环测试在 115200 到 2000000 **全部 PASS**——
-自环只能验证两端一致，不能验证两端等于你要的值（详见
-[hpm_board PITFALLS.md 第 6 节](../hpm_board/PITFALLS.md)，同一次排查的 5321 侧
-DLAB 坑也在那里）。
-
-## CubeMX 纪律（本板适用）
-- 配置改在 CubeMX（`.ioc`），人工 Generate；**禁止**直接改 `bsp/cubemx/Core/` 生成代码。
-- **每次 CubeMX “Generate Code” 后需手工复原**（会被覆盖），清单见 `README.md` 末节，例如删除 `Core/Src/main.c` 里重新生成的 `int main(void)`、把 `static void MPU_Config` 改回 `void MPU_Config`。
+配置改在 `.ioc`，人工 Generate；禁止直接改 `bsp/cubemx/Core/`。Generate 之后按 README 末节复原（删重新生成的
+`int main(void)`、`static void MPU_Config` 改回 `void MPU_Config` 等）。

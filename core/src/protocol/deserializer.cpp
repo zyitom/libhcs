@@ -45,6 +45,9 @@ coroutine::LifoTask<void> Deserializer::process_stream() {
         if (id == FieldId::kExtend) {
             const auto* header_bytes = co_await peek_bytes(sizeof(FieldHeaderExtended));
             if (!header_bytes) [[unlikely]] {
+                // The transfer ended inside the extended field header: the
+                // record is truncated, and only its first byte says kExtend.
+                callback_.error_callback(FieldId::kExtend, data::DownlinkError::kMalformed);
                 enter_discard_mode();
                 continue;
             }
@@ -53,61 +56,73 @@ coroutine::LifoTask<void> Deserializer::process_stream() {
             consume_peeked_partial(sizeof(FieldHeader));
         }
 
-        bool success = false;
+        RecordStatus status = RecordStatus::kDelivered;
         switch (id) {
         case FieldId::kCan0:
         case FieldId::kCan1:
         case FieldId::kCan2:
-        case FieldId::kCan3: success = co_await process_can_field(id); break;
+        case FieldId::kCan3: status = co_await process_can_field(id); break;
         case FieldId::kUartDbus:
         case FieldId::kUart0:
         case FieldId::kUart1:
         case FieldId::kUart2:
         case FieldId::kUart3:
         case FieldId::kUart7:
-        case FieldId::kUart10: success = co_await process_uart_field(id); break;
-        case FieldId::kUartDbusConfig:
-        case FieldId::kUart0Config:
-        case FieldId::kUart1Config:
-        case FieldId::kUart2Config:
-        case FieldId::kUart3Config:
-        case FieldId::kUart7Config:
-        case FieldId::kUart10Config: success = co_await process_uart_config_field(id); break;
-        case FieldId::kGpio: success = co_await process_gpio_field(id); break;
-        case FieldId::kImu: success = co_await process_imu_field(id); break;
-        case FieldId::kSession: success = co_await process_session_field(id); break;
-        default: break;
+        case FieldId::kUart10: status = co_await process_uart_field(id); break;
+        case FieldId::kGpio: status = co_await process_gpio_field(); break;
+        case FieldId::kBuzzer: status = co_await process_buzzer_field(); break;
+        case FieldId::kImu: status = co_await process_imu_field(id); break;
+        case FieldId::kSession: status = co_await process_session_field(id); break;
+        default: status = RecordStatus::kUnknownField; break;
         }
-        if (!success)
+        if (status != RecordStatus::kDelivered) [[unlikely]] {
+            if (status == RecordStatus::kRefused) {
+                // The record is complete and its bytes consumed, so the next
+                // record starts on a known boundary: skip this one and keep
+                // delivering the rest of the batch.
+                callback_.error_callback(id, data::DownlinkError::kRefused);
+                continue;
+            }
+            // Truncated, structurally invalid, or of an unknown field id: the
+            // next record's boundary is unknowable, so the rest of this
+            // transfer is dropped. Re-entering discard mode from the
+            // finish_transfer() unwind (discard_mode_ already set) is
+            // harmless -- and is what reports the truncation exactly once.
+            callback_.error_callback(
+                id, status == RecordStatus::kUnknownField ? data::DownlinkError::kUnknownField
+                                                          : data::DownlinkError::kMalformed);
             enter_discard_mode();
+        }
     }
 }
 
-coroutine::LifoTask<bool> Deserializer::process_can_field(FieldId field_id) {
+auto Deserializer::process_can_field(FieldId field_id) -> coroutine::LifoTask<RecordStatus> {
     data::CanDataView data_view;
     uint8_t can_data_length = 0;
+    bool has_can_data = false;
     bool is_long_frame = false;
     bool has_timestamp = false;
     {
         const auto* header_bytes = co_await peek_bytes(sizeof(CanHeader));
         if (!header_bytes) [[unlikely]]
-            co_return false;
+            co_return RecordStatus::kMalformed;
         auto header = CanHeader::CRef{header_bytes};
 
         data_view.is_extended_can_id = header.get<CanHeader::IsExtendedCanId>();
         data_view.is_remote_transmission = header.get<CanHeader::IsRemoteTransmission>();
         can_data_length = static_cast<uint8_t>(header.get<CanHeader::HasCanData>());
+        has_can_data = can_data_length != 0;
         is_long_frame = header.get<CanHeader::IsLongFrame>();
         // Reserved combination: ISO CAN-FD has no remote frames, so no peer
         // can ever have encoded IsLongFrame on one.
         if (is_long_frame && data_view.is_remote_transmission) [[unlikely]]
-            co_return false;
+            co_return RecordStatus::kMalformed;
     }
 
     if (data_view.is_extended_can_id) {
         const auto* header_ext_bytes = co_await peek_bytes(sizeof(CanHeaderExtended));
         if (!header_ext_bytes) [[unlikely]]
-            co_return false;
+            co_return RecordStatus::kMalformed;
         auto header = CanHeaderExtended::CRef{header_ext_bytes};
 
         data_view.can_id = header.get<CanHeaderExtended::CanId>();
@@ -119,7 +134,7 @@ coroutine::LifoTask<bool> Deserializer::process_can_field(FieldId field_id) {
     } else {
         const auto* header_std_bytes = co_await peek_bytes(sizeof(CanHeaderStandard));
         if (!header_std_bytes) [[unlikely]]
-            co_return false;
+            co_return RecordStatus::kMalformed;
         auto header = CanHeaderStandard::CRef{header_std_bytes};
 
         data_view.can_id = header.get<CanHeaderStandard::CanId>();
@@ -132,42 +147,47 @@ coroutine::LifoTask<bool> Deserializer::process_can_field(FieldId field_id) {
     // resolve_can_length returns 0 for a reserved encoding; the record is
     // structurally undecodable, so the stream goes to discard mode rather
     // than delivering a frame that was never sent.
-    if (can_data_length == 0 && !data_view.is_remote_transmission)
-        co_return false;
+    //
+    // Only a record that CLAIMS data can be undecodable this way. A record
+    // with HasCanData clear is a zero-length frame -- a legal CAN data frame
+    // (DLC 0) that the serializer writes exactly like this, remote or not.
+    // Testing the length alone used to reject it and, through discard mode,
+    // every field after it in the same transfer (host/tests/wire_protocol_test.cpp).
+    if (has_can_data && can_data_length == 0)
+        co_return RecordStatus::kMalformed;
     consume_peeked();
 
     // A later peek may reuse the pending cache, so keep the payload and its
     // timestamp in one window until the callback has consumed can_data.
-    const size_t tail_size = can_data_length + (has_timestamp ? sizeof(uint32_t) : 0);
+    const size_t tail_size = can_data_length + (has_timestamp ? layouts::kCanStampBytes : 0);
     if (tail_size) {
         const auto* tail_bytes = co_await peek_bytes(tail_size);
         if (!tail_bytes) [[unlikely]]
-            co_return false;
+            co_return RecordStatus::kMalformed;
 
         data_view.can_data = std::span<const std::byte>{tail_bytes, can_data_length};
         if (has_timestamp) {
-            const auto* ts_bytes = tail_bytes + can_data_length;
-            // Explicit little-endian to match the serializer; on a
-            // little-endian host this compiles to the same plain load the
-            // native memcpy produced.
-            data_view.timestamp_us = utility::Bitfield<4>::CRef{ts_bytes}
-                                         .get<layouts::CanTimestampLayout::TimestampUs>();
+            const auto* stamp_bytes = tail_bytes + can_data_length;
+            data_view.sof_stamp =
+                libhcs::time::SofStamp{utility::Bitfield<layouts::kCanStampBytes>::CRef{stamp_bytes}
+                                           .get<layouts::CanStampLayout::Ticks>()};
         }
         consume_peeked();
     } else {
         data_view.can_data = std::span<const std::byte>{};
     }
 
-    co_return callback_.can_deserialized_callback(field_id, data_view);
+    co_return callback_.can_deserialized_callback(field_id, data_view) ? RecordStatus::kDelivered
+                                                                       : RecordStatus::kRefused;
 }
 
-coroutine::LifoTask<bool> Deserializer::process_uart_field(FieldId field_id) {
+auto Deserializer::process_uart_field(FieldId field_id) -> coroutine::LifoTask<RecordStatus> {
     data::UartDataView data_view;
     uint16_t uart_data_length;
     {
         const auto* header_bytes = co_await peek_bytes(sizeof(UartHeader));
         if (!header_bytes) [[unlikely]]
-            co_return false;
+            co_return RecordStatus::kMalformed;
         auto header = UartHeader::CRef{header_bytes};
         data_view.idle_delimited = header.get<UartHeader::IdleDelimited>();
 
@@ -176,11 +196,11 @@ coroutine::LifoTask<bool> Deserializer::process_uart_field(FieldId field_id) {
         } else {
             const auto* header_ext_bytes = co_await peek_bytes(sizeof(UartHeaderExtended));
             if (!header_ext_bytes) [[unlikely]]
-                co_return false;
+                co_return RecordStatus::kMalformed;
             auto header_ext = UartHeaderExtended::CRef{header_ext_bytes};
             uart_data_length = header_ext.get<UartHeaderExtended::DataLengthExtended>();
             if (uart_data_length > sizeof(pending_bytes_buffer_)) [[unlikely]]
-                co_return false;
+                co_return RecordStatus::kMalformed;
         }
     }
     consume_peeked();
@@ -188,42 +208,30 @@ coroutine::LifoTask<bool> Deserializer::process_uart_field(FieldId field_id) {
     if (uart_data_length) {
         const auto* uart_data_bytes = co_await peek_bytes(uart_data_length);
         if (!uart_data_bytes) [[unlikely]]
-            co_return false;
+            co_return RecordStatus::kMalformed;
         data_view.uart_data = std::span<const std::byte>{uart_data_bytes, uart_data_length};
         consume_peeked();
     } else {
         data_view.uart_data = std::span<const std::byte>{};
     }
 
-    co_return callback_.uart_deserialized_callback(field_id, data_view);
+    co_return callback_.uart_deserialized_callback(field_id, data_view) ? RecordStatus::kDelivered
+                                                                        : RecordStatus::kRefused;
 }
 
-coroutine::LifoTask<bool> Deserializer::process_uart_config_field(FieldId field_id) {
-    const auto* payload_bytes = co_await peek_bytes(sizeof(UartConfigPayload));
-    if (!payload_bytes) [[unlikely]]
-        co_return false;
-
-    auto payload = UartConfigPayload::CRef{payload_bytes};
-    data::UartConfigView data_view{};
-    data_view.baudrate = payload.get<UartConfigPayload::Baudrate>();
-    consume_peeked();
-
-    co_return callback_.uart_config_deserialized_callback(field_id, data_view);
-}
-
-coroutine::LifoTask<bool> Deserializer::process_gpio_field(FieldId) {
+auto Deserializer::process_gpio_field() -> coroutine::LifoTask<RecordStatus> {
     GpioHeader::PayloadEnum payload_type;
-    std::uint8_t channel_index = 0;
     bool timestamped = false;
+    uint8_t line = 0;
     {
         const auto* header_bytes = co_await peek_bytes(sizeof(GpioHeader));
         if (!header_bytes) [[unlikely]]
-            co_return false;
+            co_return RecordStatus::kMalformed;
 
         auto header = GpioHeader::CRef{header_bytes};
         payload_type = header.get<GpioHeader::PayloadType>();
-        channel_index = header.get<GpioHeader::ChannelIndex>();
         timestamped = header.get<GpioHeader::Timestamped>();
+        line = header.get<GpioHeader::Line>();
         consume_peeked();
     }
 
@@ -236,75 +244,69 @@ coroutine::LifoTask<bool> Deserializer::process_gpio_field(FieldId) {
             const auto* payload_bytes =
                 co_await peek_bytes(sizeof(GpioDigitalReadTimestampPayload));
             if (!payload_bytes) [[unlikely]]
-                co_return false;
+                co_return RecordStatus::kMalformed;
             auto payload = GpioDigitalReadTimestampPayload::CRef{payload_bytes};
             data_view.timestamp_quarter_us =
                 payload.get<GpioDigitalReadTimestampPayload::TimestampQuarterUs>();
             consume_peeked();
         }
-        if (!callback_.gpio_digital_data_deserialized_callback(channel_index, data_view))
-            co_return false;
-        break;
+        co_return callback_.gpio_digital_data_deserialized_callback(line, data_view)
+            ? RecordStatus::kDelivered
+            : RecordStatus::kRefused;
     }
     case GpioHeader::PayloadEnum::kAnalog: {
         if (timestamped) [[unlikely]]
-            co_return false;
+            co_return RecordStatus::kMalformed;
         const auto* payload_bytes = co_await peek_bytes(sizeof(GpioAnalogPayload));
         if (!payload_bytes) [[unlikely]]
-            co_return false;
+            co_return RecordStatus::kMalformed;
 
         auto payload = GpioAnalogPayload::CRef{payload_bytes};
         data::GpioAnalogDataView data_view{};
         data_view.value = payload.get<GpioAnalogPayload::Value>();
         consume_peeked();
 
-        if (!callback_.gpio_analog_data_deserialized_callback(channel_index, data_view))
-            co_return false;
-        break;
+        co_return callback_.gpio_analog_data_deserialized_callback(line, data_view)
+            ? RecordStatus::kDelivered
+            : RecordStatus::kRefused;
     }
-    case GpioHeader::PayloadEnum::kDigitalReadConfig:
-    case GpioHeader::PayloadEnum::kAnalogReadConfig: {
-        const auto* payload_bytes = co_await peek_bytes(sizeof(GpioReadConfigPayload));
-        if (!payload_bytes) [[unlikely]]
-            co_return false;
-
-        auto payload = GpioReadConfigPayload::CRef{payload_bytes};
-        data::GpioReadConfigView data_view{};
-        data_view.asap = payload.get<GpioReadConfigPayload::Asap>();
-        data_view.rising_edge = payload.get<GpioReadConfigPayload::RisingEdge>();
-        data_view.falling_edge = payload.get<GpioReadConfigPayload::FallingEdge>();
-        data_view.capture_timestamp = timestamped;
-        data_view.pull = payload.get<GpioReadConfigPayload::Pull>();
-        data_view.period_ms = payload.get<GpioReadConfigPayload::PeriodMs>();
-        consume_peeked();
-
-        if (data_view.pull != data::GpioPull::kNone && data_view.pull != data::GpioPull::kUp
-            && data_view.pull != data::GpioPull::kDown)
-            co_return false;
-
-        if (payload_type == GpioHeader::PayloadEnum::kDigitalReadConfig) {
-            if (!callback_.gpio_digital_read_config_deserialized_callback(channel_index, data_view))
-                co_return false;
-        } else {
-            if (data_view.capture_timestamp || data_view.rising_edge || data_view.falling_edge)
-                co_return false;
-            if (!callback_.gpio_analog_read_config_deserialized_callback(channel_index, data_view))
-                co_return false;
-        }
-        break;
+    case GpioHeader::PayloadEnum::kRead:
+        if (timestamped) [[unlikely]]
+            co_return RecordStatus::kMalformed;
+        co_return callback_.gpio_read_deserialized_callback(line) ? RecordStatus::kDelivered
+                                                                  : RecordStatus::kRefused;
+    default: co_return RecordStatus::kMalformed;
     }
-    default: co_return false;
-    }
-
-    co_return true;
 }
 
-coroutine::LifoTask<bool> Deserializer::process_imu_field(FieldId) {
+auto Deserializer::process_buzzer_field() -> coroutine::LifoTask<RecordStatus> {
+    {
+        const auto* header_bytes = co_await peek_bytes(sizeof(BuzzerHeader));
+        if (!header_bytes) [[unlikely]]
+            co_return RecordStatus::kMalformed;
+        if (BuzzerHeader::CRef{header_bytes}.get<BuzzerHeader::Reserved>() != 0) [[unlikely]]
+            co_return RecordStatus::kMalformed;
+        consume_peeked();
+    }
+    const auto* payload_bytes = co_await peek_bytes(sizeof(BuzzerTonePayload));
+    if (!payload_bytes) [[unlikely]]
+        co_return RecordStatus::kMalformed;
+    auto payload = BuzzerTonePayload::CRef{payload_bytes};
+    const data::BuzzerToneDataView tone{
+        .frequency_hz = payload.get<BuzzerTonePayload::FrequencyHz>(),
+        .loudness = payload.get<BuzzerTonePayload::Loudness>(),
+    };
+    consume_peeked();
+    co_return callback_.buzzer_tone_deserialized_callback(tone) ? RecordStatus::kDelivered
+                                                                : RecordStatus::kRefused;
+}
+
+auto Deserializer::process_imu_field(FieldId) -> coroutine::LifoTask<RecordStatus> {
     ImuHeader::PayloadEnum payload_type;
     {
         const auto* header_bytes = co_await peek_bytes(sizeof(ImuHeader));
         if (!header_bytes) [[unlikely]]
-            co_return false;
+            co_return RecordStatus::kMalformed;
 
         auto header = ImuHeader::CRef{header_bytes};
         payload_type = header.get<ImuHeader::PayloadType>();
@@ -316,7 +318,7 @@ coroutine::LifoTask<bool> Deserializer::process_imu_field(FieldId) {
         data::ImuAccelerometerDataView data_view{};
         const auto* payload_bytes = co_await peek_bytes(sizeof(ImuAccelerometerPayload));
         if (!payload_bytes) [[unlikely]]
-            co_return false;
+            co_return RecordStatus::kMalformed;
         auto payload = ImuAccelerometerPayload::CRef{payload_bytes};
         data_view.x = payload.get<ImuAccelerometerPayload::X>();
         data_view.y = payload.get<ImuAccelerometerPayload::Y>();
@@ -330,7 +332,7 @@ coroutine::LifoTask<bool> Deserializer::process_imu_field(FieldId) {
         data::ImuGyroscopeDataView data_view{};
         const auto* payload_bytes = co_await peek_bytes(sizeof(ImuGyroscopePayload));
         if (!payload_bytes) [[unlikely]]
-            co_return false;
+            co_return RecordStatus::kMalformed;
         auto payload = ImuGyroscopePayload::CRef{payload_bytes};
         data_view.x = payload.get<ImuGyroscopePayload::X>();
         data_view.y = payload.get<ImuGyroscopePayload::Y>();
@@ -344,7 +346,7 @@ coroutine::LifoTask<bool> Deserializer::process_imu_field(FieldId) {
         data::ImuTemperatureDataView data_view{};
         const auto* payload_bytes = co_await peek_bytes(sizeof(ImuTemperaturePayload));
         if (!payload_bytes) [[unlikely]]
-            co_return false;
+            co_return RecordStatus::kMalformed;
         auto payload = ImuTemperaturePayload::CRef{payload_bytes};
         data_view.raw_register_value = payload.get<ImuTemperaturePayload::Temperature>();
         data_view.timestamp_quarter_us = payload.get<ImuTemperaturePayload::TimestampQuarterUs>();
@@ -352,15 +354,15 @@ coroutine::LifoTask<bool> Deserializer::process_imu_field(FieldId) {
         callback_.temperature_deserialized_callback(data_view);
         break;
     }
-    default: co_return false;
+    default: co_return RecordStatus::kMalformed;
     }
-    co_return true;
+    co_return RecordStatus::kDelivered;
 }
 
-coroutine::LifoTask<bool> Deserializer::process_session_field(FieldId) {
+auto Deserializer::process_session_field(FieldId) -> coroutine::LifoTask<RecordStatus> {
     const auto* header_bytes = co_await peek_bytes(sizeof(SessionHeader));
     if (!header_bytes) [[unlikely]]
-        co_return false;
+        co_return RecordStatus::kMalformed;
 
     auto header = SessionHeader::CRef{header_bytes};
     data::SessionControlView data_view{};
@@ -368,15 +370,16 @@ coroutine::LifoTask<bool> Deserializer::process_session_field(FieldId) {
     data_view.nonce = header.get<SessionHeader::Nonce>();
     consume_peeked();
 
-    // The four original session types are header-only; the two time-base types
+    // The four original session types are header-only; the types after them
     // carry a payload whose length is implied by the type. A receiver that does
     // not recognise a type therefore cannot skip it -- which is why the sender
-    // only emits these to a peer known to support them.
+    // only emits these to a peer known to support them (the EP0 fingerprint
+    // gate for the host, the session gate for the boards).
     switch (data_view.type) {
     case data::SessionType::kTimeAnchor: {
         const auto* payload_bytes = co_await peek_bytes(sizeof(TimeAnchorPayload));
         if (!payload_bytes) [[unlikely]]
-            co_return false;
+            co_return RecordStatus::kMalformed;
         auto payload = TimeAnchorPayload::CRef{payload_bytes};
         const data::TimeAnchorView anchor{
             .nonce = data_view.nonce,
@@ -384,16 +387,17 @@ coroutine::LifoTask<bool> Deserializer::process_session_field(FieldId) {
         };
         consume_peeked();
         callback_.time_anchor_deserialized_callback(anchor);
-        co_return true;
+        co_return RecordStatus::kDelivered;
     }
     case data::SessionType::kTimeStatus: {
         const auto* payload_bytes = co_await peek_bytes(sizeof(TimeStatusPayload));
         if (!payload_bytes) [[unlikely]]
-            co_return false;
+            co_return RecordStatus::kMalformed;
         auto payload = TimeStatusPayload::CRef{payload_bytes};
         const data::TimeStatusView status{
             .nonce = data_view.nonce,
             .microframe = payload.get<TimeStatusPayload::Microframe>(),
+            .microframe_fraction_q16 = payload.get<TimeStatusPayload::MicroframeFractionQ16>(),
             .timestamp_quarter_us = payload.get<TimeStatusPayload::TimestampQuarterUs>(),
             .ticks_per_microframe_q16 = payload.get<TimeStatusPayload::TicksPerMicroframeQ16>(),
             .state = payload.get<TimeStatusPayload::State>(),
@@ -401,15 +405,17 @@ coroutine::LifoTask<bool> Deserializer::process_session_field(FieldId) {
             .residual_mean_q16 = payload.get<TimeStatusPayload::ResidualMeanQ16>(),
             .residual_abs_max_q16 = payload.get<TimeStatusPayload::ResidualAbsMaxQ16>(),
             .residual_count = payload.get<TimeStatusPayload::ResidualCount>(),
+            .capture_fresh_count = payload.get<TimeStatusPayload::CaptureFreshCount>(),
+            .capture_stale_count = payload.get<TimeStatusPayload::CaptureStaleCount>(),
         };
         consume_peeked();
         callback_.time_status_deserialized_callback(status);
-        co_return true;
+        co_return RecordStatus::kDelivered;
     }
     case data::SessionType::kPulseSchedule: {
         const auto* payload_bytes = co_await peek_bytes(sizeof(PulseSchedulePayload));
         if (!payload_bytes) [[unlikely]]
-            co_return false;
+            co_return RecordStatus::kMalformed;
         auto payload = PulseSchedulePayload::CRef{payload_bytes};
         const data::PulseScheduleView schedule{
             .nonce = data_view.nonce,
@@ -417,12 +423,12 @@ coroutine::LifoTask<bool> Deserializer::process_session_field(FieldId) {
         };
         consume_peeked();
         callback_.pulse_schedule_deserialized_callback(schedule);
-        co_return true;
+        co_return RecordStatus::kDelivered;
     }
     case data::SessionType::kPulseReport: {
         const auto* payload_bytes = co_await peek_bytes(sizeof(PulseReportPayload));
         if (!payload_bytes) [[unlikely]]
-            co_return false;
+            co_return RecordStatus::kMalformed;
         auto payload = PulseReportPayload::CRef{payload_bytes};
         const data::PulseReportView report{
             .nonce = data_view.nonce,
@@ -433,14 +439,34 @@ coroutine::LifoTask<bool> Deserializer::process_session_field(FieldId) {
         };
         consume_peeked();
         callback_.pulse_report_deserialized_callback(report);
-        co_return true;
+        co_return RecordStatus::kDelivered;
+    }
+    case data::SessionType::kPortStatus: {
+        const auto* header_bytes = co_await peek_bytes(sizeof(PortStatusHeader));
+        if (!header_bytes) [[unlikely]]
+            co_return RecordStatus::kMalformed;
+        const auto header = PortStatusHeader::CRef{header_bytes};
+        const data::DataId port = header.get<PortStatusHeader::Port>();
+        const std::size_t length = header.get<PortStatusHeader::BodyLength>();
+        consume_peeked();
+        if (length == 0)
+            co_return RecordStatus::kDelivered;
+
+        const auto* body_bytes = co_await peek_bytes(length);
+        if (!body_bytes) [[unlikely]]
+            co_return RecordStatus::kMalformed;
+        // 认识的口种按自己的正文解前缀(字段只追加); 不认识的、或比已知正文短的, 按长度
+        // 跳过 -- 定界不丢。
+        deliver_port_status(data_view.nonce, port, body_bytes, length);
+        consume_peeked();
+        co_return RecordStatus::kDelivered;
     }
     default: break;
     }
 
     callback_.session_control_deserialized_callback(data_view);
 
-    co_return true;
+    co_return RecordStatus::kDelivered;
 }
 
 } // namespace libhcs::core::protocol

@@ -11,7 +11,7 @@
 
 #include "core/src/utility/assert.hpp"
 #include "core/src/utility/immovable.hpp"
-#include "firmware/c_board/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 
 namespace libhcs::firmware::spi {
 
@@ -35,10 +35,23 @@ class Spi : private core::utility::Immovable {
 public:
     static constexpr size_t kMaxTransferSize = 32;
 
-    using Lazy = utility::Lazy<Spi, SPI_HandleTypeDef*>;
+    // 收发缓冲独立成对象: 段属性不能放在非静态数据成员上(见 uart.hpp 的
+    // UartDmaMemory)。异步路径里它们是 DMA 的源与目标, 必须待在 .dmaram 非缓存区
+    // (app.cpp 的 configure_dmaram_mpu_region()); 同步路径(CPU 收发)一并使用。
+    struct DmaMemory {
+        alignas(4) uint8_t tx_buffer[kMaxTransferSize];
+        alignas(4) uint8_t rx_buffer[kMaxTransferSize];
+    };
 
-    explicit Spi(SPI_HandleTypeDef* hal_spi_handle)
-        : hal_spi_handle_(hal_spi_handle) {
+    using Lazy = utility::Lazy<Spi, SPI_HandleTypeDef*, DmaMemory*>;
+
+    // 参数是指针而非引用: Lazy 的构造参数落在 std::tuple 里, libstdc++ 15 的 tuple
+    // 转换构造对引用成员不可用(consteval 下报 no matching function), 指针与 Lazy 里
+    // 其余的 &hspi1 形态一致。
+    explicit Spi(SPI_HandleTypeDef* hal_spi_handle, DmaMemory* dma_memory)
+        : hal_spi_handle_(hal_spi_handle)
+        , tx_buffer(dma_memory->tx_buffer)
+        , rx_buffer(dma_memory->rx_buffer) {
         init_dma_transfer();
     }
 
@@ -86,10 +99,10 @@ public:
     }
 
     void transmit_receive_async_callback(bool success) {
-        // Fail-fast in debug builds
+        // 调试构建快速失败
         core::utility::assert_debug_lazy([&]() noexcept { return success; });
 
-        // Release fallback: cleanup
+        // release 兜底: 清理
         if (!success) [[unlikely]] {
             HAL_DMA_Abort(hal_spi_handle_->hdmarx);
             HAL_DMA_Abort(hal_spi_handle_->hdmatx);
@@ -106,8 +119,10 @@ public:
             module->transmit_receive_async_callback(success ? tx_rx_size_ : 0);
     }
 
-    alignas(4) uint8_t tx_buffer[kMaxTransferSize];
-    alignas(4) uint8_t rx_buffer[kMaxTransferSize];
+    // 由 DmaMemory(spi1_dma_memory)持有并传入引用: 独立对象才进得去 .dmaram 非缓存
+    // 区(类注释), 同步/异步两条路径共用。
+    uint8_t (&tx_buffer)[kMaxTransferSize];
+    uint8_t (&rx_buffer)[kMaxTransferSize];
 
 private:
     bool hal_ready() const { return hal_spi_handle_->State == HAL_SPI_STATE_READY; }
@@ -201,6 +216,7 @@ private:
     uint16_t tx_rx_size_{0};
 };
 
-inline constinit Spi::Lazy spi1(&hspi1);
+[[gnu::section(".dmaram")]] inline constinit Spi::DmaMemory spi1_dma_memory{};
+inline constinit Spi::Lazy spi1(&hspi1, &spi1_dma_memory);
 
 } // namespace libhcs::firmware::spi

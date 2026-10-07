@@ -8,8 +8,8 @@
 # include <hpm_soc.h>
 
 # include "core/src/utility/assert.hpp"
+# include "firmware/common/app/src/utility/interrupt_lock.hpp"
 # include "firmware/hpm_board/app/src/sync/timebase.hpp"
-# include "firmware/hpm_board/app/src/utility/interrupt_lock.hpp"
 
 namespace libhcs::firmware::sync::pulse {
 namespace {

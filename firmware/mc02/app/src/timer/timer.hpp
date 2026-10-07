@@ -11,7 +11,7 @@
 #include <tim.h>
 
 #include "core/src/utility/assert.hpp"
-#include "firmware/mc02/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 
 namespace libhcs::firmware::timer {
 
@@ -19,9 +19,9 @@ namespace libhcs::firmware::timer {
 //
 // 协议时间戳单位是 quarter-us(4 MHz tick), 与 c_board、hpm_board 一致。mc02 的
 // SYSCLK 为 550 MHz, 各定时器内核跑 275 MHz; 550 MHz 含因子 11, 任何整数预分频
-// 都得不到恰好 4 MHz。改为把 TIM5(自由运行 32 位定时器)预分频到恰好 1 MHz,
+// 都得不到恰好 4 MHz。改为把 TIM23(自由运行 32 位定时器)预分频到恰好 1 MHz,
 // timepoint() 返回 CNT << 2 -- 精确的 quarter-us 值(分辨率 1 us, 对 <= 2 kHz 的
-// IMU 足够)。TIM5 的 ARR 取 0x3FFFFFFF, 使 (CNT << 2) 铺满整个 uint32 区间并在
+// IMU 足够)。TIM23 的 ARR 取 0x3FFFFFFF, 使 (CNT << 2) 铺满整个 uint32 区间并在
 // 2^32 quarter-us(约 1073 s)处干净回绕; 主机只消费回绕安全的差值。
 class Timer {
 public:
@@ -37,7 +37,9 @@ public:
     // 真窗口至少保留半个计数周期, 到期检查才能无状态地做。
     static constexpr uint32_t kMaxDurationTicks = uint32_t{1} << 31;
 
-    static constexpr TIM_HandleTypeDef* kTimer = &htim5;
+    // 2026-10-05 之前是 TIM5。TIM5 现在整个归共享时基(USB SOF 的硬件捕获只接 TIM2 与
+    // TIM5, 见 sync/sof.cpp), 本计时器挪到同样 32 位、不占引脚的 TIM23, 配置一字不差。
+    static constexpr TIM_HandleTypeDef* kTimer = &htim23;
 
     Timer() { core::utility::assert_always(HAL_TIM_Base_Start(kTimer) == HAL_OK); }
 
@@ -60,8 +62,8 @@ public:
         return elapsed_ticks < kMaxDurationTicks;
     }
 
-    // 基于自由运行的 TIM5 计数器忙等给定时长。直接读 CNT, 故可在中断关闭时使用
-    // (如 InterruptLockGuard 下的初始化阶段); 要求 timer.init() 已启动 TIM5。
+    // 基于自由运行的 TIM23 计数器忙等给定时长。直接读 CNT, 故可在中断关闭时使用
+    // (如 InterruptLockGuard 下的初始化阶段); 要求 timer.init() 已启动 TIM23。
     void spin_wait(Duration delay) const {
         core::utility::assert_debug(delay.count() <= kMaxDurationTicks);
 

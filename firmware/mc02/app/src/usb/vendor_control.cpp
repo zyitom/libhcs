@@ -1,487 +1,50 @@
 #include "core/include/libhcs/protocol/vendor_control.hpp"
 
-#include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <type_traits>
 
 #include <common/tusb_types.h>
-#include <device/usbd.h>
 
-#include "firmware/common/app/src/usb/ep0_staging.hpp"
-#include "firmware/mc02/app/src/can/can.hpp"
-#include "firmware/mc02/app/src/uart/uart.hpp"
+#include "firmware/common/app/src/usb/ep0_vendor_control.hpp"
+#include "firmware/mc02/app/src/ports.hpp"
+#include "firmware/mc02/app/src/sync/sof.hpp"
 #include "firmware/mc02/app/src/usb/vendor.hpp"
 
-// EP0 配置通道 -- libhcs/protocol/vendor_control.hpp 的 mc02 半边。
+// EP0 配置通道 -- core/include/libhcs/protocol/vendor_control.hpp 的 mc02 半边。
+//
+// 请求分发、清单的两阶段提交、按口类型的设置校验与应用都在核心(core/src/link/), TinyUSB
+// 胶水在 firmware/common 的 ep0_vendor_control.hpp, 三块板共用; 本文件只是它对这块板
+// 的实例化: 注册表来自 ports.hpp 的绑定(spec 口表 -> 驱动), 板级上下文在下面。
+//
+// 与 hpm_board 的差异只有策略, 不再有第二份协议代码: 本板没有附加功能(DMTool/CDC),
+// 没有归属可交接, 只有一把握手门 -- 清单被完整应用时 set_ep0_handshake_done(true), 在
+// 那之前 kStart 一律被静默拒绝。上电全停是各驱动的构造状态: 声明的口由清单应用启动,
+// 未声明的口由清单应用保持停止; 应用中途失败时核心把所有口挂起, 门保持原样。
 //
 // 执行上下文: TinyUSB 在 USB 中断里排队 setup 包, 在 tud_task() 中解码, 因此下面
 // 全部代码运行在主循环上, 与 bulk 下行回调同线程、同趟主循环的同一位置。这对 UART
 // 路径很关键: 应用波特率会在 TX DMA 运行中改写 BRR, 切换窗口内的 RX 字节可能被打乱
 // (uart/uart.hpp)。若从中断上下文执行, 该窗口会扩大到 ISR 抢占的一切范围。
-//
-// 不受会话门控: 主机在构造板对象时应用配置, 早于其 keepalive 线程开会话; 且会话
-// 已过期的板也必须应答读回。配置是传输层状态, 不是数据面状态。
 
 namespace {
 
-namespace vc = libhcs::core::protocol::vendor_control;
-
-namespace can = libhcs::firmware::can;
-namespace uart = libhcs::firmware::uart;
-namespace usb = libhcs::firmware::usb;
-
-// 机制部分（暂存缓冲、拒绝原因锁存、staged()/reply()）在共享头里，四块板共用；
-// 这里只引入名字。策略（各请求回答什么、能力位、下标空间）留在本文件 —— 本板置
-// kCapCanModeSettable，切帧型只翻 Tx 元素标志；hpm_board 同样置位但靠重初始化控制器，见共享头。
-using libhcs::firmware::usb::ep0::framing_matches;
-using libhcs::firmware::usb::ep0::g_control_buffer;
-using libhcs::firmware::usb::ep0::g_last_config_error;
-using libhcs::firmware::usb::ep0::rate_plausible;
-using libhcs::firmware::usb::ep0::record_config_error;
-using libhcs::firmware::usb::ep0::reply;
-using libhcs::firmware::usb::ep0::staged;
-
-// EP0 的 UART 下标顺序即板端描述符表(core/include/libhcs/spec/mc02/uart.hpp):
-// 0=DBUS, 1=UART1, 2=UART2, 3=UART3, 4=UART7, 5=UART10。下标空间固定, 主机下标
-// 永远指同一端口 —— 每个下标背后都有对象(原先 2/3 受 RS-485 开关门控, 该开关已
-// 取消)。uart_count 上报整个下标空间而非存活端口数。
-constexpr uint8_t kUartIndexCount = 6;
-
-vc::CanMode can_mode(uint16_t index);
-
-// 板对自己的描述, 按请求现组而非缓存。FD 掩码上报的是"当前"模式: 主机可能已通过
-// kSetCanConfig 重配过某条总线; CAN 对象尚未构造时, 编译期端口表就是唯一出处。
-// caps 位告知主机本板的 CAN 模式可由其配置(见 kSetCanConfig)。
-vc::InterfacePayload interface_payload() {
-    vc::InterfacePayload payload{};
-    payload.version = vc::kVersion;
-    payload.can_count = static_cast<uint8_t>(can::kCanCount);
-    payload.uart_count = kUartIndexCount;
-    payload.caps = vc::kCapCanModeSettable;
-    for (std::size_t i = 0; i < can::kCanCount; ++i) {
-        if (can_mode(i) == vc::CanMode::kCanFd)
-            payload.can_fd_mask |= static_cast<uint8_t>(1U << i);
+// 板级上下文: 清单生效即放行会话。其余(锁存、暂存、清单结果、无交接)是公共半边。
+class BoardContext : public libhcs::firmware::usb::ep0::ContextBase {
+public:
+    static void on_manifest_accepted(uint64_t /*now*/) {
+        libhcs::firmware::usb::vendor->set_ep0_handshake_done(true);
     }
-    return payload;
-}
 
-bool can_index_valid(uint16_t index) { return index < can::kCanCount; }
-
-// 调用方必须已按 kUartIndexCount 校验下标。返回 null 只表示 init() 尚未运行。
-//
-// **必须用 try_get() 而不是 get()**: get() 在未初始化时只在 debug 下断言, release
-// 下照旧返回 addressof(object_) —— 一个未初始化 union 上的垃圾指针, 本函数承诺的
-// "返回 null" 就失效了, 下面每个 `port == nullptr` 的 STALL 分支也随之失效。
-// 这正是 UART_EP0_MIGRATION.md §6.8 记的那个陷阱。
-uart::UartCommon* uart_by_index(uint16_t index) {
-    switch (index) {
-    case 0: return uart::uart_dbus.try_get();
-    case 1: return uart::uart1.try_get();
-    case 2: return uart::uart2.try_get();
-    case 3: return uart::uart3.try_get();
-    case 4: return uart::uart7.try_get();
-    case 5: return uart::uart10.try_get();
-    default: return nullptr;
-    }
-}
-
-// 该总线当前实际发送的帧型。init() 运行前没有对象可问, 由编译期端口表作答; 此后
-// 以运行值为准 -- 主机可能已通过 kSetCanConfig 重配过该总线。下标非法时无总线
-// 可言, 返回 classic 兜底: 下标源自主机请求, 调用方虽都先经 can_index_valid 校验,
-// 本函数不依赖这一点也能保证查表在界内。
-vc::CanMode can_mode(uint16_t index) {
-    if (!can_index_valid(index))
-        return vc::CanMode::kClassic;
-    const can::Can* bus = can::can_by_index(index);
-    const bool fd =
-        bus != nullptr ? bus->fd_mode() : can::kCanPorts[index].mode == can::CanMode::kCanFd;
-    return fd ? vc::CanMode::kCanFd : vc::CanMode::kClassic;
-}
-
-// 控制器实际被整定的速率, 从 CubeMX 生成的分频器与 .ioc 路由给 FDCAN 的内核时钟
-// (PLL2, 80 MHz)重构 -- 与 UART 的实际波特率读回同一算术, 永远不是"上次请求了什么"。
-// 数据段速率只要控制器具备 FD 能力就照报, 与当前 TX 模式无关: 具备 FD 能力的
-// FDCAN 在发送 classic 帧的同时仍照常解码对端发来的 FD 帧。
-uint32_t can_arbitration_baudrate(uint16_t index) {
-    const auto& init = can::kCanPorts[index].handle->Init;
-    const uint32_t divisor =
-        init.NominalPrescaler * (1U + init.NominalTimeSeg1 + init.NominalTimeSeg2);
-    return divisor ? HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_FDCAN) / divisor : 0;
-}
-
-uint32_t can_data_baudrate(uint16_t index) {
-    const auto& init = can::kCanPorts[index].handle->Init;
-    const uint32_t divisor = init.DataPrescaler * (1U + init.DataTimeSeg1 + init.DataTimeSeg2);
-    return divisor ? HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_FDCAN) / divisor : 0;
-}
-
-// 两个位相的采样点, 从 CubeMX 生成的位时序段算出(千分比): 同步段 + Seg1 占整个
-// 位时间的比例。80 MHz / (5 * (1+13+2)) 的仲裁段即 (1+13)/16 = 875‰, 数据段同值
-// -- 与总线上其他板一致正是固件初始化的目标。
-uint32_t can_arbitration_sample_point(uint16_t index) {
-    const auto& init = can::kCanPorts[index].handle->Init;
-    const uint32_t total = 1U + init.NominalTimeSeg1 + init.NominalTimeSeg2;
-    return total ? (1U + init.NominalTimeSeg1) * 1000U / total : 0;
-}
-
-uint32_t can_data_sample_point(uint16_t index) {
-    const auto& init = can::kCanPorts[index].handle->Init;
-    const uint32_t total = 1U + init.DataTimeSeg1 + init.DataTimeSeg2;
-    return total ? (1U + init.DataTimeSeg1) * 1000U / total : 0;
-}
-
-bool handle_setup(uint8_t rhport, const tusb_control_request_t* request) {
-    const auto index = request->wIndex;
-
-    switch (static_cast<vc::Request>(request->bRequest)) {
-    case vc::Request::kGetInterface: {
-        if (request->bmRequestType != vc::kRequestTypeIn || index != 0)
-            return false;
-        if (!reply(rhport, request, interface_payload()))
-            return false;
-        // 读接口本身就是握手: 走到这里的主机已被告知通道数与 CAN 模式, 不可能是
-        // 配置移入 EP0 之前的旧主机。只有此后才允许开会话
-        // -- 见 Vendor::session_control_deserialized_callback()。
-        usb::vendor->set_ep0_handshake_done(true);
+    // 共享时间基准: 每个镜像都带, 清单要了才开(core 在端口应用之前调)。
+    static constexpr uint8_t kBoardCaps = libhcs::core::protocol::vendor_control::kBoardCapTimeSync;
+    [[nodiscard]] static bool set_time_sync(bool on) {
+        if (on)
+            return libhcs::firmware::sync::time_sync_start();
+        libhcs::firmware::sync::time_sync_stop();
         return true;
     }
+};
 
-    case vc::Request::kGetCanConfig: {
-        if (request->bmRequestType != vc::kRequestTypeIn || !can_index_valid(index)) {
-            record_config_error(
-                vc::Request::kGetCanConfig, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
-            return false;
-        }
-        return reply(
-            rhport, request,
-            vc::CanConfigPayload{
-                .mode = static_cast<uint8_t>(can_mode(index)),
-                .control = 0,
-                .reserved0 = 0,
-                .arbitration_baudrate = can_arbitration_baudrate(index),
-                .data_baudrate = can_data_baudrate(index),
-                .nominal_sample_point = static_cast<uint16_t>(can_arbitration_sample_point(index)),
-                .data_sample_point = static_cast<uint16_t>(can_data_sample_point(index)),
-                .reserved1 = 0,
-            });
-    }
-
-    case vc::Request::kGetCanStatus: {
-        if (request->bmRequestType != vc::kRequestTypeIn || !can_index_valid(index)) {
-            record_config_error(
-                vc::Request::kGetCanStatus, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
-            return false;
-        }
-        const can::Can* bus = can::can_by_index(index);
-        if (bus == nullptr)
-            return false;
-        const auto s = bus->status();
-        return reply(
-            rhport, request,
-            vc::CanStatusPayload{
-                .tec = s.tec,
-                .rec = s.rec,
-                .last_error = s.last_error,
-                .data_last_error = s.data_last_error,
-                .flags = s.flags,
-                .reserved = {},
-                .tx_occurred = s.tx_occurred,
-                .tx_cancelled = s.tx_cancelled,
-                .rx_frames = s.rx_frames,
-                .rx_fifo_level = s.rx_fifo_level,
-            });
-    }
-
-    case vc::Request::kGetUartConfig: {
-        if (request->bmRequestType != vc::kRequestTypeIn || index >= kUartIndexCount) {
-            record_config_error(
-                vc::Request::kGetUartConfig, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
-            return false;
-        }
-        const uart::UartCommon* port = uart_by_index(index);
-        if (port == nullptr) {
-            record_config_error(
-                vc::Request::kGetUartConfig, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
-            return false;
-        }
-        // 硬件事实而非"上次请求": 波特率从实际编程的分频器重构, 帧格式从活
-        // 寄存器解码; control 恒为 0。divisor/oversample 一并上报 —— 它们是
-        // 速率真正的整数形式, 主机就是靠这两个整数判定切换是否生效, 因为主机
-        // 的内核时钟与板子不同(本板还要经 UART_GETCLOCKSOURCE 解析), 无法自行
-        // 复算分频器。见 UartDivisor。
-        return reply(
-            rhport, request,
-            vc::UartConfigPayload{
-                .baudrate = port->effective_baudrate(),
-                .divisor = port->divisor_u16(),
-                .oversample = port->oversample(),
-                .word_length = static_cast<uint8_t>(port->word_length()),
-                .parity = static_cast<uint8_t>(port->parity()),
-                .stop_bits = static_cast<uint8_t>(port->stop_bits()),
-                .control = 0,
-                .rx_polarity = static_cast<uint8_t>(port->rx_polarity()),
-            });
-    }
-
-    case vc::Request::kGetLastConfigError: {
-        if (request->bmRequestType != vc::kRequestTypeIn || index != 0)
-            return false;
-        return reply(
-            rhport, request,
-            vc::LastConfigErrorPayload{
-                .request = g_last_config_error.request,
-                .reason = g_last_config_error.reason,
-                .index = g_last_config_error.index,
-                .value = g_last_config_error.value,
-                .reserved = 0,
-            });
-    }
-
-    // SET 的每条 STALL 都记锁存: 主机失败时只读一次原因, 漏记会读到更早那次的陈旧原因。
-    case vc::Request::kSetCanConfig:
-        if (request->bmRequestType != vc::kRequestTypeOut || !can_index_valid(index)
-            || request->wLength != sizeof(vc::CanConfigPayload)) {
-            record_config_error(
-                vc::Request::kSetCanConfig, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
-            return false;
-        }
-        // 接受 data stage; 数据到达后再校验其值。
-        return tud_control_xfer(rhport, request, g_control_buffer, request->wLength);
-
-    case vc::Request::kSetUartConfig:
-        if (request->bmRequestType != vc::kRequestTypeOut || index >= kUartIndexCount
-            || request->wLength != sizeof(vc::UartConfigPayload)) {
-            record_config_error(
-                vc::Request::kSetUartConfig, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
-            return false;
-        }
-        if (uart_by_index(index) == nullptr) {
-            record_config_error(
-                vc::Request::kSetUartConfig, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
-            return false;
-        }
-        return tud_control_xfer(rhport, request, g_control_buffer, request->wLength);
-
-    default: return false;
-    }
-}
-
-// 此处返回 false 会 STALL status stage, 这正是配置搬上 EP0 的全部意义: 它是 bulk
-// 流承载不了的那份应答。STALL 表示设置未被应用、硬件未动 -- 主机读回会看到旧值。
-bool handle_data(const tusb_control_request_t* request) {
-    const auto index = request->wIndex;
-
-    // IN 传输在应答发出后也会触发 DATA stage, 此处返回 false 会把已经成功的读也
-    // STALL 掉。只有两个 OUT 请求还有后续工作要做。
-    if (request->bmRequestType != vc::kRequestTypeOut)
-        return true;
-
-    switch (static_cast<vc::Request>(request->bRequest)) {
-    case vc::Request::kSetCanConfig: {
-        const auto payload = staged<vc::CanConfigPayload>();
-        if (payload.mode > static_cast<uint8_t>(vc::CanMode::kCanFd)) {
-            record_config_error(
-                vc::Request::kSetCanConfig, index, vc::ConfigErrorReason::kConfigErrorBadRequest,
-                payload.mode);
-            return false;
-        }
-        if ((payload.control & ~vc::kCanConfigApply) != 0U) {
-            record_config_error(
-                vc::Request::kSetCanConfig, index, vc::ConfigErrorReason::kConfigErrorBadRequest,
-                payload.control);
-            return false;
-        }
-        // 速率与采样点是核对不是配置(位时序是本板实测整定的事实, 速率由对端硬件
-        // 决定 -- 见 CanConfigPayload): 非零就必须与板子的实际值一致, 否则 STALL。
-        const auto asserted_ok = [&](uint32_t asserted, uint32_t actual) {
-            if (asserted == 0U || asserted == actual)
-                return true;
-            record_config_error(
-                vc::Request::kSetCanConfig, index,
-                vc::ConfigErrorReason::kConfigErrorRateUnrepresentable, asserted);
-            return false;
-        };
-        if (!asserted_ok(payload.arbitration_baudrate, can_arbitration_baudrate(index))
-            || !asserted_ok(payload.data_baudrate, can_data_baudrate(index))
-            || !asserted_ok(payload.nominal_sample_point, can_arbitration_sample_point(index))
-            || !asserted_ok(payload.data_sample_point, can_data_sample_point(index)))
-            return false;
-
-        // 模式是本板唯一可由主机配置的 CAN 属性(InterfacePayload 的 caps 位已
-        // 告知): 应用 = 改 Tx 元素的 FDF/BRS 标志, 控制器保持 FD 能力, 不进 INIT
-        // 模式、不重新初始化, 收方向不受影响。无 kCanConfigApply 位时退化为纯
-        // 核对: 与当前模式不一致即 STALL。换模式与排队中的数据不保序, 静默链路
-        // 后再切的义务在主机 -- 与波特率切换同一约定。
-        const bool current = can_mode(index) == vc::CanMode::kCanFd;
-        const bool want_fd = payload.mode == static_cast<uint8_t>(vc::CanMode::kCanFd);
-        if (want_fd != current) {
-            if ((payload.control & vc::kCanConfigApply) == 0U) {
-                record_config_error(
-                    vc::Request::kSetCanConfig, index,
-                    vc::ConfigErrorReason::kConfigErrorUnsupportedMode, payload.mode);
-                return false;
-            }
-            can::Can* bus = can::can_by_index(index);
-            if (bus == nullptr) {
-                record_config_error(
-                    vc::Request::kSetCanConfig, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
-                return false;
-            }
-            bus->set_fd_mode(want_fd);
-            // 写后回读: 主机不再回读, ACK 前确认帧型已到位。
-            if ((can_mode(index) == vc::CanMode::kCanFd) != want_fd) [[unlikely]] {
-                record_config_error(
-                    vc::Request::kSetCanConfig, index,
-                    vc::ConfigErrorReason::kConfigErrorVerifyFailed, payload.mode);
-                return false;
-            }
-        }
-        return true;
-    }
-
-    case vc::Request::kSetUartConfig: {
-        const auto payload = staged<vc::UartConfigPayload>();
-        if ((payload.control & ~vc::kUartConfigApply) != 0U) {
-            record_config_error(
-                vc::Request::kSetUartConfig, index, vc::ConfigErrorReason::kConfigErrorBadRequest,
-                payload.control);
-            return false;
-        }
-        uart::UartCommon* port = uart_by_index(index);
-        if (port == nullptr) {
-            record_config_error(
-                vc::Request::kSetUartConfig, index, vc::ConfigErrorReason::kConfigErrorBadIndex);
-            return false;
-        }
-
-        // 先全量校验后统一提交: 波特率先解不写(solve_brr 失败即 STALL, 寄存器
-        // 原样), 帧格式先纯校验(check_framing 不碰寄存器), 全部通过后才提交:
-        // 帧格式一次 UE 下拉内写完(commit_framing 无失败路径), 最后提交分频器
-        // (同样无失败路径)。因此 STALL 严格等于"什么都没改"。
-        //
-        // divisor/oversample 是**断言**不是指令: 非零就必须与切换后实际写入的
-        // 一致。主机先 GET 再 SET 同样的值, 就是在一次传输里断言整个端口的电气
-        // 身份 —— 与 kSetCanConfig 的时间字段同一性质。波特率不再用百分比容差
-        // 比对: 请求值本就不是求解器的不动点(921600 在本板上也除不尽), 只有
-        // BRR 整数是可比的事实。见 UartDivisor。
-        if (!port->check_framing(
-                payload.word_length, payload.parity, payload.stop_bits, payload.rx_polarity)) {
-            record_config_error(
-                vc::Request::kSetUartConfig, index,
-                vc::ConfigErrorReason::kConfigErrorFramingUnsupported);
-            return false;
-        }
-
-        uint32_t brr = 0;
-        if (payload.baudrate != 0U && !port->solve_brr(payload.baudrate, brr)) {
-            record_config_error(
-                vc::Request::kSetUartConfig, index,
-                vc::ConfigErrorReason::kConfigErrorRateUnrepresentable, payload.baudrate);
-            return false;
-        }
-        // 宽松兜底前置到写入之前: 解出的速率离请求太远同样算不可表示。
-        if (payload.baudrate != 0U && !rate_plausible(payload.baudrate, port->baudrate_for(brr))) {
-            record_config_error(
-                vc::Request::kSetUartConfig, index,
-                vc::ConfigErrorReason::kConfigErrorRateUnrepresentable, payload.baudrate);
-            return false;
-        }
-
-        if ((payload.control & vc::kUartConfigApply) != 0U) {
-            // 断言字段先比, 提交放最后 —— 这样断言类 STALL 都发生在动寄存器之前。
-            if (payload.baudrate != 0U) {
-                // 调用方回显了分频器就要求它相等 —— 这一步让"整条身份一起断言"
-                // 成立: 主机说不出自己期望的分频器, 就不该假装验证过速率。
-                if (payload.divisor != 0U && payload.divisor != static_cast<uint16_t>(brr)) {
-                    record_config_error(
-                        vc::Request::kSetUartConfig, index,
-                        vc::ConfigErrorReason::kConfigErrorVerifyFailed, payload.baudrate);
-                    return false;
-                }
-                if (payload.oversample != 0U && payload.oversample != port->oversample()) {
-                    record_config_error(
-                        vc::Request::kSetUartConfig, index,
-                        vc::ConfigErrorReason::kConfigErrorVerifyFailed, payload.baudrate);
-                    return false;
-                }
-                port->commit_brr(payload.baudrate, brr);
-                // 写后回读: 不符即硬件没收下, 与求解器拒绝区分(kConfigErrorVerifyFailed)。
-                if (!port->verify_baudrate(static_cast<uint16_t>(brr), port->oversample()))
-                    [[unlikely]] {
-                    record_config_error(
-                        vc::Request::kSetUartConfig, index,
-                        vc::ConfigErrorReason::kConfigErrorVerifyFailed, payload.baudrate);
-                    return false;
-                }
-            } else if (payload.divisor != 0U || payload.oversample != 0U) {
-                // 只给了分频器却没给速率: 没有"切换后"可言, 只能对当前值断言。
-                if (payload.divisor != 0U && payload.divisor != port->divisor_u16()) {
-                    record_config_error(
-                        vc::Request::kSetUartConfig, index,
-                        vc::ConfigErrorReason::kConfigErrorVerifyFailed, payload.divisor);
-                    return false;
-                }
-                if (payload.oversample != 0U && payload.oversample != port->oversample()) {
-                    record_config_error(
-                        vc::Request::kSetUartConfig, index,
-                        vc::ConfigErrorReason::kConfigErrorVerifyFailed, payload.oversample);
-                    return false;
-                }
-            }
-            port->commit_framing(
-                payload.word_length, payload.parity, payload.stop_bits, payload.rx_polarity);
-            // 写后回读帧格式: 主机不再回读, ACK 必须等于已生效。
-            if (!framing_matches(
-                    *port, payload.word_length, payload.parity, payload.stop_bits,
-                    payload.rx_polarity)) [[unlikely]] {
-                record_config_error(
-                    vc::Request::kSetUartConfig, index,
-                    vc::ConfigErrorReason::kConfigErrorVerifyFailed);
-                return false;
-            }
-            return true;
-        }
-
-        // 无 kUartConfigApply: 纯断言, 每个非零字段都必须与端口当前状态一致。
-        // 分频器精确比对(它本就是整数), 帧格式精确比对。
-        if (payload.baudrate != 0U && payload.divisor == 0U) {
-            // 只给了速率没给分频器: 无法验证速率是否真的落成了那个数, 但至少
-            // 要求端口当前跑的就是这个请求速率。保留一层宽松兜底抓"离谱到不可能"
-            // 的值 —— 严格的判据是分频器, 这条只拦明显不在同一量级的输入。
-            if (!rate_plausible(payload.baudrate, port->effective_baudrate())) {
-                record_config_error(
-                    vc::Request::kSetUartConfig, index,
-                    vc::ConfigErrorReason::kConfigErrorVerifyFailed, payload.baudrate);
-                return false;
-            }
-        }
-        if (payload.divisor != 0U && payload.divisor != port->divisor_u16()) {
-            record_config_error(
-                vc::Request::kSetUartConfig, index, vc::ConfigErrorReason::kConfigErrorVerifyFailed,
-                payload.divisor);
-            return false;
-        }
-        if (payload.oversample != 0U && payload.oversample != port->oversample()) {
-            record_config_error(
-                vc::Request::kSetUartConfig, index, vc::ConfigErrorReason::kConfigErrorVerifyFailed,
-                payload.oversample);
-            return false;
-        }
-        if (!framing_matches(
-                *port, payload.word_length, payload.parity, payload.stop_bits,
-                payload.rx_polarity)) {
-            record_config_error(
-                vc::Request::kSetUartConfig, index,
-                vc::ConfigErrorReason::kConfigErrorFramingUnsupported);
-            return false;
-        }
-        return true;
-    }
-
-    default: return false;
-    }
-}
+BoardContext g_board_context;
 
 } // namespace
 
@@ -491,9 +54,6 @@ bool handle_data(const tusb_control_request_t* request) {
 // -- DFU runtime 接口使用 CLASS 请求, 不会相撞。
 extern "C" bool tud_vendor_control_xfer_cb(
     uint8_t rhport, uint8_t stage, const tusb_control_request_t* request) {
-    switch (stage) {
-    case CONTROL_STAGE_SETUP: return handle_setup(rhport, request);
-    case CONTROL_STAGE_DATA: return handle_data(request);
-    default: return true; // CONTROL_STAGE_ACK
-    }
+    return libhcs::firmware::usb::ep0::vendor_control_xfer<libhcs::firmware::ports::Registry>(
+        g_board_context, rhport, stage, request);
 }

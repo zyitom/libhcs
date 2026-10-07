@@ -4,19 +4,29 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <variant>
 
-#include <libhcs/spec/gpio.hpp>
+#include <libhcs/time/sof_stamp.hpp>
 
 namespace libhcs::data {
 
 enum class DataId : uint8_t {
     kExtend = 0,
 
+    // Every id below is a port (EP0 addresses it, a manifest declares it) and the
+    // field id of that port's records, except kSession (the link's own field).
+    // Names come from the connectors: CAN/UART ids match the silkscreen number.
+
+    // The board's GPIO port: a group of lines (the PWM header), declared one line
+    // at a time. A line is not a port of its own -- like a motor id on a CAN bus,
+    // it is an address within the port, carried as the line number in the record
+    // header (GpioHeader in core/src/protocol/protocol.hpp) and in the high byte
+    // of wIndex on EP0.
     kGpio = 1,
 
     // CAN field ids match each board's silkscreen number. hpm6e8y prints
     // CAN0..CAN3, so its four buses occupy kCan0..kCan3. 5321 / mc02 /
-    // c_board / ch32_board print CAN1.. and stay on kCan1..
+    // c_board print CAN1.. and stay on kCan1..
     kCan0 = 2,
     kCan1 = 3,
     kCan2 = 4,
@@ -42,23 +52,14 @@ enum class DataId : uint8_t {
 
     kSession = 14,
 
-    // Downlink configuration channels. These ride the same byte stream as the
-    // data fields above and are told apart by the field header alone; ids > 15
-    // need the extended (2-byte) field header. Config traffic is rare (UART baud
-    // and CAN mode now go over EP0), so the extra byte is acceptable.
-    kCan0Config = 17,
-    kCan1Config = 18,
-    kCan2Config = 19,
-    kCan3Config = 20,
-
-    kUart0Config = 21,
-    kUart1Config = 22,
-    kUart2Config = 23,
-    kUart3Config = 24,
-    kUart7Config = 25,
-    kUart10Config = 26,
-    kUartDbusConfig = 27,
+    // The on-board buzzer (mc02: a passive buzzer on a timer channel). Declared, it
+    // starts silent; each downlink record sets the tone it plays until the next
+    // one. The melody's timing is the host's. Every id now uses the compact field
+    // header; kExtend stays as the escape for ids above 15.
+    kBuzzer = 15,
 };
+
+static_assert(sizeof(DataId) == 1); // 类型层:底层类型必须还是单字节(uint8_t)
 
 enum class SessionType : uint8_t {
     kStart = 0,
@@ -89,7 +90,48 @@ enum class SessionType : uint8_t {
     // at the SAME microframe; each reports where it captured the other's pulse.
     kPulseSchedule = 7,
     kPulseReport = 8,
+
+    // kStreamError = 9 was the board's downlink error report (v15), folded into
+    // kPortStatus as the link's own status (data::LinkStatusView) in v16. The
+    // number is not reused.
+
+    // Board -> host: one port's runtime status, appended AFTER the
+    // kKeepaliveAck (whose own format is untouched). Like the time-base types
+    // above it carries a payload, so only a peer that agreed on this session
+    // layout over EP0 can skip it. One record per running port whose
+    // status changed since the previous report; the first round after a
+    // kStart carries every running port, which is the host's baseline. The
+    // payload is one byte -- the port's DataId (4 bits) and the length of what
+    // follows (4 bits) -- then a body whose layout the port's kind defines
+    // (data::PortStatusVariant): at most 16 bytes in all,
+    // and a receiver can skip a body it does not know. This is the only
+    // runtime status path: EP0 is the configuration plane and carries no
+    // per-round traffic (kGetPortStatus was retired in v16).
+    kPortStatus = 10,
 };
+
+// Why a downlink record did not reach a port (data::LinkStatusView carries the
+// most recent one to the host). The two discard reasons lose the framing and
+// take the rest of the USB transfer with them; kRefused is one skipped record.
+enum class DownlinkError : uint8_t {
+    // 格式坏: 记录截断、头部非法或保留编码 -- 已无法对齐下一条记录的边界, 本次
+    // 传输剩余的全部字节只能丢弃。
+    kMalformed = 0,
+    // 字段号不认识: 记录的长度无从得知, 同样只能整批丢弃。
+    kUnknownField = 1,
+    // 字节完整但板子拒收(本板没有这个口、方向不符): 只丢这一条, 同一批里排在
+    // 后面的记录照常处理。
+    kRefused = 2,
+};
+
+constexpr const char* downlink_error_name(DownlinkError reason) noexcept {
+    switch (reason) {
+    case DownlinkError::kMalformed: return "malformed";
+    case DownlinkError::kUnknownField: return "unknown field";
+    case DownlinkError::kRefused: return "refused";
+    }
+    return "unknown reason";
+}
 
 // Wire-layout version of the session payloads that follow a SessionHeader.
 // The EP0 fingerprint in libhcs/protocol/vendor_control.hpp folds this in, so
@@ -101,8 +143,167 @@ enum class SessionType : uint8_t {
 // constant to the computed value -- edit a session payload and the build
 // fails until this constant is updated to the fingerprint it prints.
 // History: 1 = pre-2026-09-13 (TimeStatus carried the PTPC diagnostics block,
-// 78 B); 2 = PTPC block removed (30 B), kSyncSample retired.
-inline constexpr uint16_t kSessionWireVersion = 20862; // session_layout_fingerprint(), 2026-09-14
+// 78 B); 2 = PTPC block removed (30 B), kSyncSample retired; 20862 = first
+// computed value (2026-09-14); 60804 = TimeStatus reports a fractional
+// microframe and the hardware-capture counters (34 B); 18007 = kStreamError
+// (10 B payload) answers the keepalive ack (2026-10-06); then the kPortStatus
+// record = 11758 (2026-10-06, v16), which also took over kStreamError's report;
+// 26076 = the UART status body gains `unattributed` (14 B, 2026-10-06, v17).
+inline constexpr uint16_t kSessionWireVersion = 26076; // session_layout_fingerprint(), 2026-10-06
+
+// PSR.LEC / PSR.DLEC coding, straight from the M_CAN register [RM]; bxCAN's
+// ESR.LEC uses the same order.
+enum class CanLastError : uint8_t {
+    kNone = 0,
+    kStuff = 1,
+    kForm = 2,
+    kAck = 3,
+    kBit1 = 4,
+    kBit0 = 5,
+    kCrc = 6,
+    kNoChange = 7, // no new error since the register was last read
+};
+
+constexpr const char* last_error_name(CanLastError code) noexcept {
+    switch (code) {
+    case CanLastError::kNone: return "none";
+    case CanLastError::kStuff: return "STUFF";
+    case CanLastError::kForm: return "FORM";
+    case CanLastError::kAck: return "ACK";
+    case CanLastError::kBit1: return "BIT1";
+    case CanLastError::kBit0: return "BIT0";
+    case CanLastError::kCrc: return "CRC";
+    default: return "no-change";
+    }
+}
+
+// An error code that names an actual bus error (kStuff..kCrc), as opposed to
+// "none" or "nothing new since the last read".
+constexpr bool is_bus_error(CanLastError code) noexcept {
+    return code != CanLastError::kNone && code != CanLastError::kNoChange;
+}
+
+enum CanStateFlags : uint8_t {
+    kCanErrorPassive = 1U << 0, // PSR.EP
+    kCanWarning = 1U << 1,      // PSR.EW
+    kCanBusOff = 1U << 2,       // PSR.BO
+};
+
+// One CAN controller's runtime status (data::SessionType::kPortStatus).
+//
+// Why a controller's error registers matter: when a bus delivers nothing,
+// "the wire is bad" and "the firmware never transmitted" look identical from
+// the host -- both are rx=0. The controller knows which it is. Read it in the
+// order that narrows fastest:
+//   last_error == kAck, tec climbing   transmitted, nobody acknowledged --
+//                                      the far end is not listening
+//   last_error == kBit0                drove dominant, read back recessive:
+//                                      the bus cannot be pulled low at all
+//   stuff / form / crc / bit1          bits arrive corrupted -- bit timing,
+//                                      termination, or noise
+//
+// The board reads the registers once per keepalive round. PSR.LEC clears on
+// read (and resets to kNone after a clean transfer), so the DRIVER latches
+// last_error / data_last_error: the most recent real bus error (is_bus_error)
+// since it started, kNone until there is one. A repeat of the same error does
+// not change them -- TEC/REC do.
+struct CanStatusView {
+    // Which ports carry this status: the DataId numbering groups the kinds
+    // (CAN ids 2..5), so a status record needs no kind byte of its own.
+    static constexpr bool is_for(DataId id) noexcept {
+        return id >= DataId::kCan0 && id <= DataId::kCan3;
+    }
+
+    uint8_t tec = 0; // ECR transmit error counter
+    uint8_t rec = 0; // ECR receive error counter (0..127; the RP bit is not carried)
+    CanLastError last_error = CanLastError::kNone;      // arbitration phase
+    CanLastError data_last_error = CanLastError::kNone; // CAN-FD data phase
+    uint8_t flags = 0;                                  // CanStateFlags
+    // The counts below are free-running since boot and wrap at 2^16: the host
+    // takes the difference of two consecutive snapshots modulo 2^16. A port
+    // reports at least every round its counts move, and no count can move by
+    // 65536 in one 250 ms round, so the difference is never ambiguous.
+    //
+    // Transmissions abandoned (single-shot: every lost arbitration or bus
+    // error drops the frame; TEC/REC do not see lost arbitration). Every
+    // board runs single-shot and counts it when a transmit slot (mailbox) is
+    // reused, so the outcome of the last few transmissions (up to the FIFO /
+    // mailbox depth) shows up one slot reuse later.
+    uint16_t tx_cancelled = 0;
+    // Frames the board itself dropped: downlink frames that found the transmit
+    // queue full, and received frames that found the uplink buffer full. "The
+    // bus had frames but the board lost them" must not look like "the bus
+    // delivered nothing" -- the first fork of every dead-bus hunt.
+    uint16_t tx_dropped = 0;
+    uint16_t rx_dropped = 0;
+    // Receive FIFO overflows: frames lost inside the controller before the
+    // board could take them (M_CAN IR.RF0L, bxCAN RF0R.FOVR0). One count is at
+    // least one lost frame -- the hardware flags the event, it does not count
+    // frames. hpm_board / c_board count every interrupt that sees the flag;
+    // mc02 checks it once a keepalive round.
+    uint16_t rx_lost = 0;
+
+    friend constexpr bool operator==(const CanStatusView&, const CanStatusView&) = default;
+};
+
+// One UART's runtime errors since boot (data::SessionType::kPortStatus).
+// Free-running counts that wrap at 2^16, differenced like CanStatusView's. One receive-error
+// count is one keepalive round in which that error was seen (each kind at most +1 a round), on
+// every board but c_board, which counts one per HAL error callback. Zero means none happened.
+// unattributed is the HPM UART's "an error happened but its kind is gone": in FIFO mode its
+// LSR error bits describe only the byte at the RXFIFO head, and RX DMA takes that byte before
+// the line-status interrupt can read them; a persistent error (wrong rate) still shows its kind
+// in the once-a-round LSR read. noise is STM32 only (HPM has no noise flag).
+struct UartStatusView {
+    static constexpr bool is_for(DataId id) noexcept { // UART ids 6..12
+        return id >= DataId::kUart0 && id <= DataId::kUartDbus;
+    }
+
+    uint16_t overrun = 0;      // a byte arrived before the previous one was taken
+    uint16_t parity = 0;
+    uint16_t framing = 0;      // includes a line break on HPM
+    uint16_t noise = 0;
+    uint16_t unattributed = 0; // a receive error of unknown kind (HPM only, see above)
+    // Records the board itself dropped: downlink records that found the
+    // transmit ring full, and received chunks that found the uplink buffer full.
+    uint16_t tx_dropped = 0;
+    uint16_t rx_dropped = 0;
+
+    friend constexpr bool operator==(const UartStatusView&, const UartStatusView&) = default;
+};
+
+// The link's own status (DataId::kSession, the field the session records ride):
+// the downlink records the board could not deliver. Why they are worth a
+// report, and the two ways a record fails, are in core/DOWNLINK_ERRORS.md.
+struct LinkStatusView {
+    static constexpr bool is_for(DataId id) noexcept { return id == DataId::kSession; }
+
+    // Downlink records the board could not deliver since boot, refused or
+    // malformed alike. Free-running, wraps at 2^16 like every status count.
+    uint16_t downlink_errors = 0;
+    // The most recent one (meaningful once downlink_errors moved): which field
+    // it was on, why it was dropped, and the ordinal (1-based, wraps at 2^16)
+    // of the downlink transfer it arrived in, counted from the start of the
+    // current session -- so the host can line it up with what it sent.
+    DataId last_field = DataId::kExtend;
+    DownlinkError last_reason = DownlinkError::kMalformed;
+    uint16_t last_transfer = 0;
+
+    friend constexpr bool operator==(const LinkStatusView&, const LinkStatusView&) = default;
+};
+
+// Every kind of port status there is -- THE list. Each port has at most one
+// kind (its view's is_for() says which), so one variant per port holds it;
+// std::monostate is "this port has no status". Everything that handles port
+// status is generic over this list: the board's ledger, the record's decoder
+// and its callback, the host's snapshot store and Handler::status<View>().
+// Adding a kind is:
+//   1. a view here, with is_for() and a defaulted operator==;
+//   2. its alternative below;
+//   3. a PortStatusRecord<View> specialization (body layout, core/src/protocol/protocol.hpp);
+//   4. read_status() on the drivers of that kind (core/src/link/port_ops.hpp).
+using PortStatusVariant =
+    std::variant<std::monostate, LinkStatusView, CanStatusView, UartStatusView>;
 
 enum class TimeState : uint8_t {
     // No usable timeline: nothing may be scheduled against it. This is the state
@@ -185,9 +386,20 @@ struct PulseReportView {
 // out together with that path. Fits one 64-byte full-speed bulk packet.
 struct TimeStatusView {
     uint32_t nonce;
-    // Absolute microframe once anchored; the board's own origin before that.
+    // Where the board was on the microframe axis when it wrote this report:
+    // absolute once anchored, the board's own origin before that. 48 bits of
+    // whole microframes on the wire.
     uint64_t microframe;
-    // Local machine-timer reading paired with `microframe`, in quarter
+    // The part of a microframe past `microframe`, in 1/65536.
+    //
+    // This is what makes the report usable as a time: the host pairs the value
+    // with the round trip that carried it, and a whole number alone is the
+    // count at the last Start-of-Frame -- up to one microframe old, uniformly,
+    // which is the entire margin the host has for telling its own counter's
+    // integer offset from the next one over. Zero from a board whose fit has
+    // not converged, where `microframe` is the latched count.
+    uint16_t microframe_fraction_q16 = 0;
+    // Local machine-timer reading paired with the position above, in quarter
     // microseconds. The pair is what lets the host fit its own clock to the
     // microframe axis.
     uint32_t timestamp_quarter_us;
@@ -215,6 +427,17 @@ struct TimeStatusView {
     int32_t residual_mean_q16;
     uint32_t residual_abs_max_q16;
     uint16_t residual_count;
+
+    // Hardware SOF captures since the previous report: how many Start-of-Frame
+    // interrupts found a fresh latch of the timestamp counter (and fed the
+    // ring that places records on the axis, see libhcs/time/sof_stamp.hpp),
+    // and how many found the latch older than half a microframe and skipped
+    // it. Both zero on a board without the capture path. Their ratio is the
+    // direct reading of how the trigger behaves on this silicon -- all fresh
+    // means one latch per SOF; half stale means it latches every other one.
+    // Saturating.
+    uint16_t capture_fresh_count = 0;
+    uint16_t capture_stale_count = 0;
 };
 
 struct CanDataView {
@@ -227,9 +450,16 @@ struct CanDataView {
     // CanHeaderLayout in core/src/protocol/protocol.hpp.
     bool is_extended_can_id = false;
     bool is_remote_transmission = false;
-    // Hardware TSU timestamp in microseconds (1 tick = 1 us, wraps ~71.6 min).
-    // std::nullopt if unsupported.
-    std::optional<uint32_t> timestamp_us = std::nullopt;
+    // When the frame started on the bus, on the shared USB microframe axis
+    // (libhcs/time/sof_stamp.hpp). Latched by hardware at the frame's first
+    // edge; uplink only.
+    //
+    // Empty whenever the board cannot place the frame on that axis: firmware
+    // built without the time base, a board with no hardware capture path, or
+    // the capture ring unable to bracket this particular frame. It is never a
+    // reading of some board-local clock -- a consumer either gets a time it
+    // can compare across boards and convert to host time, or nothing.
+    std::optional<time::SofStamp> sof_stamp = std::nullopt;
 };
 
 struct UartDataView {
@@ -237,44 +467,25 @@ struct UartDataView {
     bool idle_delimited = false;
 };
 
-// Sparse patch: an unset field leaves the corresponding setting untouched. An
-// entirely empty view is a deliberate no-op rather than an error.
-struct UartConfigView {
-    std::optional<uint32_t> baudrate = std::nullopt;
-};
-
+// One GPIO line's level. Downlink it is a write to an output line; uplink it is a
+// sample of an input line, with the board's quarter-microsecond timestamp when
+// the line was declared with kGpioInputTimestamp.
 struct GpioDigitalDataView {
     bool high;
     std::optional<uint32_t> timestamp_quarter_us = std::nullopt;
 };
 
+// One GPIO line's analog value, 0..65535 of full scale. Downlink it is the PWM
+// duty of an output line.
 struct GpioAnalogDataView {
     uint16_t value;
 };
 
-enum class GpioPull : uint8_t {
-    kNone = 0,
-    kUp = 1,
-    kDown = 2,
-};
-
-struct GpioReadConfigView {
-    uint16_t period_ms = 0;
-    bool asap = false;
-    bool rising_edge = false;
-    bool falling_edge = false;
-    bool capture_timestamp = false;
-    GpioPull pull = GpioPull::kNone;
-
-    [[nodiscard]] constexpr bool supported(const spec::GpioDescriptor& gpio) const noexcept {
-        return (!asap || gpio.supports(spec::GpioCapability::kDigitalReadOnce))
-            && (!period_ms || gpio.supports(spec::GpioCapability::kDigitalReadPeriodic))
-            && ((!rising_edge && !falling_edge)
-                || gpio.supports(spec::GpioCapability::kDigitalReadInterrupt))
-            && (pull != GpioPull::kUp || gpio.supports(spec::GpioCapability::kPullUp))
-            && (pull != GpioPull::kDown || gpio.supports(spec::GpioCapability::kPullDown))
-            && (!capture_timestamp || gpio.supports(spec::GpioCapability::kTimestampedDigitalRead));
-    }
+// A tone for the buzzer, downlink: frequency in Hz and loudness 0..255 (255 is
+// the loudest a passive buzzer gets, a 50% duty). Zero in either is silence.
+struct BuzzerToneDataView {
+    uint16_t frequency_hz;
+    uint8_t loudness;
 };
 
 struct ImuAccelerometerDataView {
@@ -296,52 +507,7 @@ struct ImuTemperatureDataView {
     uint32_t timestamp_quarter_us;
 };
 
-/**
- * @brief Interface for consuming deserialized uplink data.
- *
- * This interface is invoked after the protocol layer has already identified the payload type and
- * decoded its contents. For callback families that are further multiplexed by a sub-identifier,
- * such as `DataId` or a GPIO `channel_index`, the callback returns `bool` to report whether that
- * sub-identifier is valid for the concrete implementation.
- *
- * Return `true` when the sub-identifier is recognized and the payload has been dispatched.
- * Return `false` when deserialization succeeded but the `DataId` or `channel_index` is unexpected,
- * so the caller can propagate that routing error to upper layers.
- *
- * IMU callbacks return `void` because each payload type maps to a single callback and requires no
- * additional route validation.
- */
-class DataCallback {
-public:
-    DataCallback() = default;
-    DataCallback(const DataCallback&) = delete;
-    DataCallback& operator=(const DataCallback&) = delete;
-    DataCallback(DataCallback&&) = delete;
-    DataCallback& operator=(DataCallback&&) = delete;
-    virtual ~DataCallback() = default;
-
-    [[nodiscard]] virtual bool can_receive_callback(DataId id, const CanDataView& data) = 0;
-
-    [[nodiscard]] virtual bool uart_receive_callback(DataId id, const UartDataView& data) = 0;
-
-    [[nodiscard]] virtual bool gpio_digital_read_result_callback(
-        uint8_t channel_index, const GpioDigitalDataView& data) = 0;
-    [[nodiscard]] virtual bool
-        gpio_analog_read_result_callback(uint8_t channel_index, const GpioAnalogDataView& data) = 0;
-
-    virtual void accelerometer_receive_callback(const ImuAccelerometerDataView& data) = 0;
-    virtual void gyroscope_receive_callback(const ImuGyroscopeDataView& data) = 0;
-    virtual void temperature_receive_callback(const ImuTemperatureDataView& data) = 0;
-
-    // Shared time base status, one per keepalive period on a link with time sync
-    // enabled. Non-pure and defaulted: every existing implementor predates it,
-    // and an application that only wants a synchronized clock never has to see
-    // the individual reports -- libhcs::host::time::timeline() is fed
-    // regardless of whether this is overridden.
-    virtual void time_status_callback(const TimeStatusView& data) { (void)data; }
-
-    // One completed hardware pulse exchange. See PulseReportView.
-    virtual void pulse_report_callback(const PulseReportView& data) { (void)data; }
-};
+// The uplink callback interface lives on the host side: libhcs/data/callback.hpp.
+// This header keeps the wire-layout views firmware and host share.
 
 } // namespace libhcs::data

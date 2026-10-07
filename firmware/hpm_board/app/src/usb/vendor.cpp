@@ -17,6 +17,7 @@
 #include "firmware/hpm_board/app/src/diag/latency.hpp"
 #include "firmware/hpm_board/app/src/link/uplink.hpp"
 #include "firmware/hpm_board/app/src/sync/sof.hpp"
+#include "firmware/hpm_board/app/src/timer/timer.hpp"
 #include "firmware/hpm_board/app/src/utility/boot_mailbox.hpp"
 
 namespace {
@@ -48,6 +49,21 @@ uint32_t runtime_ms() {
 // 数据面"是应用的选择, 不是本驱动的属性。见该文件。
 
 namespace libhcs::firmware::usb {
+
+void Vendor::begin_claim() { ownership_.begin_claim(); }
+
+void Vendor::commit_claim(uint64_t now) { ownership_.commit_claim(now); }
+
+void Vendor::abort_claim() { ownership_.abort_claim(); }
+
+void Vendor::drop_host() {
+    deactivate_session();
+    finish_downlink_transfer();
+}
+
+void Vendor::poll_ownership() { ownership_.poll(&timer::Timer::timestamp64_quarter_us); }
+
+void Vendor::release_ownership() { ownership_.release(); }
 
 void poll_dfu_runtime_reboot() {
     if (!g_dfu_runtime_reboot_requested)
@@ -94,21 +110,21 @@ void tud_vendor_rx_cb(uint8_t itf, const uint8_t* buffer, uint32_t size) {
     // 在任何处理之前打时间戳, 这里打开的 turnaround 才能覆盖整个设备侧路径。
     // 未定义 libhcs_APP_CAN_DIAG 时编译消失。
     diag::note_usb_out_complete();
+    // 先挂后处理(tusb_config.h 的 CFG_TUD_VENDOR_RX_ARM_FIRST): 类驱动在调本回调之前
+    // 已把另一块 OUT 缓冲挂上, 下面处理这一包期间端点照常收下一包, 不对主机 NAK。
+    diag::note_usb_out_armed();
     diag::latency::open_downlink();
 
-    // 先处理, 后挂端点: 类驱动交给本回调的指针指向端点自己的 DMA 缓冲, 类驱动在本
-    // 回调返回后才重挂端点, 否则控制器会开始覆写同一块缓冲。因此端点保持未挂载 --
-    // 设备对主机 NAK -- 贯穿下面的全部处理。
+    // buffer 指向刚收完的那块 DMA 缓冲, 在本回调返回之前有效: 下一次完成要等本回调返回、
+    // 回到 tud_task() 才处理, 那时才会把这块重新挂上。所以这里不能留它的指针 -- 解析器
+    // 把跨包的半条记录拷进自己的缓存(core/src/protocol/deserializer.hpp), CAN / UART 的
+    // 下行也都是当场拷走。
     //
-    // 先把包拷出去可以解除该约束(turnaround 实测 2.22 -> 1.27 us), 2026-09-05 前
-    // 试过。在这里没有收益: 本主机对每个设备每 125 us 微帧恰好调度 8 个 bulk
-    // 事务, 下一个到来时设备早已空闲等待, 省下的 turnaround 只是挪进那段空闲 --
-    // 包率有拷贝时 63999/63996/64002, 无拷贝时 63988/63988/63991。仅当主机每微帧
-    // 调度超过 8 个、设备成为瓶颈时再重估。
+    // 2026-09-05 曾以"拷贝后再挂"的形式试过并否掉(当时板子几乎不处理载荷, 测不出差别);
+    // 2026-10-03 用真实 CAN 帧洪泛重测, 包率 57.2k -> 62.8k/s(+10%), 1 kHz 往返在噪声内,
+    // 见 USB_OPTIMIZATION_LOG.md 16.3。
     usb::vendor->handle_downlink(
         {reinterpret_cast<const std::byte*>(buffer), payload_size}, finished);
-
-    diag::note_usb_out_armed();
 }
 
 void tud_dfu_runtime_reboot_to_dfu_cb() {
@@ -119,26 +135,18 @@ void tud_dfu_runtime_reboot_to_dfu_cb() {
 
 void tud_suspend_cb(bool remote_wakeup_en) {
     (void)remote_wakeup_en;
-    usb::vendor->deactivate_session();
-    usb::vendor->finish_downlink_transfer();
-    // 新主机必须自己完成 EP0 握手。
-    usb::vendor->set_ep0_handshake_done(false);
+    usb::vendor->drop_host();
 }
 
 void tud_resume_cb() {}
 
+// 重新枚举: 不论上一次枚举时开着什么会话, 那个主机的连接都已不在。
 void tud_mount_cb() {
     g_packet_size = (tud_speed_get() == TUSB_SPEED_HIGH) ? 512U : 64U;
-    // 新主机必须自己完成 EP0 握手。
-    usb::vendor->set_ep0_handshake_done(false);
+    usb::vendor->drop_host();
 }
 
-void tud_umount_cb() {
-    usb::vendor->deactivate_session();
-    usb::vendor->finish_downlink_transfer();
-    // 新主机必须自己完成 EP0 握手。
-    usb::vendor->set_ep0_handshake_done(false);
-}
+void tud_umount_cb() { usb::vendor->drop_host(); }
 
 } // extern "C"
 

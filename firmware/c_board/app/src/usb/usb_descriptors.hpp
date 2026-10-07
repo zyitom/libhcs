@@ -16,7 +16,7 @@
 #include <tusb_config.h>
 
 #include "core/src/utility/assert.hpp"
-#include "firmware/c_board/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 
 namespace libhcs::firmware::usb {
 
@@ -120,7 +120,7 @@ private:
         return buffer;
     }
 
-private: // Device Descriptor
+private: // 设备描述符
     static constexpr tusb_desc_device_t kDeviceDescriptor = {
         .bLength = sizeof(tusb_desc_device_t),
         .bDescriptorType = TUSB_DESC_DEVICE,
@@ -142,7 +142,7 @@ private: // Device Descriptor
         .bNumConfigurations = 0x01,
     };
 
-private: // Configuration Descriptor
+private: // 配置描述符
          // NOLINTNEXTLINE(cppcoreguidelines-use-enum-class)
     enum InterfaceNumber : uint8_t {
         kItfNumVendor = 0,
@@ -166,7 +166,7 @@ private: // Configuration Descriptor
     };
     static_assert(sizeof(kConfigurationDescriptorFs) == kConfigTotalLen);
 
-private: // String Descriptor
+private: // 字符串描述符
     static constexpr std::array<uint8_t, 2> kLanguageId = {0x09, 0x04};
     static constexpr std::string_view kManufacturerString = "Helios";
     static constexpr std::string_view kProductString = "HCS Agent v" libhcs_PROJECT_VERSION_STRING;

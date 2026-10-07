@@ -30,20 +30,17 @@ public:
     [[nodiscard]] virtual bool
         uart_deserialized_callback(FieldId id, const data::UartDataView& data) = 0;
 
-    [[nodiscard]] virtual bool
-        uart_config_deserialized_callback(FieldId id, const data::UartConfigView& data) = 0;
-
+    // GPIO records, keyed by the line of the board's GPIO port (DataId::kGpio).
     [[nodiscard]] virtual bool gpio_digital_data_deserialized_callback(
-        uint8_t channel_index, const data::GpioDigitalDataView& data) = 0;
-
+        std::uint8_t line, const data::GpioDigitalDataView& data) = 0;
     [[nodiscard]] virtual bool gpio_analog_data_deserialized_callback(
-        uint8_t channel_index, const data::GpioAnalogDataView& data) = 0;
+        std::uint8_t line, const data::GpioAnalogDataView& data) = 0;
+    // kRead: a request to sample an input line once. Downlink only.
+    [[nodiscard]] virtual bool gpio_read_deserialized_callback(std::uint8_t line) = 0;
 
-    [[nodiscard]] virtual bool gpio_digital_read_config_deserialized_callback(
-        uint8_t channel_index, const data::GpioReadConfigView& data) = 0;
-
-    [[nodiscard]] virtual bool gpio_analog_read_config_deserialized_callback(
-        uint8_t channel_index, const data::GpioReadConfigView& data) = 0;
+    // A buzzer tone. Downlink only.
+    [[nodiscard]] virtual bool
+        buzzer_tone_deserialized_callback(const data::BuzzerToneDataView& data) = 0;
 
     virtual void
         accelerometer_deserialized_callback(const data::ImuAccelerometerDataView& data) = 0;
@@ -66,11 +63,27 @@ public:
         (void)data;
     }
 
+    // One completed pulse exchange. See PulseReportView.
     virtual void pulse_report_deserialized_callback(const data::PulseReportView& data) {
         (void)data;
     }
 
-    virtual void error_callback() = 0;
+    // One port's runtime status (data::PortStatusVariant, holding the kind the
+    // port's DataId implies), appended after a keepalive ack. One callback for
+    // every kind. Defaulted for the same reason as above.
+    virtual void port_status_deserialized_callback(
+        std::uint32_t nonce, data::DataId port, const data::PortStatusVariant& status) {
+        (void)nonce, (void)port, (void)status;
+    }
+
+    // A record could not be delivered. kMalformed / kUnknownField mean the
+    // framing is lost and the rest of this USB transfer is discarded; kRefused
+    // means the record was complete but the receiver does not want it -- only
+    // that record is skipped, the next one starts on a known boundary. The
+    // field is the record's field id (kExtend when not even the field header
+    // could be read). Fires from inside the coroutine: keep it cheap and
+    // non-throwing.
+    virtual void error_callback(FieldId field, data::DownlinkError reason) = 0;
 };
 
 class Deserializer : private coroutine::InlineLifoContext<1024> {
@@ -134,19 +147,50 @@ public:
     }
 
 private:
+    // One record's outcome, deciding how the main loop resumes:
+    //   kDelivered     -- handed to the receiver (or nothing to hand over);
+    //   kRefused       -- every byte of the record is consumed but the receiver
+    //                     does not want it (no such port, wrong direction): the
+    //                     boundary at the next record is intact, skip one;
+    //   kMalformed     -- reserved encoding, invalid header, or the input ended
+    //                     inside the record: the boundary is lost, discard mode.
+    // kUnknownField never comes out of the per-kind parsers; the main loop
+    // assigns it when the field id matches no parser (a record whose length
+    // cannot be known, so it cannot be skipped either).
+    enum class RecordStatus : std::uint8_t { kDelivered, kRefused, kMalformed, kUnknownField };
+
     coroutine::LifoTask<void> process_stream();
 
-    coroutine::LifoTask<bool> process_can_field(FieldId field_id);
+    coroutine::LifoTask<RecordStatus> process_can_field(FieldId field_id);
 
-    coroutine::LifoTask<bool> process_uart_field(FieldId field_id);
+    coroutine::LifoTask<RecordStatus> process_uart_field(FieldId field_id);
 
-    coroutine::LifoTask<bool> process_uart_config_field(FieldId field_id);
+    coroutine::LifoTask<RecordStatus> process_gpio_field();
 
-    coroutine::LifoTask<bool> process_gpio_field(FieldId field_id);
+    coroutine::LifoTask<RecordStatus> process_buzzer_field();
+    coroutine::LifoTask<RecordStatus> process_imu_field(FieldId field_id);
 
-    coroutine::LifoTask<bool> process_imu_field(FieldId field_id);
+    coroutine::LifoTask<RecordStatus> process_session_field(FieldId field_id);
 
-    coroutine::LifoTask<bool> process_session_field(FieldId field_id);
+    // The kPortStatus case once the body bytes are in hand: the kind whose view
+    // is for this port decodes the prefix it knows (fields are only appended)
+    // and hands it over; a port of no known kind, or a body shorter than the
+    // kind's, is skipped. Not a coroutine -- the awaiting stays in
+    // process_session_field(); the caller consumes.
+    void deliver_port_status(
+        std::uint32_t nonce, data::DataId port, const std::byte* body_bytes, std::size_t length) {
+        (void)any_port_status_kind([&]<typename View>() {
+            using Body = typename PortStatusRecord<View>::Body;
+            if (!View::is_for(port))
+                return false;
+            if (length >= sizeof(Body))
+                callback_.port_status_deserialized_callback(
+                    nonce, port,
+                    data::PortStatusVariant{
+                        PortStatusRecord<View>::decode(typename Body::CRef{body_bytes})});
+            return true;
+        });
+    }
 
     // Await until at least `size` contiguous bytes are available at the current read position.
     // Returns a pointer to a contiguous region of at least `size` bytes.
@@ -272,7 +316,8 @@ private:
     }
 
     void enter_discard_mode() {
-        callback_.error_callback();
+        // The caller has already reported the reason via error_callback(); this
+        // is the mechanism only.
 
         // - Treat the current input chunk as exhausted (so the next peek_bytes() suspends)
         // - Ignore subsequent feed() calls while discard_mode_ is true

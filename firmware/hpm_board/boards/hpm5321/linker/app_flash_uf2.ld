@@ -55,8 +55,15 @@ SECTIONS
         *(.text._ZNK6libhcs4core8protocol*)
         *(.text._ZN6libhcs4core9coroutine*)
         *(.text._ZNK6libhcs4core9coroutine*)
-        *(.text._ZN6libhcs8firmware4link19InterruptSafeBuffer*)
-        *(.text._ZNK6libhcs8firmware4link19InterruptSafeBuffer*)
+        *(.text._ZN6libhcs8firmware3usb19InterruptSafeBuffer*)
+        *(.text._ZNK6libhcs8firmware3usb19InterruptSafeBuffer*)
+        /* libhcs::core::time: the SOF capture ring that places every received
+         * CAN frame on the microframe axis (every image; it runs while the host's
+         * manifest asks for the time base). Its locate() is a template member the compiler may or
+         * may not inline into sync::sof_capture::stamp_of(), which is in
+         * .fast -- left to the catch-all it would be a per-frame FLASH call. */
+        *(.text._ZN6libhcs4core4time*)
+        *(.text._ZNK6libhcs4core4time*)
         *(.text.mcan_read_rxfifo*)
         /* Everything the ILM code above still reached in FLASH on every frame.
          * One out-of-ILM callee is enough to put the whole path back on the
@@ -98,9 +105,13 @@ SECTIONS
 
     /* Tripwire for the mangled-name rules above. InterruptSafeBuffer::allocate is
      * virtual, so every build type emits it out of line: if it is not in ILM, the
-     * rules no longer match what the compiler emits. */
+     * rules no longer match what the compiler emits. The class moved to
+     * libhcs::firmware::usb and became a template (batch alignment + alloc-fail
+     * hook as parameters, shared with the other boards, 2026-10-05); the exact
+     * mangled name carries the template arguments, the collection rules above keep
+     * matching on the class-name prefix. */
     ASSERT(
-        _ZN6libhcs8firmware4link19InterruptSafeBuffer8allocateEj < ORIGIN(ILM) + LENGTH(ILM),
+        _ZN6libhcs8firmware3usb19InterruptSafeBufferILj32ENS0_4link17UplinkAllocFailedEE8allocateEj < ORIGIN(ILM) + LENGTH(ILM),
         "ILM name rules in .vectors matched nothing: InterruptSafeBuffer::allocate is outside ILM. Recheck the mangled prefixes there against riscv32-unknown-elf-nm.")
 
     /* Same tripwire for the per-frame callees: a toolchain whose libc names its

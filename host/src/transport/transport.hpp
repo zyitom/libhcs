@@ -176,6 +176,16 @@ public:
     virtual std::string_view serial() const noexcept { return {}; }
 
     /**
+     * @brief USB bus the device sits on, or -1 for a transport that is not USB.
+     *
+     * The bus identifies the host controller, and the host controller is what
+     * the shared time base is derived from: every board on it follows the same
+     * Start-of-Frame stream. Fixed for the lifetime of the transport, like
+     * serial().
+     */
+    virtual int usb_bus_number() const noexcept { return -1; }
+
+    /**
      * @brief Whether the link has failed beyond local repair.
      *
      * A faulted transport accepts no further traffic: transmits are dropped and

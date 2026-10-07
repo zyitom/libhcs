@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
@@ -15,18 +16,22 @@
 
 #include "board_app.hpp"
 #include "core/include/libhcs/data/datas.hpp"
+#include "core/src/link/port.hpp"
 #include "core/src/protocol/serializer.hpp"
 #include "core/src/utility/assert.hpp"
 #include "core/src/utility/immovable.hpp"
+#include "firmware/common/app/src/utility/event_counter.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 #include "firmware/hpm_board/app/src/dmtool/dm_adapter.hpp"
 #include "firmware/hpm_board/app/src/led/led.hpp"
 #include "firmware/hpm_board/app/src/link/uplink.hpp"
 #include "firmware/hpm_board/app/src/uart/rx_buffer.hpp"
 #include "firmware/hpm_board/app/src/uart/tx_buffer.hpp"
 #include "firmware/hpm_board/app/src/uart/uart_port.hpp"
-#include "firmware/hpm_board/app/src/utility/lazy.hpp"
 
 namespace libhcs::firmware::uart {
+
+namespace vc = libhcs::core::protocol::vendor_control;
 
 using board::UartPort;
 
@@ -37,14 +42,15 @@ class Uart
     friend class RxBuffer<Uart>;
 
 public:
+    // EP0 口能力: 没有 RX 反相寄存器, 极性是接线事实。
+    static constexpr uint8_t kPortCapabilities = 0;
+
     using Lazy = utility::Lazy<Uart, UartPort, size_t>;
 
     // 定义移到下方 AHB SRAM 存储数组之后(out-of-line)。
     explicit Uart(UartPort port, size_t storage_index);
 
     [[nodiscard]] data::DataId data_id() const { return data_id_; }
-
-    [[nodiscard]] data::DataId config_data_id() const { return config_data_id_; }
 
     // 主机经 EP0(usb/vendor_control.cpp)请求的运行时波特率切换。返回端口
     // 当前是否已运行在 `baudrate`; 返回 false 时硬件原样保留, 控制传输的
@@ -100,18 +106,65 @@ public:
         return true;
     }
 
-    // 写入之后再回读, 确认寄存器真的收下了这次编程。EP0 的 kSetUartConfig 用它
+    // 写入之后再回读, 确认寄存器真的收下了这次编程。EP0 配置声明用它
     // 把"求解器接受"升级为"硬件确认": 求解通过但回读不符, 是 kConfigErrorVerifyFailed,
     // 与"求解器拒绝"(kConfigErrorRateUnrepresentable) 是两件事。
     //
     // 比对的是分频器整数与过采样, 不是波特率: 主机的内核时钟与板子不同, 波特率
     // 无法在两侧复算, 而请求值本身不是求解器的不动点。见 UartDivisor 的注释。
     //
-    // 只在 set_baudrate() 成功之后调用: 此时 DMA 已由那一步停稳, snapshot_divisor()
-    // 也已刷新, 这里读快照不会引入新的 DLAB 竞争。
+    // 读的是快照(除 init 与 set_baudrate 外无人改分频器), 不开 DLAB, 任何时候调用都
+    // 不与在途 TX DMA 竞争: 清单重放在写之前用它判"速率没变"(core port_ops uart_apply)。
     [[nodiscard]] bool
         verify_baudrate(uint16_t expected_divisor, uint8_t expected_oversample) const {
         return divisor_u16() == expected_divisor && oversample() == expected_oversample;
+    }
+
+    // ---- 端口接口(core/src/link/ 的通用 UART 操作按这一组原语工作) ----
+    //
+    // 全部是冷路径(EP0 的清单校验与应用)。solve()/commit_baudrate() 是既有静态求解
+    // 器与 set_baudrate() 的统一签名视图: 核心流程对三块板写同一份代码, 分频器的
+    // 编码差异(本板 DLM:DLL + OSCR, STM32 是 BRR)留在各自的 solve 里。
+    [[nodiscard]] bool running() const { return !suspended_; }
+
+    // 只解不写(统一签名版, 见 solve_divisor)。
+    [[nodiscard]] bool solve(uint32_t baudrate, uint16_t& divisor, uint8_t& oversample) const {
+        return solve_divisor(uart_clock_hz_, baudrate, divisor, oversample);
+    }
+
+    // 写入统一签名版: 校验已过, 两个整数由 set_baudrate() 内部的同一次求解给出。
+    // 极端情况下(SDK 求解器与本类复制品分道扬镳)它仍可能失败, 返回 false 而不是
+    // 假装写入成功。
+    bool commit_baudrate(uint32_t baudrate, uint16_t /*divisor*/, uint8_t /*oversample*/) {
+        return set_baudrate(baudrate);
+    }
+
+    [[nodiscard]] bool framing_matches(
+        uint32_t word_length, uint32_t parity, uint32_t stop_bits, uint32_t rx_polarity) const {
+        return (word_length == 0U || word_length == this->word_length())
+            && (parity == 0U || parity == this->parity())
+            && (stop_bits == 0U || stop_bits == this->stop_bits())
+            && (rx_polarity == 0U || rx_polarity == this->rx_polarity());
+    }
+
+    // kGetPortConfig 的应答: 硬件事实而非"上次请求"。分频器取自快照(DLAB 竞争,
+    // 见 divisor_u16()), 帧格式从活寄存器解码, control 恒为 0。
+    void read_config(vc::UartConfigPayload& out) const {
+        out = {
+            .baudrate = effective_baudrate(),
+            .divisor = divisor_u16(),
+            .oversample = oversample(),
+            .word_length = static_cast<uint8_t>(word_length()),
+            .parity = static_cast<uint8_t>(parity()),
+            .stop_bits = static_cast<uint8_t>(stop_bits()),
+            .control = 0,
+            .rx_polarity = static_cast<uint8_t>(rx_polarity()),
+        };
+    }
+
+    // kGetPortList 的状态位。
+    [[nodiscard]] core::link::PortStatus describe() const {
+        return {.running = running(), .fd = false};
     }
 
     // ---- 帧格式: EP0 配置通道的运行时切换与读回 ----
@@ -144,9 +197,10 @@ public:
     }
 
     // 提交 check_framing() 已通过的帧格式。0 = 保持不变; 只改请求了的字段。
-    // LCR 直写并保持 DLAB=0(set_baudrate 结束时已清, 这里再清一次防御), 与
-    // set_baudrate 的锁存器舞步一样只在主循环执行。
-    void commit_framing(uint32_t word_length, uint32_t parity, uint32_t stop_bits) {
+    // 第四参(rx_polarity)是统一签名的一部分: 本板没有 RX 反相硬件, check_framing
+    // 已拒绝过非 0/1 的值, 这里无事可做。LCR 直写并保持 DLAB=0(set_baudrate 结束时
+    // 已清, 这里再清一次防御), 与 set_baudrate 的锁存器舞步一样只在主循环执行。
+    void commit_framing(uint32_t word_length, uint32_t parity, uint32_t stop_bits, uint32_t) {
         uint32_t lcr = uart_base_->LCR & ~UART_LCR_DLAB_MASK;
         if (parity != 0U) {
             lcr &= ~(UART_LCR_SPS_MASK | UART_LCR_EPS_MASK | UART_LCR_PEN_MASK);
@@ -193,17 +247,103 @@ public:
 
     ATTR_PLACE_AT(".fast")
     void handle_downlink(const data::UartDataView& data) {
-        if (!TxBuffer::try_enqueue(data))
+        // 主机没声明的串口不发(见 suspend())。
+        if (suspended_) [[unlikely]]
+            return;
+        if (!TxBuffer::try_enqueue(data)) {
+            tx_dropped_.note();
             led::led->downlink_buffer_full();
+        }
+    }
+
+    // 运行时状态(core/src/link/port_status.hpp), 每个 keepalive 轮次在主循环读一次。
+    //
+    // 接收错误按轮计: 一个计数 = "这一轮里出现过这种错误", 每种每轮至多 +1。FIFO 模式下
+    // LSR 的 PE/FE/LBREAK 只描述 RXFIFO 队首那个字节, DMA 取走它错误位就没了(手册, 台架
+    // 实测 2026-10-06), 光靠这里每轮读一次 LSR 会漏掉两次读之间的整段错误。所以线路状态
+    // 中断(ELSI)单发: 第一个坏字节进一次中断记下种类并关掉 ELSI(irq_handler()), 这里汇总
+    // 后再打开 -- 坏线或速率不符时每口每轮至多多一次中断, 不会有逐字节的中断风暴去挤 CAN
+    // 的转发。中断进来时坏字节多半已被 DMA 取走、LSR 已空(台架 5/5), 这时只知道出过错,
+    // 记 unattributed; 持续的错误(速率不符)仍会在这里每轮那一读里带出种类。线路中断
+    // (LBREAK)计入 framing, 本 IP 没有噪声位。
+    [[nodiscard]] data::UartStatusView read_status() {
+        const uint32_t seen = line_errors_seen_.exchange(0U, std::memory_order_relaxed)
+                            | (uart_get_status(uart_base_) & kLineErrorMask);
+        if ((seen & UART_LSR_OE_MASK) != 0U)
+            overrun_.note();
+        if ((seen & UART_LSR_PE_MASK) != 0U)
+            parity_errors_.note();
+        if ((seen & (UART_LSR_FE_MASK | UART_LSR_LBREAK_MASK)) != 0U)
+            framing_errors_.note();
+        if ((seen & kUnattributed) != 0U)
+            unattributed_.note();
+        uart_enable_irq(uart_base_, uart_intr_rx_line_stat);
+        return {
+            .overrun = overrun_.count(),
+            .parity = parity_errors_.count(),
+            .framing = framing_errors_.count(),
+            .noise = 0,
+            .unattributed = unattributed_.count(),
+            .tx_dropped = tx_dropped_.count(),
+            .rx_dropped = rx_dropped_.count(),
+        };
+    }
+
+    // ---- libhcs 握手里的声明: 主机没声明的串口不工作 ----
+    //
+    // 清单里没有这一路的串口保持挂起, 声明了才工作(resume); 归属交还时恢复
+    // (没有 libhcs 主机时它是 CDC 串口桥, 那条路不走 EP0)。
+    //
+    // 挂起的端口不占任何东西 [2026-10-03]: 接收器从引脚上摘下、接收 DMA 通道与 IDLE
+    // 中断关掉(RxBuffer::stop_rx()), 所以线上有什么都不进中断; 主机写来的字节在
+    // handle_downlink 入口丢弃, 发送环因此一直是空的, 主循环里的发送泵对它只是三次内存
+    // 读(TxBuffer::try_dequeue() 开头), 不碰寄存器 -- 与一个声明了但此刻没东西要发的口
+    // 完全一样, 所以不需要另设"要不要轮询"的状态。挂起之前已经收下的待发字节照常发完。
+    // 恢复时接收从环的开头重新开始 -- 设置先于恢复生效(usb/vendor_control.cpp), 所以
+    // 端口一起来就已经是主机要的速率和帧格式。
+    //
+    // handle_uplink / handle_downlink 里的 suspended_ 判断是最后一道: 不经板卡类的主机
+    // 往没声明的口发数据, 到这里为止。
+    //
+    // 只在主循环写(EP0 处理器与会话状态机); UART 中断只读, 单字节读写是原子的。
+    // 标志先于停、后于起: 中断里见到"没挂起"时接收一定是在跑的。
+    [[nodiscard]] bool suspended() const { return suspended_; }
+
+    void suspend() {
+        if (suspended_)
+            return;
+        suspended_ = true;
+        RxBuffer::stop_rx();
+        uart_disable_irq(uart_base_, uart_intr_rx_line_stat);
+    }
+
+    void resume() {
+        if (!suspended_)
+            return;
+        RxBuffer::start_rx();
+        suspended_ = false;
     }
 
     ATTR_PLACE_AT(".fast")
     void try_transmit() { TxBuffer::try_dequeue(); }
 
     void irq_handler() {
-        if (uart_is_rxline_idle(uart_base_)) {
+        const bool idle = uart_is_rxline_idle(uart_base_);
+        if (idle) {
             uart_clear_rxline_idle_flag(uart_base_);
             RxBuffer::rx_idle_callback();
+        }
+        // ELSI 开着(本轮还没见过错误): 读一次 LSR 记下种类。进来却读不到错误位又不是
+        // IDLE, 是坏字节已被 DMA 取走, 只知道出过错。记下即关 ELSI, read_status() 再开。
+        // IER 的读改写与主循环的(read_status / suspend / start_rx)可能交错, 最坏是 ELSI
+        // 被提前重开、多进一次中断。
+        if ((uart_base_->IER & UART_IER_ELSI_MASK) != 0U) {
+            const uint32_t errors = uart_get_status(uart_base_) & kLineErrorMask;
+            if (errors != 0U || !idle) {
+                line_errors_seen_.fetch_or(
+                    errors != 0U ? errors : kUnattributed, std::memory_order_relaxed);
+                uart_disable_irq(uart_base_, uart_intr_rx_line_stat);
+            }
         }
     }
 
@@ -220,7 +360,7 @@ public:
     [[nodiscard]] uint32_t oscr() const { return uart_base_->OSCR; }
     [[nodiscard]] UART_Type* base() const { return uart_base_; }
 
-    // UartDivisor 的两个整数, 供 EP0 的 kGetUartConfig 上报与 kSetUartConfig
+    // UartDivisor 的两个整数, 供 EP0 的 kGetPortConfig 上报与清单声明
     // 回读比对。**分频器取自快照** -- 理由同 divisor() 上方: 按需回读要置
     // LCR.DLAB, 会与在途 TX DMA 争用 0x20。过采样取自活寄存器 OSCR(它不在
     // DLAB 的别名窗口里, 直接读安全), 按 SDK 的编码把 0 还原成 32。
@@ -367,6 +507,9 @@ private:
 
     void handle_uplink(
         std::span<const std::byte> payload, std::span<const std::byte> payload2, bool is_idle) {
+        // 主机没声明的串口: 字节到此为止(RxBuffer 照常推进读指针, 环不会积压)。
+        if (suspended_) [[unlikely]]
+            return;
         if (!link::uplink_enabled()) {
             // 没有 libhcs 会话: 交给 CDC 串口桥(桥没接通时它什么也不做)。冷函数调用
             // 而非内联判断, 上面 libhcs 分支的代码与没有 CDC 桥时一样。
@@ -376,14 +519,15 @@ private:
         }
 
         auto& serializer = link::uplink_serializer();
+        const auto result = serializer.write_uart(
+            data_id_, {.uart_data = payload, .idle_delimited = is_idle}, payload2);
+        if (result == core::protocol::Serializer::SerializeResult::kBadAlloc) [[unlikely]]
+            rx_dropped_.note();
         core::utility::assert_debug(
-            serializer.write_uart(
-                data_id_, {.uart_data = payload, .idle_delimited = is_idle}, payload2)
-            != core::protocol::Serializer::SerializeResult::kInvalidArgument);
+            result != core::protocol::Serializer::SerializeResult::kInvalidArgument);
     }
 
     const data::DataId data_id_;
-    const data::DataId config_data_id_;
     UART_Type* uart_base_;
     // init 时捕获的源时钟: 运行时切波特率时, uart_set_baudrate 靠它重算
     // 分频器。
@@ -391,6 +535,22 @@ private:
     // 实际写入的分频器值, 由 snapshot_divisor() 在 init 时与每次切换后
     // 采样。为何不按需回读, 见上方访问器注释。
     uint32_t uart_divisor_ = 0;
+    // 见 suspend()。
+    bool suspended_ = false;
+
+    // 运行时状态的计数(read_status())。接收错误与下行丢弃在主循环记, 上行丢弃在
+    // 接收中断里记; 各自单写者。
+    utility::EventCounter overrun_;
+    utility::EventCounter parity_errors_;
+    utility::EventCounter framing_errors_;
+    utility::EventCounter unattributed_;
+    utility::EventCounter tx_dropped_;
+    // 本轮中断里见到的 LSR 错误位(加 kUnattributed), 中断置、read_status() 取走清零。
+    static constexpr uint32_t kLineErrorMask =
+        UART_LSR_OE_MASK | UART_LSR_PE_MASK | UART_LSR_FE_MASK | UART_LSR_LBREAK_MASK;
+    static constexpr uint32_t kUnattributed = 1UL << 31;
+    std::atomic<uint32_t> line_errors_seen_{0U};
+    utility::EventCounter rx_dropped_;
 
 public:
     // DMA 缓冲存储, 放在板级选定的非缓存区域(HPM5321 上是 AHB SRAM,
@@ -407,12 +567,14 @@ public:
     };
 };
 
+// 板子的数据 UART 数, 可以是 0(hpm6e8y: 唯一的 UART 是调试焊盘, 生产镜像不带)。
+// 存储用 std::array: 零个口时是合法的空数组, 而不是 C 的零长数组。
 constexpr size_t kUartCount = std::size(board::kUartPorts);
 
 ATTR_PLACE_AT(libhcs_DMA_BUFFER_SECTION)
-inline constinit Uart::RxStorage uart_rx_storage[kUartCount]{};
+inline constinit std::array<Uart::RxStorage, kUartCount> uart_rx_storage{};
 ATTR_PLACE_AT(libhcs_DMA_BUFFER_SECTION)
-inline constinit Uart::TxStorage uart_tx_storage[kUartCount]{};
+inline constinit std::array<Uart::TxStorage, kUartCount> uart_tx_storage{};
 
 inline Uart::Uart(UartPort port, size_t storage_index)
     : TxBuffer(
@@ -423,7 +585,6 @@ inline Uart::Uart(UartPort port, size_t storage_index)
           uart_rx_storage[storage_index].data.data(),
           uart_rx_storage[storage_index].descriptors.data())
     , data_id_(port.data_id)
-    , config_data_id_(port.config_data_id)
     , uart_base_(reinterpret_cast<UART_Type*>(port.base))
     , uart_clock_hz_(init_uart(port.irq_num, port.baudrate, port.parity)) {
     // 此处安全, 理由同 set_baudrate 中的调用: 尚无任何 TX 入队, DLAB 置位
@@ -448,5 +609,29 @@ consteval std::array<Uart::Lazy, sizeof...(indices)>
 
 inline constinit auto uart_array =
     internal::make_uart_array(std::make_index_sequence<kUartCount>{});
+
+// libhcs 握手开始 / 作废时对全部串口生效; 未构造的槽位跳过。
+inline void suspend_all() {
+    for (auto& lazy : uart_array) {
+        if (Uart* port = lazy.try_get())
+            port->suspend();
+    }
+}
+
+inline void resume_all() {
+    for (auto& lazy : uart_array) {
+        if (Uart* port = lazy.try_get())
+            port->resume();
+    }
+}
+
+// CDC 串口桥(dmtool/)接的那一个数据 UART: 表里的第一个, 尚未构造时为 null。没有数据
+// UART 的板子恒为 null, 桥永远不通。
+inline Uart* bridge_uart() {
+    if constexpr (kUartCount != 0)
+        return uart_array[0].try_get();
+    else
+        return nullptr;
+}
 
 } // namespace libhcs::firmware::uart

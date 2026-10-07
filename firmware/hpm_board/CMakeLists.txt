@@ -33,9 +33,6 @@ set_property(CACHE BOARD_BOOTLOADER_MODE PROPERTY STRINGS auto manual)
 # 透传给 app 子构建为 libhcs_APP_CAN_DIAG; 见 app/CMakeLists.txt。
 option(libhcs_CAN_DIAG "Emit CAN forwarding telemetry on the UART0 uplink" OFF)
 
-# 透传给 app 子构建为 libhcs_APP_TIME_SYNC; 见 app/CMakeLists.txt。
-option(libhcs_TIME_SYNC "Run the shared USB-SOF time base" OFF)
-
 # 透传给 app 子构建为 libhcs_APP_PULSE_TEST; 见 app/CMakeLists.txt。
 option(libhcs_PULSE_TEST "Measure cross-board skew with GPTMR pulses (takes over UART0)" OFF)
 
@@ -95,7 +92,6 @@ add_hpm_board_subbuild(
     hpm_board_app
     app
     -Dlibhcs_APP_CAN_DIAG=${libhcs_CAN_DIAG}
-    -Dlibhcs_APP_TIME_SYNC=${libhcs_TIME_SYNC}
     -Dlibhcs_APP_PULSE_TEST=${libhcs_PULSE_TEST}
     -Dlibhcs_APP_SOF_DIAG=${libhcs_SOF_DIAG}
     -Dlibhcs_APP_WATCHDOG=${libhcs_WATCHDOG}

@@ -8,6 +8,8 @@
 #include <fdcan.h>
 
 #include "core/include/libhcs/data/datas.hpp"
+#include "core/include/libhcs/spec/mc02/ports.hpp"
+#include "core/src/link/port.hpp"
 #include "firmware/mc02/app/src/diag/can_diag.hpp"
 #include "firmware/mc02/app/src/led/led.hpp"
 #include "firmware/mc02/app/src/usb/helper.hpp"
@@ -19,6 +21,9 @@
 #define libhcs_ITCM __attribute__((section(".itcm")))
 
 namespace libhcs::firmware::can {
+
+namespace vc = libhcs::core::protocol::vendor_control;
+namespace link = libhcs::core::link;
 
 libhcs_ITCM uint32_t Can::hardware_free_slots() const noexcept {
     return hal_can_handle_->Instance->TXFQS & FDCAN_TXFQS_TFFL;
@@ -46,11 +51,23 @@ libhcs_ITCM void Can::push_to_hardware(const TransmitMailboxData& mailbox_data) 
     target_mailbox->TDLR = mailbox_data.data[0];
     target_mailbox->TDHR = mailbox_data.data[1];
 
-    hcan->Instance->TXBAR = (1UL << put_index);
-    hcan->LatestTxFifoQRequest = (1UL << put_index);
+    // 单发作废的清点, 与 hpm_board 的 send_to_fifo() 同法: 一个槽只在上一次发送结束(成功
+    // 或作废)后才重新分配, 所以写入前 TXBCF 的这一位就是这个槽上一次的结果, 每次结果正好
+    // 看一次; 最近还没被重用的槽(至多 FIFO 深度个)要等下一次重用才计入。代价: 每帧多读
+    // 一次 TXBCF(D2 域外设读)。
+    const uint32_t bit = 1UL << put_index;
+    if ((hcan->Instance->TXBCF & used_tx_slots_ & bit) != 0U) [[unlikely]]
+        cancelled_frames_.note();
+    used_tx_slots_ |= bit;
+
+    hcan->Instance->TXBAR = bit;
+    hcan->LatestTxFifoQRequest = bit;
 }
 
 libhcs_ITCM void Can::handle_downlink(const data::CanDataView& data) {
+    // 没声明的总线不发: 控制器不在总线上, 主机往它写的帧直接丢弃。
+    if (!started_) [[unlikely]]
+        return;
     // 本板不广告 kCapCanFdLongFrames(RX FIFO 元素仍为 8 字节, 主机 SDK 侧也已
     // 拒绝长负载), 该守卫防止对端 bug 在无 debug 构建上溢出 8 字节 TX 元素。
     if (data.can_data.size() > 8)
@@ -99,6 +116,7 @@ libhcs_ITCM void Can::handle_downlink(const data::CanDataView& data) {
         new (storage) TransmitMailboxData{mailbox};
     };
     if (!transmit_buffer_.emplace_back_n(copy, 1)) {
+        tx_dropped_.note();
         led::led->downlink_buffer_full();
         diag::note_tx_fail(diag_index());
     }
@@ -146,16 +164,12 @@ libhcs_ITCM void Can::handle_uplink(data::DataId field_id, core::protocol::Seria
             can_data.can_id = (rx_mailbox->RIR & 0x1FFC0000U) >> 18;
         }
 
-        // 不用硬件 RX 时间戳: FDCAN 内部计数器只有 16 位, 上报值约 65.5 ms 回绕,
-        // 不满足 CanDataView::timestamp_us 的 32 位微秒约定
-        // (见 core/include/libhcs/data/datas.hpp)。留空则 serializer 直接省掉该字段,
-        // 每个上行帧省 4 字节。若要恢复, 除取消下面这行注释和 config_can() 里的
-        // FDCAN_TIMESTAMP_* 配置外, 还要先把值加宽(例如叠加自由运行的 TIM5 微秒计数器),
-        // 上位机才能继续用普通的 32 位回绕差值。
-
-        // 帧起始时刻捕获的 16 位硬件时间戳(R1 bits[15:0])。内部计数器每个标称位时间
-        // 走一格, 在 1 Mbit/s 仲裁速率(预分频 1)下即 1 us, 所以数值本身就是微秒。
-        // can_data.timestamp_us = static_cast<uint32_t>(rdtr & 0x0000FFFFU);
+        // 帧起始时刻的 16 位硬件时间戳在 R1 bits[15:0](外部计数器 = TIM3, 见 can.hpp 的
+        // config_can())。换成共享微帧轴上的位置; 换不出就不带, serializer 直接省掉该
+        // 字段。主机的清单没要时间基准时只付第一个判断。
+        if (sync::time_sync_on() && longest_frame_age_ns_ != 0U
+            && sync::sof_capture::window_covers(longest_frame_age_ns_))
+            can_data.sof_stamp = sync::sof_capture::stamp_of(static_cast<uint16_t>(rdtr));
 
         size_t can_data_length = (rdtr & 0x000F0000U) >> 16;
         if (can_data.is_remote_transmission)
@@ -186,13 +200,12 @@ libhcs_ITCM void Can::handle_uplink(data::DataId field_id, core::protocol::Seria
         //
         // 与 hpm_board 的 Can::serialize_uplink 一致, 那边一直有这个标记。无论如何
         // 下面都会确认报文: 从 RX FIFO 重试会卡住排空循环、连累更新的帧, 所以池满时
-        // 仍然丢帧 -- 这里的意义只是让它不再静默。
-        // 在结果判断之前计数: 因上行批量池满而被丢的帧, 也要在 EP0 状态查询里
-        // 显示为"已接收" -- "总线有帧但我们丢了"不能看起来像"总线什么都没来",
-        // 这是每次排查死总线的第一个分叉。
-        ++forwarded_frames_;
+        // 仍然丢帧 -- 这里的意义只是让它不再静默: 计进 rx_dropped_, 随端口状态报给
+        // 主机 -- "总线有帧但我们丢了"不能看起来像"总线什么都没来", 这是每次排查死
+        // 总线的第一个分叉。
         const auto uplink_result = serializer.write_can(field_id, can_data);
         if (uplink_result == core::protocol::Serializer::SerializeResult::kBadAlloc) [[unlikely]] {
+            rx_dropped_.note();
             led::led->uplink_buffer_full();
             diag::note_uplink_drop(diag_index());
         } else {
@@ -205,11 +218,29 @@ libhcs_ITCM void Can::handle_uplink(data::DataId field_id, core::protocol::Seria
     }
 }
 
-// 仅 EP0 使用的冷路径, 刻意不放进 ITCM 热路径段。HAL 读到的就是 M_CAN 寄存器的
-// 原始编码 -- FDCAN_PROTOCOL_ERROR_* 的 0..7 与 EP0 LastErrorCode 枚举同序 --
-// 无需任何转换即可进负载。tx_occurred/tx_cancelled 读 TXBTO/TXBCF: 由于
-// AutoRetransmission 已被 .ioc 关闭, 二者分别明确表示"已上总线"与"已放弃"。
-Can::Status Can::status() const {
+// 协议错误中断(IR.PEA / PED)里调用, 与 hpm_board 的 ISR 同法: PSR 只读这一次, LEC/DLEC
+// 读后自清, 读到的真实错误码交给锁存(唯一的写者)。冷路径, 不放进 ITCM。
+void Can::note_bus_errors() {
+    const uint32_t psr = hal_can_handle_->Instance->PSR;
+    last_bus_error_.note(static_cast<data::CanLastError>(psr & FDCAN_PSR_LEC));
+    last_data_bus_error_.note(
+        static_cast<data::CanLastError>((psr & FDCAN_PSR_DLEC) >> FDCAN_PSR_DLEC_Pos));
+}
+
+// 运行时状态(core/src/link/port_status.hpp), 每个 keepalive 轮次在主循环读一次; 冷
+// 路径, 刻意不放进 ITCM 热路径段。HAL 读到的就是 M_CAN 寄存器的原始编码 --
+// FDCAN_PROTOCOL_ERROR_* 的 0..7 与 data::CanLastError 同序 -- 无需转换。错误码多半
+// 已被协议错误中断读走并锁存, 这里只读: 自己这次读到真实错误就用它, 否则用锁存的。
+// 另一个读 PSR 的是 bus-off 恢复路径(为 BusOff 电平), 它会顺带清掉那一刻的错误码。
+// 单发作废在 push_to_hardware() 里按发送槽清点。RX FIFO0 溢出(IR.RF0L)不在中断使能
+// 掩码里, 中断路径(line0_isr / HAL)都不碰它, 这里每轮看一次、见到就记一次并清掉 --
+// 一个计数是"这一轮里溢出过", 接收热路径上不多读一次 IR。
+data::CanStatusView Can::read_status() {
+    if ((hal_can_handle_->Instance->IR & FDCAN_IR_RF0L) != 0U) {
+        hal_can_handle_->Instance->IR = FDCAN_IR_RF0L; // 写 1 清, 只清这一位
+        rx_lost_.note();
+    }
+
     FDCAN_ProtocolStatusTypeDef protocol_status{};
     core::utility::assert_always(
         HAL_FDCAN_GetProtocolStatus(hal_can_handle_, &protocol_status) == HAL_OK);
@@ -217,23 +248,65 @@ Can::Status Can::status() const {
     core::utility::assert_always(
         HAL_FDCAN_GetErrorCounters(hal_can_handle_, &error_counters) == HAL_OK);
 
+    const auto last_error = static_cast<data::CanLastError>(protocol_status.LastErrorCode);
+    const auto data_last_error = static_cast<data::CanLastError>(protocol_status.DataLastErrorCode);
+
     uint8_t flags = 0;
     if (protocol_status.ErrorPassive != 0U)
-        flags |= 1U << 0; // 被动错误
+        flags |= data::kCanErrorPassive;
     if (protocol_status.Warning != 0U)
-        flags |= 1U << 1; // 警告
+        flags |= data::kCanWarning;
     if (protocol_status.BusOff != 0U)
-        flags |= 1U << 2; // 总线关闭
+        flags |= data::kCanBusOff;
     return {
         .tec = static_cast<uint8_t>(error_counters.TxErrorCnt),
         .rec = static_cast<uint8_t>(error_counters.RxErrorCnt),
-        .last_error = static_cast<uint8_t>(protocol_status.LastErrorCode),
-        .data_last_error = static_cast<uint8_t>(protocol_status.DataLastErrorCode),
+        .last_error = last_bus_error_.latest(last_error),
+        .data_last_error = last_data_bus_error_.latest(data_last_error),
         .flags = flags,
-        .tx_occurred = hal_can_handle_->Instance->TXBTO,
-        .tx_cancelled = hal_can_handle_->Instance->TXBCF,
-        .rx_frames = forwarded_frames_,
-        .rx_fifo_level = hal_can_handle_->Instance->RXF0S & FDCAN_RXF0S_F0FL,
+        .tx_cancelled = cancelled_frames_.count(),
+        .tx_dropped = tx_dropped_.count(),
+        .rx_dropped = rx_dropped_.count(),
+        .rx_lost = rx_lost_.count(),
+    };
+}
+
+// 寄存器预设重构的位时序事实: 分频器与时间段来自 CubeMX 生成的 Init, 内核时钟
+// 经 RCC 解析(PLL2Q/PLL3Q/HSI), 与 UART 的实际波特率读回同一算术 -- 永远不是
+// "上次请求了什么"。控制器具备 FD 能力, 数据段速率无论当前 TX 模式照报。
+link::CanTimingValue Can::timing() const {
+    const auto& init = hal_can_handle_->Init;
+    const uint32_t clock_hz = HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_FDCAN);
+    const auto rate = [clock_hz](uint32_t prescaler, uint32_t seg1, uint32_t seg2) {
+        const uint32_t divisor = prescaler * (1U + seg1 + seg2);
+        return divisor != 0U ? clock_hz / divisor : 0U;
+    };
+    const auto sample_point = [](uint32_t seg1, uint32_t seg2) -> uint16_t {
+        const uint32_t total = 1U + seg1 + seg2;
+        return total != 0U ? static_cast<uint16_t>((1U + seg1) * 1000U / total) : 0U;
+    };
+    return {
+        .arbitration_baudrate =
+            rate(init.NominalPrescaler, init.NominalTimeSeg1, init.NominalTimeSeg2),
+        .data_baudrate = rate(init.DataPrescaler, init.DataTimeSeg1, init.DataTimeSeg2),
+        .nominal_sample_point = sample_point(init.NominalTimeSeg1, init.NominalTimeSeg2),
+        .data_sample_point = sample_point(init.DataTimeSeg1, init.DataTimeSeg2),
+    };
+}
+
+// kGetPortConfig 的应答: 当前帧型 + 寄存器重构的速率与采样点。控制器保持 FD 能力,
+// 经典模式下数据段速率照报(它仍照常解码对端发来的 FD 帧)。
+void Can::read_config(vc::CanConfigPayload& out) const {
+    const link::CanTimingValue t = timing();
+    out = {
+        .mode = std::to_underlying(canfd_ ? vc::CanMode::kCanFd : vc::CanMode::kClassic),
+        .control = 0,
+        .reserved0 = 0,
+        .arbitration_baudrate = t.arbitration_baudrate,
+        .data_baudrate = t.data_baudrate,
+        .nominal_sample_point = t.nominal_sample_point,
+        .data_sample_point = t.data_sample_point,
+        .reserved1 = 0,
     };
 }
 
@@ -280,6 +353,34 @@ bool Can::transmit_queues_empty() {
         && can3->transmit_buffer_.readable() == 0;
 }
 
+// 把控制器撤下总线。标志先落: 之后才到的 RX / bus-off 中断见到它就直接返回。
+// HAL_FDCAN_Stop 置 CCCR.INIT 与 CCE: 控制器不再参与总线, 硬件 Tx 请求与 Rx FIFO 随
+// CCE 清空(RM0468: TXBRP / RXF0S 等在 CCE 置位时复位); bus-off 期间内核已自行置
+// INIT 而 HAL 状态仍是 BUSY, 走的是同一条收尾。位时序、TDC 与过滤器是受保护的
+// 配置寄存器, 不受影响, 下一次 start() 直接可用。
+void Can::stop() {
+    if (!started_)
+        return;
+    started_ = false;
+
+    constexpr auto ok = HAL_OK;
+    core::utility::assert_always(
+        HAL_FDCAN_DeactivateNotification(
+            hal_can_handle_, FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_BUS_OFF
+                                 | FDCAN_IT_ARB_PROTOCOL_ERROR | FDCAN_IT_DATA_PROTOCOL_ERROR)
+        == ok);
+    core::utility::assert_always(HAL_FDCAN_Stop(hal_can_handle_) == ok);
+    // INIT 之后 TXBCF 的旧位不再是"上一次发送的结果": 发送槽的历史一并忘掉。
+    used_tx_slots_ = 0;
+
+    // 软件队列里排着的帧属于刚结束的会话, 不留给下一个。
+    (void)transmit_buffer_.clear();
+    transmit_pending_mask_ &= ~(1U << diag_index());
+    bus_off_ = false;
+    stuck_request_since_ms_ = 0;
+    loop::clear(loop::bit(kCanPorts[diag_index()].data_id));
+}
+
 void Can::recover_all_stuck_transmits() {
     can1->recover_stuck_transmits();
     can2->recover_stuck_transmits();
@@ -294,13 +395,16 @@ void Can::recover_all_stuck_transmits() {
 // 且不在 bus-off(恢复期间请求位合法地长期非零, 见 bus_off_)只剩这一种硬件状态。
 //
 // 处置按勘误 workaround 取消请求(TXBCR), 释放槽位; 帧与正常 DAR 仲裁失败同语义地
-// 丢弃, EP0 状态查询的 tx_cancelled(TXBCF)可见。刻意不执行 workaround 的"重发"半步:
+// 丢弃(TXBCF 置位, 槽位重用时计进 tx_cancelled)。刻意不执行 workaround 的"重发"半步:
 // 取消一完成槽位就回到 TFQPI 分配, 同线程的下一次 handle_downlink 可能已把新帧写进
 // 同一槽位, 此时对旧请求位再置 TXBAR 会把新帧发两遍。丢弃一个已停滞 20 ms 的帧,
 // 好过让一个槽位永久蒸发。
 constexpr uint32_t kStuckRequestThresholdMs = 20;
 
 void Can::recover_stuck_transmits() {
+    // 没启动的控制器没有发送请求可查, 也不去碰它的寄存器。
+    if (!started_)
+        return;
     const uint32_t pending = hal_can_handle_->Instance->TXBRP;
     if (pending == 0U || bus_off_) {
         stuck_request_since_ms_ = 0;
@@ -332,15 +436,15 @@ extern "C" libhcs_ITCM void
 
     if (hfdcan == &hfdcan1) {
         can = can1.get();
-        field_id = data::DataId::kCan1;
+        field_id = spec::mc02::Spec::Cans::kCan1.data_id;
         diag_index = 0;
     } else if (hfdcan == &hfdcan2) {
         can = can2.get();
-        field_id = data::DataId::kCan2;
+        field_id = spec::mc02::Spec::Cans::kCan2.data_id;
         diag_index = 1;
     } else if (hfdcan == &hfdcan3) {
         can = can3.get();
-        field_id = data::DataId::kCan3;
+        field_id = spec::mc02::Spec::Cans::kCan3.data_id;
         diag_index = 2;
     } else {
         return;
@@ -349,6 +453,11 @@ extern "C" libhcs_ITCM void
     // 按中断计数而非按帧计数: RX FIFO 非空而计数不再增长, 才能区分"中断不再送达"
     // 与"控制器收不到报文"。
     diag::note_isr_entry(diag_index);
+
+    // 正在停口: stop() 已落标志、还没来得及撤通知的那一小段里到的中断, 直接放过。
+    // 控制器随即进 INIT, FIFO 由硬件清空。
+    if (!can->started()) [[unlikely]]
+        return;
 
     can->handle_uplink(field_id, usb::get_serializer());
 }
@@ -368,6 +477,10 @@ extern "C" void
     else
         return;
 
+    // 同上: 正在停口的控制器不做 bus-off 恢复, 否则这里清掉的 INIT 会把它重新拉上总线。
+    if (!can->started())
+        return;
+
     FDCAN_ProtocolStatusTypeDef status;
     HAL_FDCAN_GetProtocolStatus(hfdcan, &status);
     // IR.BO 在 Bus_Off 置位与清零两个沿都会触发: 置位沿启动恢复流程, 清零沿只解除
@@ -381,6 +494,54 @@ extern "C" void
     // 129 * 11 个连续隐性位, 复位错误计数器后恢复运行。总线持续故障时它只会再次
     // 进入 bus-off 并重试, 端口不用重启也能保活。
     CLEAR_BIT(hfdcan->Instance->CCCR, FDCAN_CCCR_INIT);
+}
+
+namespace {
+
+// FDCAN 第 0 中断线。本固件开了四种通知(RX FIFO0 新消息、bus-off、两段协议错误, 见
+// Can::start), 中断线选择(ILS)从未配置, 全部落在第 0 线。接收是每帧一次的热路径: 读一次 IR 直接
+// 分发, 不经 CubeMX 存根(stm32h7xx_it.c)与 HAL_FDCAN_IRQHandler -- 后者在 FLASH 里
+// 300 余条指令, 每次进来都把十几类中断源逐一读一遍寄存器。协议错误也在这里直接锁存
+// 错误码; bus-off 和任何意料之外的源照旧交给 HAL, 行为与原路径一致。
+template <FDCAN_HandleTypeDef* kHandle>
+Can& can_of() {
+    if constexpr (kHandle == &hfdcan1)
+        return *can1;
+    else if constexpr (kHandle == &hfdcan2)
+        return *can2;
+    else
+        return *can3;
+}
+
+template <FDCAN_HandleTypeDef* kHandle>
+libhcs_ITCM void line0_isr() {
+    constexpr std::uint32_t kProtocolErrors = FDCAN_IR_PEA | FDCAN_IR_PED;
+    FDCAN_GlobalTypeDef* const instance = kHandle->Instance;
+    const std::uint32_t pending = instance->IR & instance->IE;
+    if ((pending & FDCAN_IR_RF0N) != 0U) {
+        instance->IR = FDCAN_IR_RF0N;
+        HAL_FDCAN_RxFifo0Callback(kHandle, FDCAN_IT_RX_FIFO0_NEW_MESSAGE);
+    }
+    // 协议错误也在这里直接处理, 不经 HAL(它只会置 ErrorCode 再回调, 读不到错误码)。
+    if ((pending & kProtocolErrors) != 0U) [[unlikely]] {
+        instance->IR = pending & kProtocolErrors;
+        can_of<kHandle>().note_bus_errors();
+    }
+    if ((pending & ~(FDCAN_IR_RF0N | kProtocolErrors)) != 0U) [[unlikely]]
+        HAL_FDCAN_IRQHandler(kHandle);
+}
+
+std::uint32_t isr_address(void (*isr)()) {
+    return static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(isr));
+}
+
+} // namespace
+
+void install_interrupt_vectors(std::uint32_t* vectors) {
+    // 外设中断 n 在表里的下标是 16 + n(前 16 项是系统异常)。
+    vectors[16 + FDCAN1_IT0_IRQn] = isr_address(&line0_isr<&hfdcan1>);
+    vectors[16 + FDCAN2_IT0_IRQn] = isr_address(&line0_isr<&hfdcan2>);
+    vectors[16 + FDCAN3_IT0_IRQn] = isr_address(&line0_isr<&hfdcan3>);
 }
 
 } // namespace libhcs::firmware::can

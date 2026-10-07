@@ -21,9 +21,7 @@
 # Ozone is started detached: the shell returns immediately and Ozone survives
 # closing the terminal. Its stdout/stderr go to the log file printed on start.
 #
-# ch32_board is deliberately absent: it is debugged over WCH-Link, which Ozone
-# does not speak. Use the VS Code "ch32 - Debug V3F boot core" configuration, or
-# ./tools/jlink-debug.sh for the command-line route on the J-Link boards.
+# Use ./tools/jlink-debug.sh for the command-line route on the J-Link boards.
 #
 set -euo pipefail
 

@@ -20,7 +20,7 @@
 
 #include "core/include/libhcs/data/datas.hpp"
 #include "core/src/utility/assert.hpp"
-#include "firmware/hpm_board/app/src/utility/ring_buffer.hpp"
+#include "firmware/common/app/src/utility/ring_buffer.hpp"
 
 namespace libhcs::firmware::uart {
 
@@ -134,6 +134,14 @@ public:
 
     ATTR_PLACE_AT(".fast")
     bool try_dequeue() {
+        // 没有待发字节、也没有 DMA 在途: 到此为止, 不碰寄存器。主循环每趟对每个口都
+        // 走到这里, 而绝大多数时候就是这种情况(只收不发的口、主机没声明的口永远是),
+        // 所以这三次内存读必须排在下面那次 DMA 寄存器读的前面。入队与本函数同在主循环
+        // (tud_task() 里的下行回调), 这里看到的 in_ 不会比下面再读一次的旧。
+        if (in_flight_ == 0
+            && in_.load(std::memory_order::relaxed) == out_.load(std::memory_order::relaxed))
+            return false;
+
         if (dma_channel_is_enable(dma_.base, dma_.channel))
             return false;
         auto out = out_.load(std::memory_order::relaxed);

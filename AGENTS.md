@@ -28,6 +28,10 @@ libhcs 是**无下位机**控制系统（[README.md](README.md)）：控制环�
 
 ## 项目结构与模块组织
 - `firmware/`：各板卡固件，详见下方"多芯片固件总览"。每块板一个子目录，含独立的 `CMakePresets.json` 与专属 `AGENTS.md`。
+- `firmware/common/`：各板共享的固件代码（`app/src/usb/` 的 EP0 头、`app/src/utility/` 的
+  `lazy.hpp` / `ring_buffer.hpp` / `interrupt_lock.hpp`，包含根是仓库根，header-only 不必改
+  各板 CMake）。板级事实（mailbox 布局、assert 失败动作、`loop_work.hpp` 等）不进这里，
+  仍留在各板 `app/src/utility/`。
 - `firmware/*/bsp/`：厂商/子模块依赖；除非有意更新子模块，否则视为第三方代码。
 
 ## 多芯片固件总览
@@ -38,20 +42,16 @@ libhcs 是**无下位机**控制系统（[README.md](README.md)）：控制环�
 |---|---|---|---|---|
 | `c_board` | STM32F407IGH6TR | ARM `cmake/gcc-arm-none-eabi.cmake` | `c_board_app` `c_board_bootloader` | CubeMX BSP + TinyUSB |
 | `mc02` | STM32H723VGT6（M7） | ARM `cmake/gcc-arm-none-eabi.cmake` | `mc02_app` `mc02_bootloader` | CAN-FD，USB Full-Speed |
-| `ch32_board` | WCH CH32H417（Qingke V3F + V5F 双核） | RISC-V `cmake/toolchain-wch-riscv.cmake` | `ch32_board_app` `ch32_board_boot` `ch32_board_merged` | USB 3.0 SuperSpeed；`boot` 是 V3F 启动核兼 DFU bootloader |
 | `hpm_board` | HPM6E8Y / HPM5321（Andes） | RISC-V 超级构建 + HPMicro GNU 工具链 | `hpm_board_app` `hpm_board_bootloader` | HPM SDK v1.12.0 |
 
-> 两块 RISC-V 板使用相互独立的编译器：`ch32_board` 用 WCH
-> `riscv32-wch-elf-gcc`，`hpm_board` 用 HPM `riscv32-unknown-elf-gcc`。**不要**用
+> RISC-V 板 `hpm_board` 用 HPM `riscv32-unknown-elf-gcc`。**不要**用
 > `arm-none-eabi-gcc`；后者只给 STM32（`c_board`、`mc02`）用。
 
 ## 构建环境与工具链
 
 - 工具链一律**留在仓库外**，不入库、不做 submodule；依赖清单与安装命令见
-  [ENV.md](ENV.md)。
-  **唯一例外**：`firmware/ch32_board/tools/openocd-wch/`（WCH 私有 fork 的 OpenOCD，
-  CH32H417 调试链路无可替代，源码未公开，所以归档入库）。判据是"不可替代且无法
-  重建"——能重下或有等价替代的工具链一律不入库。
+  [ENV.md](ENV.md)。判据是"不可替代且无法重建"——能重下或有等价替代的工具链一律
+  不入库。
 
 ### 开发机环境路径约定（重要，先读这条再看任何路径）
 
@@ -62,7 +62,7 @@ libhcs 是**无下位机**控制系统（[README.md](README.md)）：控制环�
   [ENV.md](ENV.md)「本机实际安装状态」**——先查它或直接 `ls` 确认，不要凭任何文档
   的旧措辞断言"本机没有/有某工具链"。
 - 换到新机器时：按 [ENV.md](ENV.md) 的依赖清单重新安装，再把
-  `GNURISCV_TOOLCHAIN_PATH`、`WCH_TOOLCHAIN_PATH`、`PATH` 等环境变量指向新的安装
+  `GNURISCV_TOOLCHAIN_PATH`、`PATH` 等环境变量指向新的安装
   位置，然后**只更新 ENV.md 的那张表**。
 - 各文档中出现旧机器路径的地方标注为 `[前机路径]`，看到这个标记就按本节理解。
 
@@ -77,14 +77,15 @@ libhcs 是**无下位机**控制系统（[README.md](README.md)）：控制环�
 - `firmware/*/bsp/cubemx/` 下 CubeMX 生成的产物（`Core/`、`USB_DEVICE/`、`cmake/`、`Makefile`、`.mxproject`）禁止 AI 直接修改：下次 Generate 会被覆盖。`.claude/settings.json` 已对这些目录硬禁止 Edit/Write。
 - 任何外设/时钟/中断/DMA 配置变更，AI 必须明确指出应在 CubeMX（或对应 `.ioc` 键）的哪个字段修改，由人工在 CubeMX 改后重新 Generate；严禁绕过 `.ioc` 直接改生成代码。
 - 例外：`.ioc` 与手维护的链接脚本 `*.ld` 仅在用户明确要求时方可由 AI 编辑。
-- 仅 `c_board`、`mc02` 使用 CubeMX；`ch32_board`、`hpm_board` 禁止 AI 直接修改bsp下内容（见各自 `AGENTS.md`）。
+- 仅 `c_board`、`mc02` 使用 CubeMX；`hpm_board` 禁止 AI 直接修改bsp下内容（见其 `AGENTS.md`）。
 
 ## 构建、测试与开发命令
 
-Host SDK（纯 x86，任意机器可编）：
+Host SDK（纯 x86，任意机器可编）；测试默认随它一起编，编完跑一遍：
 ```bash
 cmake --preset linux-debug -S host
 cmake --build host/build
+ctest --test-dir host/build --output-on-failure
 ```
 
 固件统一形态为 `cmake --preset <preset> -S firmware/<board>` + `cmake --build`。
@@ -113,10 +114,32 @@ AGENTS.md 里留一句结论加链接。**
   注释与 Markdown 文档允许中文。
 
 ## 测试指南
-- 目前尚未启用 CTest/GTest 测试目标；当前 CI 质量门禁为：clang-format、clang-tidy 和 编译验证。
-- 每次修改后，运行 `clang-format-check` 并至少构建一个相关的构建目标。
-- **clang-tidy 很慢，不要每次修改都跑** [用户要求 2026-09-18]：只在准备提交/推送前跑一次，
-  或用户明确要求时跑；只跑改动涉及的 target，不整仓扫。
+- **主机侧测试在 `host/tests/`（GoogleTest），不要硬件**；本仓库作顶层工程时默认构建（`LIBHCS_BUILD_TESTS`），
+  CI 在「Build host」后跑 `ctest`；被 HCS 引入时由 HCS 把同一批源文件编进 `test_libhcs_*`。被测代码在 `core/`
+  的，主机与固件编的是同一份，测试即固件那一侧的测试：
+  - `wire_protocol_test.cpp`：数据流线格式往返。
+  - `ep0_declaration_test.cpp`：EP0 声明。假板 = 真实的 `core/src/link/`（注册表、EP0 分发、清单事务）+ 内存驱动 +
+    真实板型的口表；末尾钉着线格式版本号（一动就红 = 主机与全部板子要同批重刷）。
+  - `sof_stamp_test.cpp`：`SofStamp` 格式、`core/src/time/` 的 SOF 环、`counter_link`、`usb_sof_bits`。
+  - `sof_timebase_test.cpp`：`core/src/time/sof_timebase.hpp` 三板共用的时间基准（拟合、锚点回绕、状态机、换算）。
+  - `time_affine_test.cpp`：时钟之间的仿射映射（`Affine`、组合与求逆、`AxisMap`/对时上报的两个工厂），只测算术。
+  - `sample_time_test.cpp`：回调交出去的 `SampleTime`（CAN 戳 / 板钟 / 未锁定回退到到达时刻 / UART）与板钟 32 位读数的 64 位展开。
+  - `time_axis_test.cpp`：主机时间轴（每个主机控制器一条的 `UsbFrameAxis`：往返拟合、控制器计数器 -> `CLOCK_MONOTONIC`），只测算术。
+  - `fetchcontent/`：不是 gtest，是 SDK 源码包的外部使用者；CI 用 `.scripts/package_sdk_source` 打包后按 README 的 `FetchContent` 写法编它一次。
+  - `board_ownership_test.cpp`：`core/src/link/ownership.hpp` 归属状态机。
+  - `session_test.cpp`：`core/src/link/session.hpp` 会话握手与租约；`core/src/link/downlink_errors.hpp`
+    链路状态来源（下行流错误）；`core/src/link/port_status.hpp` 端口状态账本。
+- **改了 `core/`、`host/src/time/`、`hcs_config.hpp` 或 `vendor_control.hpp` 必须跑这批测试**；新增协议字段或
+  EP0 语义时在同一次改动里补用例。
+- 运行时的错误与状态一律随 keepalive 应答推送，**不走 EP0**（EP0 只做握手、声明、查清单）：
+  一种记录 `kPortStatus`，正文按口种类定、≤16 字节、变了才发；种类只在 `data::PortStatusVariant` 登记一处，
+  链路本身（下行流错误）也是一个口（[PORT_STATUS.md](core/PORT_STATUS.md)；下行错误的拒收/丢弃纪律见
+  [DOWNLINK_ERRORS.md](core/DOWNLINK_ERRORS.md)）。线格式见 [PROTOCOL.md](core/PROTOCOL.md) 1.3。
+- **固件行为（外设启停、总线应答）只有上板才能验**：用例在 HCS 的 `hcs_core/test/test_bench_boards.cpp`
+  （两块 5321 / 5321 + mc02 / 两块 5321 + mc02 / 5321 + mc02 + c_board，凑不成就自动跳过）。能不碰寄存器判断对错的逻辑优先放进 `core/`。
+- 一次性测量程序不进仓库（`host/examples/` 已删），结论写进对应 L3 文档。
+- CI 门禁：clang-format、主机构建 + `ctest`、各板固件编译、clang-tidy。每次修改后跑 `clang-format-check` 并至少
+  构建一个相关 target。**clang-tidy 很慢**：只在准备提交前、或用户要求时跑，只跑改动涉及的 target。
 
 ## 提交指南
 - Git unstaged changes 是必要的 code review 渠道。Agent 严禁执行 git add。 

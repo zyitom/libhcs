@@ -5,7 +5,7 @@
 #include <main.h>
 #include <stm32f4xx_ll_iwdg.h>
 
-#include "firmware/c_board/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 
 namespace libhcs::firmware::watchdog {
 

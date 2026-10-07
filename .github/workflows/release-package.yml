@@ -22,13 +22,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build SDK package
+      - name: Build SDK source package
         uses: docker/build-push-action@v6
         with:
           context: . # Use workspace context to keep .git
           file: Dockerfile.build_sdk
-          build-args: |
-            WITH_SOURCE=true
           outputs: type=local,dest=build/
           cache-from: type=gha,scope=docker-build-amd64
 
@@ -45,13 +43,6 @@ jobs:
         with:
           name: libhcs-sdk-src
           path: build/libhcs-sdk-src*
-          if-no-files-found: error
-
-      - name: Upload SDK Debian package
-        uses: actions/upload-artifact@v6
-        with:
-          name: libhcs-sdk-deb-amd64
-          path: build/libhcs-sdk*.deb
           if-no-files-found: error
 
       - name: Upload firmware

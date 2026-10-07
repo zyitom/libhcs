@@ -21,7 +21,7 @@ extern "C" void HAL_GPIO_EXTI_Callback(uint16_t gpio_pin) {
             timer::timer->timepoint().time_since_epoch().count();
         spi::bmi088::gyroscope->data_ready_callback(capture_timestamp_quarter_us);
     } else {
-        gpio::gpio->handle_input_edge_interrupt(gpio_pin);
+        gpio::gpio->handle_edge(gpio_pin);
     }
 }
 

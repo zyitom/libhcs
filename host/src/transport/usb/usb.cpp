@@ -529,6 +529,8 @@ public:
 
     std::string_view serial() const noexcept override { return serial_; }
 
+    int usb_bus_number() const noexcept override { return usb_bus_number_; }
+
 private:
     // Bring every outstanding transfer home and let the device go, WITHOUT
     // touching the libusb context or the event thread polling it. That is the
@@ -898,6 +900,7 @@ private:
         }
 
         serial_ = read_serial(libusb_device_handle_);
+        usb_bus_number_ = libusb_get_bus_number(libusb_get_device(libusb_device_handle_));
         // Still single-threaded here: the event thread is started by the
         // constructor only after usb_init() returns.
         logger_.set_source(serial_);
@@ -1799,6 +1802,7 @@ private:
     uint16_t vendor_id_ = 0;
     std::vector<uint16_t> product_ids_;
     std::string serial_;
+    int usb_bus_number_ = -1;
     ConnectionOptions reconnect_options_;
     std::mutex reconnect_mutex_;
     std::atomic<uint64_t> reconnect_failures_ = 0;

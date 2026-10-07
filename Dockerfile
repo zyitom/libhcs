@@ -26,55 +26,6 @@ RUN printf 'int main(void) { return 0; }\n' \
     && test -s /tmp/rv32imac-ilp32-smoke.elf \
     && rm /tmp/rv32imac-ilp32-smoke.elf
 
-FROM ubuntu:24.04 AS wch-toolchain
-
-ARG TARGETARCH
-ARG WCH_TOOLCHAIN_GCC_VERSION=15.2.0
-ARG WCH_TOOLCHAIN_RESOURCE_ID=2030114123741700098
-ARG WCH_TOOLCHAIN_ARCHIVE=MRS_Toolchain_Linux_X64_V240.tar.xz
-ARG WCH_TOOLCHAIN_ARCHIVE_SIZE=411269512
-ARG WCH_TOOLCHAIN_SHA256=1fae593d27e24466f17c2df0fd00f746143f587fe33e912a78e35142fef82a6d
-
-# MounRiver publishes this X64 package through a short-lived signed URL. Pin
-# the immutable resource ID and archive digest, then extract only the GCC15
-# compiler needed by ch32_board; OpenOCD and GUI debuggers stay on the host.
-RUN test "${TARGETARCH}" = "amd64" \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
-    ca-certificates curl jq xz-utils \
-    && apt-get autoremove -y \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/* /tmp/* \
-    && download_url="$(curl -fsSL --retry 5 --retry-all-errors \
-        "https://api.mounriver.com/mountriver/api/version/fetchRecentOpenOcdUrl?resourceId=${WCH_TOOLCHAIN_RESOURCE_ID}" \
-        | jq -er '.result | select(type == "string" and length > 0)')" \
-    && case "${download_url}" in \
-        *"/${WCH_TOOLCHAIN_ARCHIVE}?"*) ;; \
-        *) echo "Unexpected MounRiver download URL" >&2; exit 1 ;; \
-    esac \
-    && curl -fL --retry 5 --retry-all-errors \
-        "${download_url}" -o "/tmp/${WCH_TOOLCHAIN_ARCHIVE}" \
-    && test "$(stat -c '%s' "/tmp/${WCH_TOOLCHAIN_ARCHIVE}")" = \
-        "${WCH_TOOLCHAIN_ARCHIVE_SIZE}" \
-    && echo "${WCH_TOOLCHAIN_SHA256}  /tmp/${WCH_TOOLCHAIN_ARCHIVE}" \
-        | sha256sum -c - \
-    && mkdir -p /opt/wch-gcc15 \
-    && tar -xJf "/tmp/${WCH_TOOLCHAIN_ARCHIVE}" -C /opt/wch-gcc15 \
-        --strip-components=2 "Toolchain/RISC-V Embedded GCC15" \
-    && rm "/tmp/${WCH_TOOLCHAIN_ARCHIVE}" \
-    && test "$(/opt/wch-gcc15/bin/riscv32-wch-elf-gcc -dumpfullversion)" = \
-        "${WCH_TOOLCHAIN_GCC_VERSION}"
-
-# Verify the exact ABI required by the CH32H417 build in a separate layer so a
-# failed smoke test does not discard the downloaded toolchain cache.
-RUN printf 'int main(void) { return 0; }\n' \
-        | /opt/wch-gcc15/bin/riscv32-wch-elf-gcc \
-            -march=rv32imafc_zicsr_zifencei -mabi=ilp32f \
-            -specs=nano.specs -x c - -o /tmp/wch-ilp32f-smoke.elf \
-    && /opt/wch-gcc15/bin/riscv32-wch-elf-readelf \
-        -h /tmp/wch-ilp32f-smoke.elf | grep -q 'single-float ABI' \
-    && rm /tmp/wch-ilp32f-smoke.elf
-
 FROM ubuntu:24.04 AS ci
 
 ARG TARGETARCH
@@ -107,6 +58,7 @@ RUN apt-get update \
     # Host toolchain
     libc6-dev gcc-14 g++-14 \
     pkg-config libusb-1.0-0-dev \
+    libgtest-dev \
     # Firmware dependencies (HPM SDK)
     libmpc3 \
     python3 python3-pip python3-venv \
@@ -129,14 +81,9 @@ RUN apt-get update \
     && ln -sf /usr/bin/gcc-14 /usr/bin/${TARGETARCH_UNAME}-linux-gnu-gcc \
     && ln -sf /usr/bin/g++-14 /usr/bin/${TARGETARCH_UNAME}-linux-gnu-g++
 
-# Keep the HPM and WCH RISC-V toolchains independent. Their compiler prefixes
-# and CMake selection variables are intentionally different.
 COPY --from=hpm-toolchain /opt/riscv32-none-elf /opt/riscv32-none-elf
-COPY --from=wch-toolchain /opt/wch-gcc15 /opt/wch-gcc15
 ENV GNURISCV_TOOLCHAIN_PATH=/opt/riscv32-none-elf
-ENV WCH_TOOLCHAIN_PATH=/opt/wch-gcc15
-ENV WCH_TOOLCHAIN_PREFIX=riscv32-wch-elf-
-ENV PATH="${WCH_TOOLCHAIN_PATH}/bin:${GNURISCV_TOOLCHAIN_PATH}/bin:${PATH}"
+ENV PATH="${GNURISCV_TOOLCHAIN_PATH}/bin:${PATH}"
 
 # Download and install ARM GNU Toolchain
 RUN test "${TARGETARCH}" = "amd64" \

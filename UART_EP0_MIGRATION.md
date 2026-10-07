@@ -2,7 +2,8 @@
 
 > **文档类型**：过程记录
 > **适用范围**：`firmware/*/`（EP0 配置通道）、`host/include/libhcs/board/`、`core/include/libhcs/protocol/vendor_control.hpp`
-> **状态**：现行有效（阶段 0-5、7、8 完成，hpm5321 台架实测通过（3.5）；阶段 6 待 c_board 上板；mc02 / c_board 固件改动只有编译验证）
+> **状态**：现行有效（阶段 0-8 完成，hpm5321 台架实测通过（3.5）；阶段 6 于 2026-10-04 执行，见 4.6；mc02 / c_board 固件改动只有编译验证）
+> **更新 [2026-10-03]**：`ch32_board` 已停止支持并整体移出仓库（代码与文档归档于仓库外）。本文正文按过程记录原样保留，文中 ch32 相关的决策、数据与"必须保留其路径"之类的表述均为当时的历史记录，不再代表仓库现状。
 > **相关文档**：[AGENTS.md](AGENTS.md)（构建/提交纪律）· [firmware/hpm_board/AGENTS.md](firmware/hpm_board/AGENTS.md)（EP0 契约表）· [firmware/mc02/AGENTS.md](firmware/mc02/AGENTS.md)（mc02 EP0 与 UART 时钟）
 
 ## 摘要
@@ -404,7 +405,17 @@ struct UartConfigPayload {
 
 ### 4.6 阶段 6：删除数据流路径（**只能部分删**）
 
-> **状态 [2026-09-30]：未执行。** 前提"c_board 迁移完成"只满足了代码与编译一半，
+> **状态 [2026-10-04]：已执行，全部删除。** 前提变了：ch32_board 已移出仓库，"必须保留
+> `kUart1Config`/`kUart2Config`"不再成立；用户 2026-10-04 先在 `datas.hpp` 删掉了
+> `kCan0Config`..`kUartDbusConfig` 全部 DataId（17-27），随后的 GPIO 口改动（v11，
+> 见 `vendor_control.hpp` 版本历史）把其余代码一并删完：`UartConfigView`、
+> `UartConfigPayload` 位布局、`write_uart_config`、`process_uart_config_field` 与
+> `uart_config_deserialized_callback`（core、主机、三块板）、c_board 的 `Uart::handle_config()`。
+> 15-21 当时成了 GPIO 引脚的 DataId（`kPwm1`..`kPwm7`；v12 起引脚不再是 DataId，排针是一路口 `kGpio = 1`，15 空着）——这是旧值第一次被新身份占用，
+> 靠线格式指纹保证老对端在握手时就被拒，不会把旧配置字段当成引脚记录。c_board 的这一步
+> 仍然只有编译验证。下面是 2026-09-30 的原计划，留作记录。
+>
+> **原状态 [2026-09-30]：未执行。** 前提"c_board 迁移完成"只满足了代码与编译一半，
 > 实测做不了（本机无 c_board 硬件）。与 c_board 无关的几项（`kCanNConfig`、
 > `kUart0/3/7/10Config`）技术上可以先删，但它们与 c_board 那几项共用同一批
 > serializer/deserializer/描述符改动，拆两次做只会把同一片代码翻两遍，故整体等实测后一次做。

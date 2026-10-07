@@ -61,21 +61,11 @@ void MX_USB_OTG_HS_PCD_Init(void)
 void HAL_PCD_MspInit(PCD_HandleTypeDef* pcdHandle)
 {
 
-  RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
   if(pcdHandle->Instance==USB_OTG_HS)
   {
   /* USER CODE BEGIN USB_OTG_HS_PCD_MspInit 0 */
 
   /* USER CODE END USB_OTG_HS_PCD_MspInit 0 */
-
-  /** Initializes the peripherals clock
-  */
-    PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_USB;
-    PeriphClkInitStruct.UsbClockSelection = RCC_USBCLKSOURCE_HSI48;
-    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
-    {
-      Error_Handler();
-    }
 
   /** Enable USB Voltage detector
   */

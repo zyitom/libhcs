@@ -26,17 +26,7 @@ RUN --mount=type=bind,target=/src,source=.,readonly \
             "/output/libhcs-bootloader-${board}.elf"; \
         cp "${build_dir}/app/${board}_app.dfu" \
             "/output/libhcs-firmware-${board}-${libhcs_PROJECT_VERSION}.dfu"; \
-    done; \
-    board=ch32_board; \
-    build_dir="/tmp/build-${board}"; \
-    cmake --preset release -S "firmware/${board}" -B "${build_dir}"; \
-    cmake --build "${build_dir}"; \
-    cp "${build_dir}/${board}_boot.elf" \
-        "/output/libhcs-bootloader-${board}.elf"; \
-    cp "${build_dir}/${board}_app.dfu" \
-        "/output/libhcs-firmware-${board}-${libhcs_PROJECT_VERSION}.dfu"; \
-    cp "${build_dir}/${board}_merged.hex" \
-        "/output/libhcs-firmware-${board}-${libhcs_PROJECT_VERSION}.hex"
+    done;
 
 FROM scratch AS output
 COPY --from=build /output/ /

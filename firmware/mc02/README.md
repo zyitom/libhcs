@@ -61,7 +61,7 @@ Full-Speed，**转发吞吐的杠杆在 CAN 侧（CAN-FD），不在 USB 侧**�
   > 按主机下发的 `is_fdcan` 标志逐帧决定。该位在线协议中已删除，主机不能再逐帧选择帧类型
   > （改为按总线经 EP0 配置）；对端发来的 classic 帧仍照常接收（FD 是超集）。
 - **硬件接收时间戳：已禁用**（代码已注释保留）。FDCAN 内部计数器只有 16 位，1 tick =
-  1 个标称位时间 = 1 us @ 1 Mbit/s，约 65.5 ms 就回绕，无法满足 `CanDataView::timestamp_us`
+  1 个标称位时间 = 1 us @ 1 Mbit/s，约 65.5 ms 就回绕，无法满足当时的 `CanDataView::timestamp_us`（2026-10-03 起线上的 CAN 时间戳是共享微帧轴上的 `sof_stamp`，本板尚无产生它的路径）
   约定的 32 位微秒语义（主机端按 32 位回绕做差分会周期性算出负值）。上行不再携带该字段，
   每帧省 4 字节。若要恢复，需同时放开 `can.hpp` 的
   `HAL_FDCAN_ConfigTimestampCounter/EnableTimestampCounter` 与 `can.cpp` 的赋值，并先把
@@ -128,7 +128,12 @@ Full-Speed，**转发吞吐的杠杆在 CAN 侧（CAN-FD），不在 USB 侧**�
 - FDCAN1/2/3 的 `FrameFormat = FD_BRS`，数据段 5 Mbit/s，标称段 1 Mbit/s。
 - FDCAN **元素数据长度保持 8 字节**——`MessageRAMOffset` 那两个值（`0x200` / `0x400`）
   是按 8 字节元素（16 B，即 4 词）算的；改成 64 字节元素会导致区域重叠。
-- SPI2 波特率 <= 10 MHz（BMI088 的上限）；当前分频系数 32（约 5.7 MHz）。
+- SPI2 波特率 <= 10 MHz（BMI088 的上限）；当前 SPI123 时钟源 PLL2P 120 MHz、分频系数 16（7.5 MHz）。
+- 时钟树：USB、全部串口挂 **PLL3Q 48 MHz**（不是 HSI48 / HSI，2026-10-04 起全部来自晶振）；
+  USART2/USART3 是 **8 倍过采样**（48 MHz 在 16 倍下最高 3 Mbit/s，配不出默认的 4.8 Mbit/s）；
+  SPI6（WS2812 LED）保持 **HSE 24 MHz**、分频 4（6 MHz），它的位时序靠这个速率。
+  `[实测 2026-10-04：冷启动与 DFU 后热启动都枚举；UART1 在 115200 / 921600 / 1M / 2M、8N1 / 8E1 /
+  8E2 / 8O1 下与 5321 双向通；IMU（SPI2 7.5 MHz）用例通过。RS-485 4.8 Mbit/s 与 LED 没有台架验证]`
 
 > 相关约束见[仓库根 AGENTS.md 的 CubeMX BSP 修改纪律](../../AGENTS.md#cubemx-bsp-修改纪律)：
 > 生成目录禁止直接编辑，配置改动一律回到 `.ioc` / CubeMX。

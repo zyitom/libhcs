@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/src/utility/immovable.hpp"
-#include "firmware/hpm_board/app/src/utility/lazy.hpp"
+#include "firmware/common/app/src/utility/lazy.hpp"
 
 namespace libhcs::firmware {
 

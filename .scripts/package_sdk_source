@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Packs the host SDK as the release's libhcs-sdk-src-<version>.zip: what a project pulls with
+# FetchContent (README.md, "在别的工程里用"). The version is baked into the zip's top-level
+# CMakeLists.txt, so building it needs neither git nor tags.
+#
+#   .scripts/package_sdk_source <output dir>      prints the path of the zip it wrote
+#
+# Run from anywhere inside the repository. LIBHCS_VERSION overrides the git-derived version.
+
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+output=${1:?usage: package_sdk_source <output dir>}
+mkdir -p "$output"
+output=$(cd "$output" && pwd)
+
+version=${LIBHCS_VERSION:-$(cd "$root" && .scripts/generate_version)}
+name=libhcs-sdk-src-$version
+staging=$(mktemp -d)
+trap 'rm -rf "$staging"' EXIT
+
+mkdir "$staging/$name"
+cp -r "$root/core" "$root/host" "$root/LICENSE" "$staging/$name/"
+rm -rf "$staging/$name/host/build"
+
+cat > "$staging/$name/CMakeLists.txt" <<CMAKE
+cmake_minimum_required(VERSION 3.24)
+project(libhcs_sdk_source VERSION 3 LANGUAGES C CXX)
+set(libhcs_PROJECT_VERSION "$version")
+add_subdirectory(host)
+CMAKE
+
+rm -f "$output/$name.zip"
+(cd "$staging" && cmake -E tar cf "$output/$name.zip" --format=zip "$name")
+echo "$output/$name.zip"

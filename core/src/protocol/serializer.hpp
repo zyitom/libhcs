@@ -42,7 +42,7 @@ public:
             const std::size_t can_data_length = view.can_data.size();
             const bool has_data = can_data_length != 0;
             const bool is_long_frame = can_data_length > kCanClassicMaxPayload;
-            const bool has_timestamp = view.timestamp_us.has_value();
+            const bool has_timestamp = view.sof_stamp.has_value();
             std::uint8_t data_length_code = 0;
             if (has_data)
                 // Long form stores the wire DLC offset by kCanFdLongDlcBase; the
@@ -76,12 +76,8 @@ public:
             cursor.copy(view.can_data);
 
             if (has_timestamp) {
-                // Explicit little-endian to match every other wire field -- this
-                // used to be a native memcpy, which made it the one field whose
-                // layout depended on the CPU endianness. On a little-endian host
-                // the bitfield store compiles to the same plain store.
-                cursor.emplace<utility::Bitfield<4>>()
-                    .set<layouts::CanTimestampLayout::TimestampUs>(*view.timestamp_us);
+                cursor.emplace<utility::Bitfield<layouts::kCanStampBytes>>()
+                    .set<layouts::CanStampLayout::Ticks>(view.sof_stamp->ticks);
             }
         });
     }
@@ -111,99 +107,53 @@ public:
         });
     }
 
-    // Sparse patch semantics: a view with nothing set writes no bytes at all and
-    // reports success, so callers can pass a partially filled config through
-    // unconditionally.
-    [[nodiscard]] SerializeResult
-        write_uart_config(FieldId field_id, const data::UartConfigView& view) noexcept {
-        if (!view.baudrate.has_value())
-            return SerializeResult::kSuccess;
-
-        return emit(required_uart_config_size(field_id, *view.baudrate), [&](Cursor& cursor) {
-            write_field_header(cursor, field_id);
-            cursor.emplace<UartConfigPayload>().set<UartConfigPayload::Baudrate>(*view.baudrate);
-        });
-    }
-
+    // A level of a line of the GPIO port: a write to an output line (downlink) or
+    // a sample of an input line (uplink, optionally timestamped).
     [[nodiscard]] SerializeResult write_gpio_digital_value(
-        uint8_t channel_index, const data::GpioDigitalDataView& view) noexcept {
-        utility::assert_debug(channel_index < (1U << GpioHeader::ChannelIndex::kBitWidth));
+        std::uint8_t line, const data::GpioDigitalDataView& view) noexcept {
+        libhcs_VERIFY_LIKELY(line < spec::kMaxGpioLines, SerializeResult::kInvalidArgument);
         const auto payload_type = view.high ? GpioHeader::PayloadEnum::kDigitalHigh
                                             : GpioHeader::PayloadEnum::kDigitalLow;
         const bool timestamped = view.timestamp_quarter_us.has_value();
-
-        return emit(
-            required_gpio_size(FieldId::kGpio, payload_type, timestamped), [&](Cursor& cursor) {
-                write_field_header(cursor, FieldId::kGpio);
-
-                auto header = cursor.emplace<GpioHeader>();
-                header.set<GpioHeader::PayloadType>(payload_type);
-                header.set<GpioHeader::ChannelIndex>(channel_index);
-                header.set<GpioHeader::Timestamped>(timestamped);
-
-                if (timestamped) {
-                    cursor.emplace<GpioDigitalReadTimestampPayload>()
-                        .set<GpioDigitalReadTimestampPayload::TimestampQuarterUs>(
-                            *view.timestamp_quarter_us);
-                }
-            });
+        const std::size_t size =
+            sizeof(GpioHeader) + (timestamped ? sizeof(GpioDigitalReadTimestampPayload) : 0U);
+        return emit(size, [&](Cursor& cursor) {
+            write_gpio_header(cursor, line, payload_type, timestamped);
+            if (timestamped) {
+                cursor.emplace<GpioDigitalReadTimestampPayload>()
+                    .set<GpioDigitalReadTimestampPayload::TimestampQuarterUs>(
+                        *view.timestamp_quarter_us);
+            }
+        });
     }
 
-    [[nodiscard]] SerializeResult write_gpio_digital_read_config(
-        uint8_t channel_index, const data::GpioReadConfigView& view) noexcept {
-        utility::assert_debug(channel_index < (1U << GpioHeader::ChannelIndex::kBitWidth));
-        return emit(
-            required_gpio_size(FieldId::kGpio, GpioHeader::PayloadEnum::kDigitalReadConfig),
-            [&](Cursor& cursor) {
-                write_field_header(cursor, FieldId::kGpio);
-
-                auto header = cursor.emplace<GpioHeader>();
-                header.set<GpioHeader::PayloadType>(GpioHeader::PayloadEnum::kDigitalReadConfig);
-                header.set<GpioHeader::ChannelIndex>(channel_index);
-                header.set<GpioHeader::Timestamped>(view.capture_timestamp);
-
-                write_gpio_read_config_payload(cursor, view, view.rising_edge, view.falling_edge);
-            });
+    // A PWM duty for an output line.
+    [[nodiscard]] SerializeResult
+        write_gpio_analog_value(std::uint8_t line, const data::GpioAnalogDataView& view) noexcept {
+        libhcs_VERIFY_LIKELY(line < spec::kMaxGpioLines, SerializeResult::kInvalidArgument);
+        return emit(sizeof(GpioHeader) + sizeof(GpioAnalogPayload), [&](Cursor& cursor) {
+            write_gpio_header(cursor, line, GpioHeader::PayloadEnum::kAnalog, false);
+            cursor.emplace<GpioAnalogPayload>().set<GpioAnalogPayload::Value>(view.value);
+        });
     }
 
-    [[nodiscard]] SerializeResult write_gpio_analog_value(
-        uint8_t channel_index, const data::GpioAnalogDataView& view) noexcept {
-        utility::assert_debug(channel_index < (1U << GpioHeader::ChannelIndex::kBitWidth));
-        return emit(
-            required_gpio_size(FieldId::kGpio, GpioHeader::PayloadEnum::kAnalog),
-            [&](Cursor& cursor) {
-                write_field_header(cursor, FieldId::kGpio);
-
-                auto header = cursor.emplace<GpioHeader>();
-                header.set<GpioHeader::PayloadType>(GpioHeader::PayloadEnum::kAnalog);
-                header.set<GpioHeader::ChannelIndex>(channel_index);
-                header.set<GpioHeader::Timestamped>(false);
-
-                cursor.emplace<GpioAnalogPayload>().set<GpioAnalogPayload::Value>(view.value);
-            });
+    // Asks an input line for one sample, now.
+    [[nodiscard]] SerializeResult write_gpio_read(std::uint8_t line) noexcept {
+        libhcs_VERIFY_LIKELY(line < spec::kMaxGpioLines, SerializeResult::kInvalidArgument);
+        return emit(sizeof(GpioHeader), [&](Cursor& cursor) {
+            write_gpio_header(cursor, line, GpioHeader::PayloadEnum::kRead, false);
+        });
     }
 
-    [[nodiscard]] SerializeResult write_gpio_analog_read_config(
-        uint8_t channel_index, const data::GpioReadConfigView& view) noexcept {
-        utility::assert_debug(channel_index < (1U << GpioHeader::ChannelIndex::kBitWidth));
-        libhcs_VERIFY_LIKELY(
-            !view.falling_edge && !view.rising_edge, SerializeResult::kInvalidArgument);
-        libhcs_VERIFY_LIKELY(!view.capture_timestamp, SerializeResult::kInvalidArgument);
-
-        return emit(
-            required_gpio_size(FieldId::kGpio, GpioHeader::PayloadEnum::kAnalogReadConfig),
-            [&](Cursor& cursor) {
-                write_field_header(cursor, FieldId::kGpio);
-
-                auto header = cursor.emplace<GpioHeader>();
-                header.set<GpioHeader::PayloadType>(GpioHeader::PayloadEnum::kAnalogReadConfig);
-                header.set<GpioHeader::ChannelIndex>(channel_index);
-                header.set<GpioHeader::Timestamped>(false);
-
-                // The analog form has no edge semantics; the guards above make
-                // that an argument error rather than a silently dropped bit.
-                write_gpio_read_config_payload(cursor, view, false, false);
-            });
+    // The tone the buzzer plays from now on (0 Hz or loudness 0 = silence).
+    [[nodiscard]] SerializeResult write_buzzer_tone(const data::BuzzerToneDataView& view) noexcept {
+        return emit(sizeof(BuzzerHeader) + sizeof(BuzzerTonePayload), [&](Cursor& cursor) {
+            write_field_header(cursor, FieldId::kBuzzer);
+            cursor.emplace<BuzzerHeader>().set<BuzzerHeader::Reserved>(0);
+            auto payload = cursor.emplace<BuzzerTonePayload>();
+            payload.set<BuzzerTonePayload::FrequencyHz>(view.frequency_hz);
+            payload.set<BuzzerTonePayload::Loudness>(view.loudness);
+        });
     }
 
     [[nodiscard]] SerializeResult
@@ -264,6 +214,7 @@ public:
 
             auto payload = cursor.emplace<TimeStatusPayload>();
             payload.set<TimeStatusPayload::Microframe>(view.microframe);
+            payload.set<TimeStatusPayload::MicroframeFractionQ16>(view.microframe_fraction_q16);
             payload.set<TimeStatusPayload::TimestampQuarterUs>(view.timestamp_quarter_us);
             payload.set<TimeStatusPayload::TicksPerMicroframeQ16>(view.ticks_per_microframe_q16);
             payload.set<TimeStatusPayload::State>(view.state);
@@ -271,6 +222,8 @@ public:
             payload.set<TimeStatusPayload::ResidualMeanQ16>(view.residual_mean_q16);
             payload.set<TimeStatusPayload::ResidualAbsMaxQ16>(view.residual_abs_max_q16);
             payload.set<TimeStatusPayload::ResidualCount>(view.residual_count);
+            payload.set<TimeStatusPayload::CaptureFreshCount>(view.capture_fresh_count);
+            payload.set<TimeStatusPayload::CaptureStaleCount>(view.capture_stale_count);
         });
     }
 
@@ -293,6 +246,26 @@ public:
             payload.set<PulseReportPayload::TicksPerMicroframeQ16>(view.ticks_per_microframe_q16);
             payload.set<PulseReportPayload::Flags>(view.flags);
         });
+    }
+
+    // One port's runtime status (data::SessionType::kPortStatus), appended
+    // after a keepalive ack. Uplink only. The body layout is
+    // PortStatusRecord<View>'s; this writer only frames it.
+    template <PortStatusKind View>
+    [[nodiscard]] SerializeResult
+        write_port_status(uint32_t nonce, data::DataId port, const View& view) noexcept {
+        using Record = PortStatusRecord<View>;
+        using Body = typename Record::Body;
+        libhcs_VERIFY_LIKELY(View::is_for(port), SerializeResult::kInvalidArgument);
+        return emit(
+            required_session_size() + sizeof(PortStatusHeader) + sizeof(Body), [&](Cursor& cursor) {
+                write_session_header(cursor, data::SessionType::kPortStatus, nonce);
+
+                auto header = cursor.emplace<PortStatusHeader>();
+                header.set<PortStatusHeader::Port>(port);
+                header.set<PortStatusHeader::BodyLength>(static_cast<uint8_t>(sizeof(Body)));
+                Record::encode(cursor.template emplace<Body>(), view);
+            });
     }
 
 private:
@@ -356,21 +329,16 @@ private:
         header.set<SessionHeader::Nonce>(nonce);
     }
 
-    // Digital and analog read configs share this payload; only the edge bits
-    // differ (analog has no edge semantics, so its caller passes false).
-    static void write_gpio_read_config_payload(
-        Cursor& cursor, const data::GpioReadConfigView& view, bool rising_edge,
-        bool falling_edge) noexcept {
-        auto payload = cursor.emplace<GpioReadConfigPayload>();
-        payload.set<GpioReadConfigPayload::Asap>(view.asap);
-        payload.set<GpioReadConfigPayload::RisingEdge>(rising_edge);
-        payload.set<GpioReadConfigPayload::FallingEdge>(falling_edge);
-        payload.set<GpioReadConfigPayload::Pull>(view.pull);
-        payload.set<GpioReadConfigPayload::PeriodMs>(view.period_ms);
+    static void write_gpio_header(
+        Cursor& cursor, std::uint8_t line, GpioHeader::PayloadEnum payload_type,
+        bool timestamped) noexcept {
+        write_field_header(cursor, FieldId::kGpio);
+        auto header = cursor.emplace<GpioHeader>();
+        header.set<GpioHeader::PayloadType>(payload_type);
+        header.set<GpioHeader::Timestamped>(timestamped);
+        header.set<GpioHeader::Line>(line);
     }
 
-    // The three IMU payloads share one skeleton (field header + ImuHeader +
-    // fixed-size payload) and differ only in layout and field names.
     template <ImuHeader::PayloadEnum payload, typename Payload, typename WriteFields>
     SerializeResult write_imu(WriteFields&& write_fields) noexcept {
         return emit(required_imu_size(FieldId::kImu, payload), [&](Cursor& cursor) {
@@ -422,7 +390,8 @@ private:
         const std::size_t field_header_bytes = required_field_header_size(field_id);
         const std::size_t can_header_bytes =
             view.is_extended_can_id ? sizeof(CanHeaderExtended) : sizeof(CanHeaderStandard);
-        const std::size_t timestamp_bytes = view.timestamp_us.has_value() ? sizeof(uint32_t) : 0;
+        const std::size_t timestamp_bytes =
+            view.sof_stamp.has_value() ? layouts::kCanStampBytes : 0;
         const std::size_t total =
             (field_header_bytes + can_header_bytes - 1) + view.can_data.size() + timestamp_bytes;
         utility::assert_debug(total <= kProtocolBufferSize);
@@ -444,56 +413,6 @@ private:
 
         const std::size_t total = (field_header_bytes + uart_header_bytes - 1) + uart_data_length;
         libhcs_VERIFY_LIKELY(total <= kProtocolBufferSize, 0);
-
-        return total;
-    }
-
-    static constexpr bool is_uart_config_field_id(FieldId field_id) {
-        switch (field_id) {
-        case FieldId::kUartDbusConfig:
-        case FieldId::kUart0Config:
-        case FieldId::kUart1Config:
-        case FieldId::kUart2Config:
-        case FieldId::kUart3Config:
-        case FieldId::kUart7Config:
-        case FieldId::kUart10Config: return true;
-        default: return false;
-        }
-    }
-
-    static std::size_t required_uart_config_size(FieldId field_id, uint32_t baudrate) noexcept {
-        libhcs_VERIFY_LIKELY(is_uart_config_field_id(field_id), 0);
-        libhcs_VERIFY_LIKELY(baudrate != 0, 0);
-
-        // The payload's low nibble shares a byte with the field header's id, so
-        // one FieldHeader worth of overlap comes back out of the total.
-        const std::size_t total =
-            required_field_header_size(field_id) + sizeof(UartConfigPayload) - sizeof(FieldHeader);
-        utility::assert_debug(total <= kProtocolBufferSize);
-
-        return total;
-    }
-
-    static std::size_t required_gpio_size(
-        FieldId field_id, GpioHeader::PayloadEnum payload, bool timestamped = false) noexcept {
-        const std::size_t field_header_bytes = required_field_header_size(field_id);
-        const std::size_t gpio_header_bytes = sizeof(GpioHeader);
-        std::size_t payload_bytes = 0;
-        switch (payload) {
-        case GpioHeader::PayloadEnum::kDigitalLow:
-        case GpioHeader::PayloadEnum::kDigitalHigh:
-            payload_bytes = timestamped ? sizeof(GpioDigitalReadTimestampPayload) : 0;
-            break;
-        case GpioHeader::PayloadEnum::kDigitalReadConfig:
-        case GpioHeader::PayloadEnum::kAnalogReadConfig:
-            payload_bytes = sizeof(GpioReadConfigPayload);
-            break;
-        case GpioHeader::PayloadEnum::kAnalog: payload_bytes = sizeof(GpioAnalogPayload); break;
-        default: return 0;
-        }
-
-        const std::size_t total = (field_header_bytes + gpio_header_bytes - 1) + payload_bytes;
-        utility::assert_debug(total <= kProtocolBufferSize);
 
         return total;
     }
