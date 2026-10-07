@@ -2,7 +2,7 @@
 	path = firmware/hpm_board/bsp/hpm_sdk
 	url = https://github.com/zyitom/hpm_sdk.git
 [submodule "firmware/c_board/bsp/tinyusb"]
-	path = firmware/c_board/bsp/tinyusb
+	path = firmware/common/bsp/tinyusb
 	url = https://github.com/zyitom/tinyusb.git
 [submodule "firmware/c_board/bsp/cmsis-device-f4"]
 	path = firmware/c_board/bsp/cmsis-device-f4
@@ -19,6 +19,3 @@
 [submodule "firmware/mc02/bsp/cmsis-device-h7"]
 	path = firmware/mc02/bsp/cmsis-device-h7
 	url = https://github.com/STMicroelectronics/cmsis-device-h7.git
-[submodule "firmware/ch32_board/bsp/ch32h417-evt"]
-	path = firmware/ch32_board/bsp/ch32h417-evt
-	url = https://github.com/zyitom/ch32h417-evt.git
