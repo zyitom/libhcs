@@ -27,9 +27,12 @@ libhcs 是 [无下位机控制系统 HCS](https://github.com/zyitom/libhcs) 的�
 | 找某块板的深入文档 | [各板文档索引](#各板文档索引) |
 | **调低 USB 延迟** | **[HOST_TUNING.md](HOST_TUNING.md)**（主机侧设置，每次重启要重做） |
 
-## libhcs v3
+## libhcs v4（开发中）
 
-libhcs v3 正在开发！目前处于测试阶段，无良好的文档/教程。
+v4 正在把主机侧重写成与 hcs-ecat 同一套使用方式（显式生命周期、拉取式通道、RT 路径
+无异常、运行时按端口名声明），线协议与固件侧不变。老 HCS 冻结在 v3 的 tag 上。当前
+接口形态见 [CHANGELOG.md](CHANGELOG.md) 的 4.0.0 条目与 `host/include/libhcs/board.hpp`
+的用法示例。
 
 ## 性能实测速览
 
@@ -139,6 +142,36 @@ target_link_libraries(my_app PRIVATE libhcs::sdk)
   `FetchContent_MakeAvailable` 之前 `set(LIBHCS_LTO ON)`（HCS 就是这样）。
 - 源码包由 `.scripts/package_sdk_source` 生成，版本号在打包时写进去，不需要 git。CI 每次都打一个包、
   用 [host/tests/fetchcontent/](host/tests/fetchcontent/) 这个外部工程按上面的写法编一遍。
+
+在程序里用（v4 接口；周期方法 `receive()` / `send()` / `stage()` 全部 `noexcept`，控制环里可直调）：
+
+```cpp
+#include <libhcs/board.hpp>
+
+libhcs::Board board{{
+    .board_type = "hpm5321",       // "mc02" / "c_board" / "hpm6e8y"
+    .serial = "A1B2",              // 多块同型板时选一块
+    .time_sync = true,             // CAN 帧带硬件时间戳（换算成 CLOCK_MONOTONIC）
+    .io_thread_cpu = 3,            // IO 线程绑核（尾延迟的最大手段）
+}};
+auto& can1  = board.add_can("CAN1", libhcs::board::hcs::kClassic1M);
+auto& uart0 = board.add_uart("UART0", libhcs::board::hcs::uart_8n1(921600));
+can1.set_safe_frames(zero_current_frames); // 失能帧：Armed/掉线/request_safe 时发
+
+board.start();   // 打开 + 版本核对 + EP0 清单 + 读回核对；失败抛异常并附差异
+board.run();     // Armed -> Running：正常收发
+
+// 控制环，每拍：
+board.receive();                       // 把各通道这一拍的数据取好
+for (const auto& frame : can1.frames()) /* 用帧 */;
+can1.stage(outgoing_frame);            // 暂存，满了返回 false 并计数
+board.send();                          // 提交，IO 线程打成尽量少的 USB 包发出
+
+board.stop();
+```
+
+板子的实际收发与断线行为不需要硬件也能测：`libhcs/testing/fake_transport.hpp` 的
+`FakeTransport` 在内存里演一块板，从 `Board` 的第二个构造参数注入。
 
 ## 固件编译与烧录
 

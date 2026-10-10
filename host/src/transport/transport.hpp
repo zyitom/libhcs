@@ -239,7 +239,7 @@ public:
 
 namespace usb {
 
-using ConnectionOptions = board::AdvancedOptions;
+using ConnectionOptions = ::libhcs::board::AdvancedOptions;
 
 // An empty usb_pids matches any product under this vendor; more than one entry
 // is how a single device that ships under several product IDs is addressed.

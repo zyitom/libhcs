@@ -17,7 +17,6 @@
 #include <utility>
 
 #include <libhcs/data/datas.hpp>
-#include <libhcs/protocol/handler.hpp>
 #include <libhcs/protocol/vendor_control.hpp>
 #include <libhcs/spec/port.hpp>
 
@@ -46,15 +45,15 @@ using spec::channel_name;
 
 // What every helper in this header needs from the thing it talks through: the
 // two EP0 vendor transfers, each answering "did the board ACK". The real one is
-// host::protocol::Handler; naming only this much is what lets the whole
-// declaration below run against a simulated board in host/tests, with no USB.
+// the SDK's link engine (host/src/session/engine.hpp); naming only this much is
+// what lets the whole declaration below run against a simulated board in
+// host/tests, with no USB.
 template <class T>
 concept Ep0Channel = requires(
     T& channel, uint8_t request, uint16_t index, void* in, const void* out, std::size_t size) {
     { channel.vendor_control_in(request, index, in, size) } -> std::convertible_to<bool>;
     { channel.vendor_control_out(request, index, out, size) } -> std::convertible_to<bool>;
 };
-static_assert(Ep0Channel<host::protocol::Handler>);
 
 // The link's state as the transmit path sees it: which ports this host declared
 // (the board runs exactly those, everything else is off), which lines of the

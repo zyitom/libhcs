@@ -1,18 +1,24 @@
-// Links the SDK built from the released source: the board class pulls in the protocol handler
-// and the USB transport (libusb), the logging call a plain exported function. Opening a board
-// needs hardware, so that path is only linked, never run.
+// Links the SDK built from the released source: the Board class pulls in the link
+// engine and the USB transport (libusb), the logging call a plain exported
+// function. Opening a board needs hardware, so that path is only linked, never
+// run.
 #include <cstdio>
 
-#include <libhcs/board/hpm5321.hpp>
+#include <libhcs/board.hpp>
+#include <libhcs/board/hcs_config.hpp>
 #include <libhcs/logging.hpp>
 
 namespace {
 
-class Callback final : public libhcs::board::Hpm5321::Callback {};
-
 [[maybe_unused]] void open_a_board() {
-    Callback callback;
-    const libhcs::board::Hpm5321 board{callback};
+    libhcs::Board board{{.board_type = "hpm5321", .serial = "A1B2"}};
+    auto& can1 = board.add_can("CAN1", libhcs::board::hcs::kClassic1M);
+    (void)can1;
+    board.start();
+    board.run();
+    board.receive();
+    board.send();
+    board.stop();
 }
 
 } // namespace
