@@ -35,7 +35,7 @@
 | 工具 | 本机位置 | 状态 |
 |---|---|---|
 | ARM GCC 15.3.rel1 | `~/3rd_party/arm-gnu-toolchain-15.3.rel1-x86_64-arm-none-eabi`（不在 PATH，要手工加，见下方） | 已装 |
-| RISC-V GCC（HPM）13.2.0 | `~/3rd_party/rv32imac_zicsr_zifencei_multilib_b_ext-linux`（含 `bin/` 的工具链根，`GNURISCV_TOOLCHAIN_PATH` 指向它；注意在 `~/3rd_party/` 顶层，不在 `hpm/` 子目录） | 已装 |
+| RISC-V GCC（HPM）13.2.0 | `~/3rd_party/hpm/rv32imac_zicsr_zifencei_multilib_b_ext-linux`（含 `bin/` 的工具链根，`GNURISCV_TOOLCHAIN_PATH` 指向它） | 已装 |
 | HPM OpenOCD | 未找到（`~/3rd_party/hpm/` 下现只有 `HPMicro_Manufacturing_Tool_v0.6.0`）；如需重装见下方 HPM 一节 | **未装**（hpm 调试统一 J-Link，本仓库流程不使用） |
 | SEGGER | `/opt/SEGGER/JLink`（→ `JLink_V948`）、`/opt/SEGGER/Ozone_V340j` | 已装（J-Link V9.48 / Ozone V3.40j） |
 | LLVM 20 | 仅 `/usr/bin/clangd-20`（未建 `clangd` 软链）；`clang-format-20` / `clang-tidy-20` 未装 | 部分安装。lint 门禁在 Docker/CI 内执行；本机只有 VS Code cpptools 扩展附带的 clang-format 23.1 可做相对检查 |

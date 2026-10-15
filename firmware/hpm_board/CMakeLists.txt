@@ -54,7 +54,16 @@ libhcs_setup_project_context(PROJECT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 
 function(add_hpm_board_subbuild target_name source_subdir)
     set(source_dir "${CMAKE_CURRENT_SOURCE_DIR}/${source_subdir}")
-    set(binary_dir "${CMAKE_CURRENT_BINARY_DIR}/${source_subdir}")
+    # 可选的 BINARY_SUBDIR 关键字: 同一 source 子目录配第二个子构建时
+    # (PCAN 人格)binary 目录不能同名, 否则两份 CMakeCache 互相覆盖。
+    cmake_parse_arguments(ASB "" "BINARY_SUBDIR" "" ${ARGN})
+    if(ASB_BINARY_SUBDIR)
+        set(binary_dir "${CMAKE_CURRENT_BINARY_DIR}/${ASB_BINARY_SUBDIR}")
+        set(configure_extra_args "${ASB_UNPARSED_ARGUMENTS}")
+    else()
+        set(binary_dir "${CMAKE_CURRENT_BINARY_DIR}/${source_subdir}")
+        set(configure_extra_args "${ARGN}")
+    endif()
     set(compile_commands_file "${binary_dir}/compile_commands.json")
 
     set(configure_args
@@ -76,7 +85,7 @@ function(add_hpm_board_subbuild target_name source_subdir)
     if(CMAKE_MAKE_PROGRAM)
         list(APPEND configure_args -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM})
     endif()
-    list(APPEND configure_args ${ARGN})
+    list(APPEND configure_args ${configure_extra_args})
 
     add_custom_target(
         ${target_name}
@@ -97,6 +106,22 @@ add_hpm_board_subbuild(
     -Dlibhcs_APP_WATCHDOG=${libhcs_WATCHDOG}
     -Dlibhcs_APP_ILM_HOT_PATH=${libhcs_ILM_HOT_PATH}
 )
+
+# PCAN 人格镜像(app/src/pcan/, PCAN_PROTOCOL.md): 整板伪装成 PEAK PCAN-USB FD /
+# Pro FD 的独立固件, 给只认 PCAN 适配器的上位机用。默认镜像的行为不受影响
+# (人格代码全在 #if 与独立文件里)。三个 UART0 遥测选项与人格互斥(app/CMakeLists
+# 有 FATAL_ERROR 兜底), 这里直接钳 OFF。
+add_hpm_board_subbuild(
+    hpm_board_app_pcan
+    app
+    BINARY_SUBDIR app_pcan
+    -Dlibhcs_APP_PCAN_PERSONALITY=ON
+    -Dlibhcs_APP_CAN_DIAG=OFF
+    -Dlibhcs_APP_PULSE_TEST=OFF
+    -Dlibhcs_APP_SOF_DIAG=OFF
+    -Dlibhcs_APP_WATCHDOG=${libhcs_WATCHDOG}
+    -Dlibhcs_APP_ILM_HOT_PATH=${libhcs_ILM_HOT_PATH}
+)
 add_hpm_board_subbuild(
     hpm_board_bootloader
     bootloader
@@ -104,14 +129,16 @@ add_hpm_board_subbuild(
 )
 
 set(HPM_BOARD_APP_COMPILE_COMMANDS "${CMAKE_CURRENT_BINARY_DIR}/app/compile_commands.json")
+set(HPM_BOARD_APP_PCAN_COMPILE_COMMANDS "${CMAKE_CURRENT_BINARY_DIR}/app_pcan/compile_commands.json")
 set(HPM_BOARD_BOOTLOADER_COMPILE_COMMANDS "${CMAKE_CURRENT_BINARY_DIR}/bootloader/compile_commands.json")
 set(HPM_BOARD_MERGED_COMPILE_COMMANDS "${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json")
 
 set(HPM_BOARD_COMPILE_COMMANDS_INPUTS
     "${HPM_BOARD_APP_COMPILE_COMMANDS}"
+    "${HPM_BOARD_APP_PCAN_COMPILE_COMMANDS}"
     "${HPM_BOARD_BOOTLOADER_COMPILE_COMMANDS}"
 )
-set(HPM_BOARD_COMPILE_COMMANDS_TARGETS hpm_board_app hpm_board_bootloader)
+set(HPM_BOARD_COMPILE_COMMANDS_TARGETS hpm_board_app hpm_board_app_pcan hpm_board_bootloader)
 
 add_custom_command(
     OUTPUT "${HPM_BOARD_MERGED_COMPILE_COMMANDS}"

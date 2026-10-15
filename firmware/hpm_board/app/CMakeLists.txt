@@ -5,6 +5,17 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 # the target board obvious and the wrong image cannot be flashed by mistake.
 set(APP_NAME "hpm_board_app_${BOARD}")
 
+# PCAN 人格(-Dlibhcs_APP_PCAN_PERSONALITY=ON, 见 app/src/pcan/ 与
+# firmware/hpm_board/PCAN_PROTOCOL.md): 独立镜像, 整板枚举为 PEAK PCAN-USB FD
+# (单 CAN)/PCAN-USB Pro FD(双 CAN)。libhcs / DMTool / CDC / UART 的源被过滤,
+# 产物名带 _pcan 后缀。默认构建(未定义)与开启前完全一致 -- 该保证由"改动前后
+# 默认镜像 .dfu 的 sha256 相同"在评审中核对。
+option(libhcs_APP_PCAN_PERSONALITY
+       "Enumerate the whole board as a PEAK PCAN-USB FD adapter (separate image)" OFF)
+if(libhcs_APP_PCAN_PERSONALITY)
+    set(APP_NAME "hpm_board_app_${BOARD}_pcan")
+endif()
+
 if(NOT libhcs_HPM_BOARD_SUPERBUILDING)
     message(FATAL_ERROR
         "Do not configure firmware/hpm_board/app directly.\n"
@@ -137,6 +148,19 @@ if(libhcs_APP_WATCHDOG)
     sdk_compile_definitions(-Dlibhcs_APP_WATCHDOG=1)
 endif()
 
+# PCAN 人格的编译定义与不兼容项: 三个 UART0 遥测选项都借 UART0(PCAN 人格不编
+# UART 模块)。
+if(libhcs_APP_PCAN_PERSONALITY)
+    foreach(diag_option IN ITEMS CAN_DIAG PULSE_TEST SOF_DIAG)
+        if(libhcs_APP_${diag_option})
+            message(FATAL_ERROR
+                "libhcs_APP_${diag_option} uses the UART0 diag path and cannot be combined "
+                "with libhcs_APP_PCAN_PERSONALITY")
+        endif()
+    endforeach()
+    sdk_compile_definitions(-Dlibhcs_APP_PCAN_PERSONALITY=1)
+endif()
+
 sdk_compile_definitions(-Dlibhcs_PROJECT_VERSION_STRING="${libhcs_PROJECT_VERSION}")
 sdk_compile_definitions(-DCFG_TUSB_MCU=OPT_MCU_HPM)
 sdk_compile_definitions(-DUSB_HOST_MCU_CORE=HPM_CORE0)
@@ -146,11 +170,16 @@ sdk_app_inc("${libhcs_PROJECT_ROOT}/core/include")
 sdk_app_inc("${libhcs_PROJECT_ROOT}")
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/current_tinyusb.cmake")
-libhcs_add_current_tinyusb(
-    src/class/vendor/vendor_device.c
-    src/class/cdc/cdc_device.c
-    src/class/dfu/dfu_rt_device.c
-)
+# PCAN 人格: 只有 DFU runtime(端点全归 pcan 的应用类驱动); 默认构建三类齐上。
+if(libhcs_APP_PCAN_PERSONALITY)
+    set(libhcs_TINYUSB_CLASSES src/class/dfu/dfu_rt_device.c)
+else()
+    set(libhcs_TINYUSB_CLASSES
+        src/class/vendor/vendor_device.c
+        src/class/cdc/cdc_device.c
+        src/class/dfu/dfu_rt_device.c)
+endif()
+libhcs_add_current_tinyusb(${libhcs_TINYUSB_CLASSES})
 
 file(GLOB_RECURSE PROJECT_SOURCE CONFIGURE_DEPENDS
     "${libhcs_PROJECT_ROOT}/core/src/*.cpp"
@@ -158,10 +187,30 @@ file(GLOB_RECURSE PROJECT_SOURCE CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c"
 )
+# 人格的源互斥: pcan 模块(接缝符号 usbd_app_driver_get_cb / 描述符回调 /
+# tud_vendor_control_xfer_cb / hcs_usb0_isr / link::uplink_*)只在人格构建里
+# 编译, 默认人格的接缝文件反之 -- 一个构建只能有一份定义。
+# diag/can_diag.cpp 走 UART0 上行, 人格构建一并排除(latency.hpp 是纯头, 保留)。
+if(libhcs_APP_PCAN_PERSONALITY)
+    list(FILTER PROJECT_SOURCE EXCLUDE REGEX
+        "/src/(dmtool|uart)/|/src/usb/(vendor|vendor_control|usb_descriptors)\\.cpp$|/src/link/uplink_usb\\.cpp$|/src/diag/can_diag\\.cpp$")
+else()
+    list(FILTER PROJECT_SOURCE EXCLUDE REGEX "/src/pcan/")
+endif()
 sdk_app_src(${PROJECT_SOURCE})
 
 
 sdk_linker_global_symbols("_uf2_bl_length=0x20000")
+
+# PCAN 人格不实例化 libhcs 的上行批量缓冲模板, hpm5321 链接脚本里那条按修饰名
+# 点名的 ILM tripwire 在该构建里无符号可查(这版 binutils 对表达式里的未定义
+# 符号直接报错)。把该修饰名 defsym 成 0: 断言平凡通过, 脚本保持两构建共用;
+# 下方 memcpy/mcan 那条 tripwire 对两个人格都照常生效。
+if(libhcs_APP_PCAN_PERSONALITY)
+    sdk_linker_global_symbols(
+        "_ZN6libhcs8firmware3usb19InterruptSafeBufferILj32ENS0_4link17UplinkAllocFailedEE8allocateEj=0"
+    )
+endif()
 
 set_property(TARGET app PROPERTY CXX_STANDARD 23)
 set_property(TARGET app PROPERTY CXX_STANDARD_REQUIRED ON)

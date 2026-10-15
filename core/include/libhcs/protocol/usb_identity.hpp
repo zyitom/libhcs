@@ -31,6 +31,16 @@ inline constexpr uint16_t kDmtoolVendorId = 0x34B7;
 inline constexpr uint16_t kHpm5321SingleCanProductId = 0x6877;
 inline constexpr uint16_t kHpm5321DualCanProductId = 0x6632;
 
+// PEAK-System ids, borrowed by the build-time PCAN personality only
+// (hpm_board -Dlibhcs_APP_PCAN_PERSONALITY=ON, firmware/hpm_board/PCAN_PROTOCOL.md):
+// single-CAN PCB enumerates as PCAN-USB FD (1 channel), dual-CAN as PCAN-USB Pro FD
+// (2 channels). The libhcs host never sees these: it filters by the DM vendor id
+// first (host/src/transport/usb/device_scanner.hpp), then by the product string, and
+// the PCAN image is not a libhcs device at all.
+inline constexpr uint16_t kPcanVendorId = 0x0C72;
+inline constexpr uint16_t kPcanUsbFdProductId = 0x0012;
+inline constexpr uint16_t kPcanUsbProFdProductId = 0x0011;
+
 constexpr bool is_dmtool_identity(uint16_t vendor_id, uint16_t product_id) {
     return vendor_id == kDmtoolVendorId
         && (product_id == kHpm5321SingleCanProductId || product_id == kHpm5321DualCanProductId);

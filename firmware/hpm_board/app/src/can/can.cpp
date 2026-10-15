@@ -7,9 +7,15 @@
 
 #include "core/include/libhcs/protocol/can_dlc.hpp"
 #include "core/src/utility/assert.hpp"
+
+#if defined(libhcs_APP_PCAN_PERSONALITY) && libhcs_APP_PCAN_PERSONALITY
+# include "firmware/hpm_board/app/src/pcan/pcan_adapter.hpp"
+#else
+# include "firmware/hpm_board/app/src/dmtool/dm_adapter.hpp"
+#endif
+
 #include "firmware/hpm_board/app/src/diag/can_diag.hpp"
 #include "firmware/hpm_board/app/src/diag/latency.hpp"
-#include "firmware/hpm_board/app/src/dmtool/dm_adapter.hpp"
 #include "firmware/hpm_board/app/src/sync/sof.hpp"
 #include "firmware/hpm_board/app/src/sync/sof_capture.hpp"
 
@@ -247,13 +253,101 @@ bool Can::handle_uplink(core::protocol::FieldId field_id, core::protocol::Serial
 
 // 不进 .fast: 没有 libhcs 会话时才走到, ILM 留给 libhcs 热路径。
 void Can::drain_without_session() {
+#if defined(libhcs_APP_PCAN_PERSONALITY) && libhcs_APP_PCAN_PERSONALITY
+    if (pcan::rx_enabled(can_index())) {
+        while (handle_pcan_uplink()) {}
+        return;
+    }
+#else
     if (dmtool::capture_enabled(can_index())) {
         while (handle_dm_uplink()) {}
         return;
     }
+#endif
     mcan_rx_message_t rx;
     while (mcan_read_rxfifo(can_base_, 0, &rx) == status_success) {}
 }
+
+#if defined(libhcs_APP_PCAN_PERSONALITY) && libhcs_APP_PCAN_PERSONALITY
+
+// PCAN 人格的 RX 序列化(与 handle_dm_uplink 同款同位, 同样不进 .fast):
+// 归一化线上 DLC, 时间戳存 PTPC 原始 {秒, 纳秒}(64 位除法留给主循环),
+// 交 pcan 的 SPSC 环(软过滤在 push 侧)。
+bool Can::handle_pcan_uplink() {
+    mcan_rx_message_t rx;
+    if (mcan_read_rxfifo(can_base_, 0, &rx) != status_success)
+        return false;
+
+    uint8_t wire_dlc = static_cast<uint8_t>(rx.dlc);
+    if (!rx.canfd_frame && wire_dlc > 8U)
+        wire_dlc = 8U;
+
+    pcan::RxEvent event{
+        .id = rx.use_ext_id ? rx.ext_id : rx.std_id,
+        .dlc = wire_dlc,
+        .extended = rx.use_ext_id != 0,
+        .remote = rx.rtr != 0,
+        .fd = rx.canfd_frame != 0,
+        .bitrate_switch = rx.bitrate_switch != 0,
+        .error_state = rx.error_state_indicator != 0,
+    };
+    if (rx.rtr == 0)
+        std::memcpy(
+            event.data.data(), rx.data_8,
+            std::min<size_t>(core::protocol::payload_length(wire_dlc), event.data.size()));
+
+    mcan_timestamp_value_t ts_value;
+    if (mcan_get_timestamp_from_received_message(can_base_, &rx, &ts_value) == status_success
+        && ts_value.is_64bit) {
+        event.timestamp_sec = static_cast<uint32_t>(ts_value.ts_64bit >> 32);
+        event.timestamp_ns = static_cast<uint32_t>(ts_value.ts_64bit);
+    }
+
+    pcan::push_can_rx(can_index(), event);
+    return true;
+}
+
+// ---- PCAN 人格的总线控制(冷路径) ----
+//
+// 与 suspend()/resume() 的分工见 can.hpp 的块注释。三者都只在主循环
+// (tud_task 里的命令分发)调用。
+
+void Can::set_bus_off() {
+    take_off_bus();
+    (void)transmit_buffer_.clear();
+    // reset 模式的通道不占主循环的看门狗轮询(suspend() 对 suspended_ 的同款
+    // 副作用, 但不置挂起标志 -- reconfigure_timing 必须仍可用)。
+    running_mask_ &= ~(1U << can_index());
+}
+
+void Can::set_bus_on(bool listen_only, bool non_iso) {
+    // mcan_enter_init_mode: 请求 INIT、等待生效、置 CCE -- 已在 init 模式时
+    // 幂等。CCCR 的受保护位(MON/NISO)只在 INIT+CCE 下可写。
+    mcan_enter_init_mode(can_base_);
+    if (listen_only)
+        mcan_enable_bus_monitoring_mode(can_base_);
+    else
+        mcan_disable_bus_monitoring_mode(can_base_);
+    // NISO 只对 FD 帧有意义; 经典模式保持复位值(ISO)。
+    if (canfd_) {
+        if (non_iso)
+            can_base_->CCCR |= MCAN_CCCR_NISO_MASK;
+        else
+            can_base_->CCCR &= ~MCAN_CCCR_NISO_MASK;
+    }
+    mcan_enter_normal_mode(can_base_);
+    enable_interrupts();
+    running_mask_ |= 1U << can_index();
+}
+
+void Can::clear_error_counters() {
+    // M_CAN 的 ECR 只读(HPM 这颗 IP 没有 CCCR.CEC 一类的清零位), 错误计数由
+    // 控制器初始化与 bus-off 恢复序列自行清零。WR_ERR_CNT 到来时紧接着的
+    // 时序重配(reconfigure_timing 的整表 mcan_init)已把计数归零, 这里如实空转。
+    // 内核不核对该命令的结果。
+}
+
+#else  // !libhcs_APP_PCAN_PERSONALITY
 
 bool Can::handle_dm_uplink() {
     mcan_rx_message_t rx;
@@ -294,6 +388,8 @@ bool Can::handle_dm_uplink() {
     dmtool::push_can_rx(can_index(), event);
     return true;
 }
+
+#endif // libhcs_APP_PCAN_PERSONALITY
 
 // DMTool SETUP_BUARD 的运行时重配(声明见 can.hpp)。
 //

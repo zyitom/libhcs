@@ -3,7 +3,7 @@
 > **文档类型**：现行规范（板级）
 > **适用范围**：`firmware/hpm_board/`，HPMicro HPM6E8Y / HPM5321（Andes RISC-V）
 > **状态**：现行有效（2026-10-06 精简：只留命令与约束，实测与来龙去脉在下列 L3 文档）
-> **相关文档**：[仓库根 AGENTS.md](../../AGENTS.md) · [PITFALLS.md](PITFALLS.md) · [USB_OPTIMIZATION_LOG.md](USB_OPTIMIZATION_LOG.md) · [BUILD_ENVIRONMENT.md](BUILD_ENVIRONMENT.md) · [SOF_TIMEBASE.md](SOF_TIMEBASE.md) · [CONTROL_TIMING.md](CONTROL_TIMING.md) · [DMTOOL_PROTOCOL.md](DMTOOL_PROTOCOL.md) · [../../HOST_TUNING.md](../../HOST_TUNING.md)
+> **相关文档**：[仓库根 AGENTS.md](../../AGENTS.md) · [PITFALLS.md](PITFALLS.md) · [USB_OPTIMIZATION_LOG.md](USB_OPTIMIZATION_LOG.md) · [BUILD_ENVIRONMENT.md](BUILD_ENVIRONMENT.md) · [SOF_TIMEBASE.md](SOF_TIMEBASE.md) · [CONTROL_TIMING.md](CONTROL_TIMING.md) · [DMTOOL_PROTOCOL.md](DMTOOL_PROTOCOL.md) · [PCAN_PROTOCOL.md](PCAN_PROTOCOL.md) · [../../HOST_TUNING.md](../../HOST_TUNING.md)
 
 ## 摘要
 
@@ -121,7 +121,22 @@ USB 身份（唯一来源 `core/include/libhcs/protocol/usb_identity.hpp`）：�
   SUBSYSTEM=="tty", ATTRS{idVendor}=="34b7", ENV{ID_MM_DEVICE_IGNORE}="1", MODE="0666"
   ```
 
-## 9. CAN 帧时间戳与共享时间基准（机制与实测见 `SOF_TIMEBASE.md` 第 8 节）
+## 9. PCAN 人格镜像（HPM5321，代码在 `app/src/pcan/`，协议见 `PCAN_PROTOCOL.md`）
+
+- 构建期选定的独立 USB 人格（`-Dlibhcs_APP_PCAN_PERSONALITY=ON`，超建 `hpm_board_app_pcan`
+  目标一并产出 `hpm_board_app_hpm5321_pcan.dfu`）：整板枚举为 PEAK PCAN-USB FD（单 CAN，
+  `0x0C72:0x0012`）/ Pro FD（双 CAN，`0x0011`），给只认 PCAN 适配器的上位机用。协议规范
+  来源是内核 `peak_usb` 驱动（GPL，只读规范、实现自研）。仍是纯转发桥。
+- 该镜像里没有 libhcs 会话 / DMTool / CDC / UART（源在 `app/CMakeLists.txt` 的 glob 过滤里
+  互斥），`uplink` 接缝由 `pcan_control.cpp` 的桩持有；共享文件（can/led/tusb_config/
+  board_app）的改动全在 `#if libhcs_APP_PCAN_PERSONALITY` 下，默认镜像回归判据见
+  `PCAN_PROTOCOL.md` 第 6 节（符号表/map 一致，仅填充字节噪音）。
+- 通道上电停在 reset 模式（真卡语义），NORMAL/LISTEN_ONLY 命令才上线；时序走 DMTool 同一条
+  `reconfigure_timing`（TQ 直写、自动重传开）；CAN 侧冷方法 `set_bus_off/set_bus_on/
+  clear_error_counters` 只在本人格编译。CAN_DIAG/PULSE_TEST/SOF_DIAG 与人格互斥。
+- 烧录/验收/刷回命令与 Windows 待验项见 `PCAN_PROTOCOL.md` 第 7 节。
+
+## 10. CAN 帧时间戳与共享时间基准（机制与实测见 `SOF_TIMEBASE.md` 第 8 节）
 
 - **时间基准是声明，不是编译开关**（v14）：主机 `hcs::Configuration::enable_time_sync()`，本板在
   `board_caps` 报 `kBoardCapTimeSync`。开着时每个收到的 CAN 帧带 3 字节 `SofStamp`；关着时 SOF 中断不开，
@@ -131,12 +146,12 @@ USB 身份（唯一来源 `core/include/libhcs/protocol/usb_identity.hpp`）：�
 - 帧只用它附近的 SOF 锁存值定位，**不要改回长窗口拟合**（游走，8.7.8）；`note_sof()` 的两道归属检查不要删。
 - `stamp_of()` 在 `.fast`，环模板由链接脚本按名收进 ILM；改 `sof_capture_ring.hpp` 后看反汇编，只许 32 位 `divu`。
 
-## 10. 主机侧板类
+## 11. 主机侧板类
 
 `Hpm5321` 同时服务单 CAN 与双 CAN 两块 PCB：spec 口表是镜像容量，实有哪些口读 `kGetPortList`；接线表用了
 板上没有的口在构造时抛；一个设备可有多个 PID（`std::span<const uint16_t>`）。（`PITFALLS.md` 第 7 节）
 
-## 11. 中断与诊断
+## 12. 中断与诊断
 
 - 延迟相关事件全部中断驱动：CAN RX 优先级 3（ISR 内排空 + 序列化）> USB 2 > UART 1；1 kHz tick（MTIP，绕过
   PLIC）只自增计数，LED 等工作在主循环。CAN TX 完成中断不开。（`HOST_TUNING.md` 第 8 节）

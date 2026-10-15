@@ -329,6 +329,24 @@ public:
     // 并切换 FD/经典模式。请求非法或硬件拒绝时端口保持原配置并返回 false。
     bool reconfigure_timing(bool fd, PhaseTiming nominal, PhaseTiming data);
 
+#if defined(libhcs_APP_PCAN_PERSONALITY) && libhcs_APP_PCAN_PERSONALITY
+    // ---- PCAN 人格的总线控制(冷路径, 只在该人格构建里编译/调用) ----
+    //
+    // 仿 PCAN 的通道语义: 控制器平时停在 reset 模式(init 模式, 不上线),
+    // NORMAL/LISTEN_ONLY 命令才上线。与 suspend()/resume() 的差别: 不碰
+    // suspended_ 与 libhcs 设置, reconfigure_timing 因此始终可用(TIMING 命令
+    // 会整表重初始化并把控制器带回总线, PCAN 适配器按通道意图再撤下或摆模式)。
+    //
+    // set_bus_on 在 INIT+CCE 下写 CCCR.MON(listen_only)与 -- FD 模式时 --
+    // CCCR.NISO(non_iso), 再退出 init 模式; 位时序不受影响。已在总线上时同样
+    // 可用(短暂离线一个 CCCR 往返, 与真实固件改 CCCR 的形态一致)。
+    void set_bus_off();
+    void set_bus_on(bool listen_only, bool non_iso);
+
+    // WR_ERR_CNT: CCCR.CEC 清错误计数(同样走 INIT+CCE 往返, 保持原在线状态)。
+    void clear_error_counters();
+#endif
+
     // ---- 清单声明: 主机没声明的总线不上线 ----
     //
     // libhcs 主机的清单声明被完整应用时, 声明的总线以声明的设置上线(apply_setting),
@@ -528,7 +546,11 @@ private:
     // 交给它, 否则丢弃(can.cpp)。与 read_uplink 刻意分开写: 那条是 libhcs 热路径,
     // 不为 DMTool 多带一个分支或参数。
     [[gnu::cold, gnu::noinline]] void drain_without_session();
+#if defined(libhcs_APP_PCAN_PERSONALITY) && libhcs_APP_PCAN_PERSONALITY
+    bool handle_pcan_uplink();
+#else
     bool handle_dm_uplink();
+#endif
 
     // 把 MCAN Last Error Code (仲裁相位或数据相位) 归类为指示 LED 状态 --
     // 即 CAN 控制器电气上真正能支撑的粒度:

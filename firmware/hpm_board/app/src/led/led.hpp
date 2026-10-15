@@ -28,6 +28,19 @@ enum class CanFault : uint8_t {
     kBusOff,      // 控制器 bus-off -- 错误过多, 恢复中/离线
 };
 
+#if defined(libhcs_APP_PCAN_PERSONALITY) && libhcs_APP_PCAN_PERSONALITY
+// PCAN 人格的 LED_SET 覆盖(仅该人格构建): 常亮/熄灭/快闪/慢闪四种强制图案,
+// 优先级最高(主机点名的指示, 压过会话/缓冲灯语); kNone 回到自动灯语。
+// 由主循环(命令分发)写、1 kHz tick 块读。
+enum class ForcedPattern : uint8_t {
+    kNone,
+    kOff,
+    kOn,
+    kBlinkFast, // ~4 Hz
+    kBlinkSlow, // ~1 Hz
+};
+#endif
+
 class Led {
 public:
     using Lazy = utility::Lazy<Led>;
@@ -66,6 +79,23 @@ public:
                 break;
         } while (!downlink_full_reset_counter_.compare_exchange_weak(
             downlink_full, downlink_full - 1, std::memory_order::relaxed));
+
+#if defined(libhcs_APP_PCAN_PERSONALITY) && libhcs_APP_PCAN_PERSONALITY
+        // PCAN LED_SET 的强制图案(主机的点名指示): 点名期间直接短路全部灯语
+        // (含 CAN 故障指示 -- 主机点名优先; 点名只在 ethtool 识别与关闭时出现)。
+        const ForcedPattern forced = forced_pattern_.load(std::memory_order::relaxed);
+        switch (forced) {
+        case ForcedPattern::kOff: led_backend->set_value(0, 0, 0); return;
+        case ForcedPattern::kOn: led_backend->set_value(0, 255, 0); return;
+        case ForcedPattern::kBlinkFast:
+            led_backend->set_value(0, (tick & 128U) ? 255 : 0, 0);
+            return;
+        case ForcedPattern::kBlinkSlow:
+            led_backend->set_value(0, (tick & 512U) ? 255 : 0, 0);
+            return;
+        case ForcedPattern::kNone: break;
+        }
+#endif
 
         // 三通道 GPIO RGB LED(每色只有开/关, 无 PWM 调光)。颜色语言与 c_board
         // 指示灯一致, 两种板读法相同; 黄=红+绿、青=绿+蓝, 三个通道从不同时
@@ -114,7 +144,7 @@ public:
             switch (fault) {
             case CanFault::kNoAck: led_on = (tick % 1000U) < 500U; break;      // 约 1 Hz
             case CanFault::kWiringFault: led_on = (tick % 200U) < 100U; break; // 约 5 Hz
-            case CanFault::kSignalError: {                                     // 两次快闪, 然后停顿
+            case CanFault::kSignalError: { // 两次快闪, 然后停顿
                 const uint32_t phase = tick % 1200U;
                 led_on = phase < 120U || (phase >= 240U && phase < 360U);
                 break;
@@ -133,6 +163,13 @@ public:
     void set_host_connected(bool connected) {
         host_connected_.store(connected, std::memory_order::relaxed);
     }
+
+#if defined(libhcs_APP_PCAN_PERSONALITY) && libhcs_APP_PCAN_PERSONALITY
+    // PCAN LED_SET 的强制图案(kNone 回到自动灯语)。主循环写, 1 kHz tick 块读。
+    void set_forced_pattern(ForcedPattern pattern) {
+        forced_pattern_.store(pattern, std::memory_order::relaxed);
+    }
+#endif
 
     // DMTool 会话的通道选择指示: 通道被选为采集通道时对应指示灯常亮(无故障时)。
     // 由 dmtool 的启停采集命令在主循环调用; 故障灯语优先于常亮(见 update)。
@@ -172,6 +209,9 @@ private:
     std::atomic<uint16_t> uplink_full_reset_counter_{0};
     std::atomic<uint16_t> downlink_full_reset_counter_{0};
     std::atomic<bool> host_connected_{false};
+#if defined(libhcs_APP_PCAN_PERSONALITY) && libhcs_APP_PCAN_PERSONALITY
+    std::atomic<ForcedPattern> forced_pattern_{ForcedPattern::kNone};
+#endif
 };
 
 inline constinit Led::Lazy led;

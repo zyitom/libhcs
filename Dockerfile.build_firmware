@@ -17,6 +17,8 @@ RUN --mount=type=bind,target=/src,source=.,readonly \
             "/output/libhcs-bootloader-${artifact_name}.elf"; \
         cp "${build_dir}/app/output/hpm_board_app_${variant}.dfu" \
             "/output/libhcs-firmware-${artifact_name}-${libhcs_PROJECT_VERSION}.dfu"; \
+        cp "${build_dir}/app_pcan/output/hpm_board_app_${variant}_pcan.dfu" \
+            "/output/libhcs-firmware-${artifact_name}-pcan-${libhcs_PROJECT_VERSION}.dfu"; \
     done; \
     for board in c_board mc02; do \
         build_dir="/tmp/build-${board}"; \

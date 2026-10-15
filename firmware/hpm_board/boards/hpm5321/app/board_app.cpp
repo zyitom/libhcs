@@ -134,7 +134,11 @@ void can0_isr() { can_irq_handler(0); }
 SDK_DECLARE_EXT_ISR_M(IRQn_MCAN3, can1_isr)
 void can1_isr() { can_irq_handler(1); }
 
+// PCAN 人格不编 UART 驱动(app/CMakeLists 的源过滤), UART2 从不上时钟, 向量
+// 保持安装但不可达(与上面的单 CAN 板 MCAN3 同一道理)。
+#if !defined(libhcs_APP_PCAN_PERSONALITY) || !libhcs_APP_PCAN_PERSONALITY
 SDK_DECLARE_EXT_ISR_M(IRQn_UART2, uart0_isr)
 void uart0_isr() { uart_irq_handler(0); }
+#endif
 
 } // namespace libhcs::firmware::board

@@ -24,6 +24,11 @@ set_property(GLOBAL PROPERTY libhcs_DFU_PRODUCT_ID 0xFFFF)
 
 if(libhcs_BUILDING_FIRMWARE_APP)
     sdk_app_inc(app)
-    # The application (App + main) is per board: see app/app.cpp.
-    sdk_app_src(app/board_app.cpp app/app.cpp)
+    # The application (App + main) is per board: see app/app.cpp. The PCAN
+    # personality swaps in its own App (app/app_pcan.cpp, see app/src/pcan/).
+    if(libhcs_APP_PCAN_PERSONALITY)
+        sdk_app_src(app/board_app.cpp app/app_pcan.cpp)
+    else()
+        sdk_app_src(app/board_app.cpp app/app.cpp)
+    endif()
 endif()

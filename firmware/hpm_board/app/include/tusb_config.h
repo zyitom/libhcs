@@ -69,14 +69,27 @@ extern "C" {
 // 挂着传输时才被调度, 见 usb_descriptors.hpp。也刻意不用 TinyUSB 0.21 的
 // interrupt 端点对做数据 -- interrupt 端点每 bInterval 才被轮询一次, 高速下会把
 // 上行量化到 125 us 微帧。
-
-#define CFG_TUD_CDC         1
-#define CFG_TUD_MSC         0
-#define CFG_TUD_HID         0
-#define CFG_TUD_MIDI        0
-#define CFG_TUD_VENDOR      1
-#define CFG_TUD_DFU_RUNTIME 1
-#define CFG_TUD_DFU         0
+//
+// PCAN 人格(-Dlibhcs_APP_PCAN_PERSONALITY=1, 见 app/src/pcan/): 没有 libhcs /
+// DMTool / CDC, uCAN 的五个 bulk 端点由 pcan 的应用类驱动承接; 只留 DFU runtime
+// (刷回默认镜像)。CFG_TUD_VENDOR_EPSIZE 仍作 pcan 端点缓冲的尺寸参数使用。
+#if defined(libhcs_APP_PCAN_PERSONALITY) && libhcs_APP_PCAN_PERSONALITY
+# define CFG_TUD_CDC         0
+# define CFG_TUD_MSC         0
+# define CFG_TUD_HID         0
+# define CFG_TUD_MIDI        0
+# define CFG_TUD_VENDOR      0
+# define CFG_TUD_DFU_RUNTIME 1
+# define CFG_TUD_DFU         0
+#else
+# define CFG_TUD_CDC         1
+# define CFG_TUD_MSC         0
+# define CFG_TUD_HID         0
+# define CFG_TUD_MIDI        0
+# define CFG_TUD_VENDOR      1
+# define CFG_TUD_DFU_RUNTIME 1
+# define CFG_TUD_DFU         0
+#endif
 
 #define CFG_TUD_VENDOR_EPSIZE 512
 
