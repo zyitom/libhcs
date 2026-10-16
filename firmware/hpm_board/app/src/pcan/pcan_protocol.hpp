@@ -62,6 +62,7 @@ inline constexpr uint8_t kEpCmdIn = 0x81;    // bulk IN: 命令应答(Linux 不�
 inline constexpr uint8_t kEpDataOut0 = 0x02; // bulk OUT: CAN0 发送
 inline constexpr uint8_t kEpDataOut1 = 0x03; // bulk OUT: CAN1 发送(双通道板)
 inline constexpr uint8_t kEpDataIn = 0x82;   // bulk IN: 共享 RX 记录流
+inline constexpr uint8_t kEpUnusedIn = 0x83; // Pro FD 保留的第三个 IN 管道, 不传数据
 
 // ---- 本板报告的设备事实 ----
 

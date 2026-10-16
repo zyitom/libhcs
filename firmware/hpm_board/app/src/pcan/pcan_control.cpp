@@ -117,8 +117,8 @@ SDK_DECLARE_EXT_ISR_M(IRQn_USB0, hcs_usb0_isr)
 void hcs_usb0_isr(void) { dcd_int_handler(0); }
 
 // PCAN 的 EP0 vendor 请求(内核 pcan_usb_pro_send_req): bmRequestType =
-// vendor|recipient-OTHER, wIndex 恒 0。别的 vendor 请求一律 STALL。wLength 精确
-// 匹配而非截断 -- 要求不同尺寸的主机说的是本协议的另一个版本。
+// vendor|recipient-OTHER, wIndex 恒 0。别的 vendor 请求一律 STALL。信息读取
+// 允许主机先读结构头或提供更大的缓冲; tud_control_xfer 按 wLength 截断。
 bool tud_vendor_control_xfer_cb(
     uint8_t rhport, uint8_t stage, const tusb_control_request_t* request) {
     if (request->bmRequestType_bit.type != TUSB_REQ_TYPE_VENDOR)
@@ -126,22 +126,25 @@ bool tud_vendor_control_xfer_cb(
 
     if (request->bRequest == pp::kReqFct) {
         // DRVLD: OUT 数据段带上"驱动已加载"标志, 到达后再改状态。
-        if (request->wValue != pp::kFctDrvld || request->wLength != pp::kDrvldLength)
+        if (request->bmRequestType_bit.direction != TUSB_DIR_OUT || request->wValue != pp::kFctDrvld
+            || request->wLength < 2 || request->wLength > sizeof(g_drvld_buffer))
             return false;
-        if (stage == CONTROL_STAGE_SETUP)
-            return tud_control_xfer(rhport, request, g_drvld_buffer, pp::kDrvldLength);
+        if (stage == CONTROL_STAGE_SETUP) {
+            std::memset(g_drvld_buffer, 0, sizeof(g_drvld_buffer));
+            return tud_control_xfer(rhport, request, g_drvld_buffer, request->wLength);
+        }
         if (stage == CONTROL_STAGE_DATA)
             libhcs::firmware::pcan::set_driver_loaded(g_drvld_buffer[1] != 0U);
         return true;
     }
 
-    if (request->bRequest != pp::kReqInfo || stage != CONTROL_STAGE_SETUP)
+    if (request->bRequest != pp::kReqInfo || request->bmRequestType_bit.direction != TUSB_DIR_IN)
+        return false;
+    if (stage != CONTROL_STAGE_SETUP)
         return true; // DATA/ACK 阶段无事可做
 
     switch (request->wValue) {
     case pp::kInfoFw: {
-        if (request->wLength != pp::FwInfo::kSize)
-            return false;
         const pp::FwInfo info{
             .device_ids =
                 {libhcs::firmware::pcan::device_id(0), libhcs::firmware::pcan::device_id(1)},
@@ -154,8 +157,6 @@ bool tud_vendor_control_xfer_cb(
             rhport, request, g_reply_buffer.data(), static_cast<uint16_t>(encoded.size()));
     }
     case pp::kInfoBl: {
-        if (request->wLength != pp::BlInfo::kSize)
-            return false;
         const pp::BlInfo info{
             .serial_number = libhcs::firmware::pcan::serial_number(),
         };

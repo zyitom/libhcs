@@ -159,8 +159,9 @@ public:
             return;
         }
         if (endpoint_address == protocol::kEpCmdOut) {
-            on_command_packet(std::span{g_endpoint_buffers.cmd_out}.first(
-                std::min<std::size_t>(size, CFG_TUD_VENDOR_EPSIZE)));
+            on_command_packet(
+                std::span{g_endpoint_buffers.cmd_out}.first(
+                    std::min<std::size_t>(size, CFG_TUD_VENDOR_EPSIZE)));
         } else if (endpoint_address == protocol::kEpDataOut0) {
             on_tx_packet(
                 0, std::span{g_endpoint_buffers.data_out0}.first(
@@ -300,8 +301,8 @@ public:
 
 private:
     enum class ChannelMode : uint8_t {
-        kReset,  // RESET_MODE: 控制器在 init 模式, 不上线(上电默认, 与真卡一致)
-        kNormal, // NORMAL_MODE
+        kReset,     // RESET_MODE: 控制器在 init 模式, 不上线(上电默认, 与真卡一致)
+        kNormal,    // NORMAL_MODE
         kListenOnly // LISTEN_ONLY_MODE(MCAN CCCR.MON, 不应答)
     };
 
@@ -732,7 +733,7 @@ void with_adapter(F&& f) {
 
 // ---- TinyUSB 应用类驱动 ----
 //
-// 承接接口 0 的五个 bulk 端点。回调全部从 tud_task() 在主循环运行(xfer_isr 为
+// 承接接口 0 的 bulk 端点(双 CAN 含保留的 0x83)。回调全部从 tud_task() 在主循环运行(xfer_isr 为
 // 空), CAN ISR 因此只与 pcan_adapter.hpp 的闸和队列打交道。
 
 void driver_init() { adapter.init(); }

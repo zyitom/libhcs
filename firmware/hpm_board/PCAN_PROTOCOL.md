@@ -2,7 +2,7 @@
 
 > **文档类型**：硬件参考
 > **适用范围**：`firmware/hpm_board/app/src/pcan/`（`-Dlibhcs_APP_PCAN_PERSONALITY=ON` 的独立镜像）
-> **状态**：现行有效（2026-10-15 首版并完成 Linux 实测：双 CAN 板识别为 PCAN-USB Pro FD，经典 + FD 长帧双向回环通；Windows 侧待实测）
+> **状态**：现行有效（Linux 双路收发与启停已实测；兼容修正后用户反馈 Win11 / PCAN 驱动 5.1.3 可用）
 > **相关文档**：[AGENTS.md](AGENTS.md) · [DMTOOL_PROTOCOL.md](DMTOOL_PROTOCOL.md)（同一模式的先例） · [SOF_TIMEBASE.md](SOF_TIMEBASE.md)（本镜像不用的共享时间基）
 
 ## 摘要
@@ -43,10 +43,17 @@ DMTOOL_PROTOCOL.md 对 DMTool 逆向的处理相同。
 | `0x02` | OUT | CAN0 发送（`pucan_tx_msg` 记录流） |
 | `0x03` | OUT | CAN1 发送（仅双 CAN 板描述符里存在） |
 | `0x82` | IN | 共享 RX 记录流（CAN/校准/错误/状态/溢出） |
+| `0x83` | IN | Pro FD 保留管道（仅双 CAN 板描述符里存在，不传数据） |
+
+双 CAN 接口保留六个 bulk 端点，按 `0x81/0x01/0x82/0x02/0x83/0x03` 排列；
+`0x83` 对应内核协议常量 `PCAN_USBPRO_EP_UNUSED`。首版只声明五个端点，Linux 能枚举
+不能证明 Windows 驱动接受该布局。[内核协议；Windows 影响待抓包确认]
 
 - 接口 1：DFU runtime（与默认镜像同一份 `TUD_DFU_RT_DESCRIPTOR`），刷回默认镜像的
-  通道。内核 `pcan_usb_fd_probe` 只绑接口 0，DFU 接口在 Linux 上保持未认领，dfu-util
-  经 libusb 可直接用。[内核驱动行为]
+  通道。单 CAN 的 `pcan_usb_fd_probe` 按接口号筛选；Pro FD 使用
+  `pcan_usb_pro_probe`，它按端点地址筛选，零端点 DFU 接口也会通过，因而双 CAN 板可能
+  被重复注册成四路 SocketCAN（接口 1 的两路不是额外物理口）。重刷前需释放驱动，见
+  第 7.1 节。[内核驱动；2026-10-15 本机枚举实测]
 - 高速 bulk 512（FS 64 变体保留；内核 FS 下自行按 64 字节分片命令——`pcan_usb_fd_send_cmd`）。
 - 字符串：iManufacturer "PEAK-System"、iProduct 按型号、iSerialNumber 是 fw_info
   `ser_no` 的十进制串（OTP UUID 折叠派生，两处同源）。
@@ -54,13 +61,15 @@ DMTOOL_PROTOCOL.md 对 DMTool 逆向的处理相同。
 ## 2. EP0 vendor 请求
 
 bmRequestType = vendor | recipient **OTHER**（内核 `pcan_usb_pro_send_req`），wIndex 恒
-0；`pcan_control.cpp` 应答，别的 vendor 请求一律 STALL。wLength 精确匹配，不截断。
+0；`pcan_control.cpp` 应答，别的 vendor 请求一律 STALL。信息读取允许先读结构头、
+读完整结构或提供更大的缓冲，实际 IN 长度为 `min(wLength, 结构长度)`；不能因为主机
+请求的长度不是 36 / 28 就 STALL。DRVLD 仅接受 OUT，信息读取仅接受 IN。
 
 | bRequest | wValue | 方向 | 长度 | 板端应答 |
 |---|---|---|---|---|
-| 0 REQ_INFO | 1 INFO_FW | IN | 36 | `fw_info`：size_of=36、type=2（EXT）、hw_type=1、bl 1.0.0、hw_version=1、**fw 2.0.0**（内核按 fw≥2 启用 ISO/non-ISO 切换，板端用 CCCR.NISO 真实实现）、dev_id[2]（DEVID_SET 只改 RAM）、ser_no、flags=0、端点表（同上节） |
-| 0 REQ_INFO | 0 INFO_BL | IN | 28 | `blinfo`（Linux FD 路径不读，按 Pro 系形状填） |
-| 2 REQ_FCT | 5 DRVLD | OUT | 16 | 主机写 `[0]=0,[1]=1/0`；板端记录"驱动已加载"，只影响 LED 判据 |
+| 0 REQ_INFO | 1 INFO_FW | IN | 最多 36 | `fw_info`：size_of=36、type=2（EXT）、hw_type=1、bl 0.1.0、hw_version=1、**fw 3.5.4**（内核按 fw≥2 启用 ISO/non-ISO 切换，板端用 CCCR.NISO 真实实现）、dev_id[2]（DEVID_SET 只改 RAM）、ser_no、flags=0、端点表（同上节） |
+| 0 REQ_INFO | 0 INFO_BL | IN | 最多 28 | `blinfo`（Linux FD 路径不读，按 Pro 系形状填） |
+| 2 REQ_FCT | 5 DRVLD | OUT | 2–16 | 主机写 `[0]=0,[1]=1/0`（Linux 用 16 字节）；板端记录"驱动已加载"，只影响 LED 判据 |
 
 ## 3. uCAN 命令流（bulk OUT 0x01）
 
@@ -211,9 +220,36 @@ DFU runtime 接口随人格保留：`dfu-util -d 0x0c72:0x0012 -a 0 -D
 .../hpm_board_app_hpm5321.dfu`（detach 后设备以 bootloader `0xA511:0x5321` 继续下载）。
 兜底：PA07 拉住地强制驻留 bootloader（见 AGENTS.md 第 2 节），再 `dfu-util -d 0xa511:*`。
 
-### 7.3 Windows（待实测）
+### 7.3 Windows 兼容验证
+
+2026-10-15，用户反馈 Win11、PCAN 驱动 5.1.3，CAN 接口硬件 ID 为
+`USB\VID_0C72&PID_0011&REV_0354&MI_00`，启动失败 Code 10。这说明报错来自接口 0，
+单凭硬件 ID 不能判定是描述符校验还是初始化请求失败。当前修正包括补齐保留端点、
+放宽 EP0 信息读取长度、接受两字节 DRVLD，并修复未知请求未 STALL 的分支。
+修正版经 DFU 刷入后，用户反馈 Windows PCAN 已可使用，随后反馈功能正常、此前的
+单路疑问与关闭后闪灯现象暂时无法复现。这是用户现场反馈，尚无 Windows USBPcap
+抓包，不能据此认定上述哪一项修正解决了 Code 10。[用户反馈 2026-10-15]
 
 装 PEAK 驱动包（PCAN-Basic / Device Driver）后用 PCAN-View 冒烟，再上电机调试工具。
 已知待验项：驱动对字符串/hw_type 的核验、TX 是否需要 SELF_RECEIVE 回显（§5）。
 若拒认，调整集中在 `pcan_protocol.hpp` 的 `kHwType/kFwVersion` 与
 `pcan_descriptors.cpp` 的字符串常量。
+
+### 7.4 双路与关停回归（2026-10-15）
+
+双 CAN 板两口 H/H、L/L 互接回环，Linux `peak_usb` 下使用接口 0 的 `can0/can1`；
+接口 1 产生的重复 `can2/can3` 保持 DOWN。测试程序使用 Python 原生 SocketCAN，
+不写入仓库。[实测]
+
+| 检查 | 结果 |
+|---|---|
+| 经典 CAN，1 Mbit/s，两路同时互发 | 每方向 1000 帧，8 字节负载，序号和内容逐帧一致 |
+| CAN FD，仲裁 1 Mbit/s、数据 5 Mbit/s、BRS，两路同时互发 | 每方向 1000 帧，64 字节负载，序号和内容逐帧一致 |
+| 交替单独关闭、重新打开一路 | 经典 / FD 各 10 轮；关闭一口时另一口保持 UP；每轮恢复后每方向 10 帧校验通过 |
+| 关停一口、从另一口提交一帧，再关闭剩余口 | 静置 6 秒后两口保持 STOPPED；重新开启后每方向 100 帧校验通过 |
+| 真实 EP0 读取与拒绝恢复 | INFO_FW / INFO_BL 请求 4 / 28 / 36 / 64 / 1024 字节，返回长度均为结构与请求长度较小值；未知请求 STALL 后正常读取可恢复 |
+| 关闭后的两颗 CAN 灯 | 测试结束两口 DOWN，静置超过 6 秒，用户确认均已熄灭，未复现持续闪烁 |
+
+前述数据与启停检查是 Linux 上板结果，灯光是用户现场观察；不替代 Windows 应用关闭
+时的 USB 命令序列验证。无应答场景的主机错误计数仍显示 0，未取得物理发送或板端错误
+记录，故不把它计作故障上报验证通过。测试结束全部 SocketCAN 接口均为 DOWN。[实测边界]
