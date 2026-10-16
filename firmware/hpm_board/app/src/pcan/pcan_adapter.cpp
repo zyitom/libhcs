@@ -22,6 +22,9 @@
 #include "firmware/common/app/src/utility/ring_buffer.hpp"
 #include "firmware/hpm_board/app/src/can/can.hpp"
 #include "firmware/hpm_board/app/src/led/led.hpp"
+#include "firmware/hpm_board/app/src/pcan/pcan_bus.hpp"
+#include "firmware/hpm_board/app/src/pcan/pcan_device_check.hpp"
+#include "firmware/hpm_board/app/src/pcan/pcan_tx.hpp"
 
 // PCAN-USB FD 仿真的实现: USB 应用类驱动、uCAN 命令分发、CAN 收发与记录流。
 // 协议格式见 pcan_protocol.hpp, 与默认人格(DMTool + libhcs)的关系见 pcan_adapter.hpp。
@@ -64,6 +67,17 @@ uint64_t now_timestamp_us() {
     }
 }
 
+// Windows 的时间映射会用校准记录的 USB 毫秒帧号对齐主机读数, 不能填 0。
+// FRINDEX 两种速度下都以微帧计数; 不开 SOF 中断, 在同一个毫秒帧内采样板钟。
+protocol::CalibrationRecord calibration_sample() {
+    while (true) {
+        const uint16_t frame = static_cast<uint16_t>(HPM_USB0->FRINDEX >> 3) & 0x7FFU;
+        const uint64_t timestamp = now_timestamp_us();
+        if (frame == ((HPM_USB0->FRINDEX >> 3) & 0x7FFU))
+            return {.timestamp_us = timestamp, .usb_frame_index = frame};
+    }
+}
+
 // PCAN 通道即本板 CAN 序号; 单 CAN 板上通道 1 不存在(命令作废, 帧丢弃)。
 can::Can* channel_can(uint8_t channel) {
     if (channel >= kChannelCount || channel >= can::can_count())
@@ -95,6 +109,7 @@ std::array<uint32_t, kChannelCount>& device_ids() {
 
 struct EndpointBuffers {
     TUD_EPBUF_DEF(cmd_out, CFG_TUD_VENDOR_EPSIZE);
+    TUD_EPBUF_DEF(cmd_in, CFG_TUD_VENDOR_EPSIZE);
     TUD_EPBUF_DEF(data_out0, CFG_TUD_VENDOR_EPSIZE);
     TUD_EPBUF_DEF(data_out1, CFG_TUD_VENDOR_EPSIZE);
     TUD_EPBUF_DEF(data_in, CFG_TUD_VENDOR_EPSIZE);
@@ -133,12 +148,14 @@ public:
                 const auto packet_size = tu_edpt_packet_size(endpoint);
                 if (address == protocol::kEpCmdOut) {
                     cmd_out_ = packet_size;
+                } else if (address == protocol::kEpCmdIn) {
+                    cmd_in_ = packet_size;
                 } else if (address == protocol::kEpDataIn) {
                     data_in_ = packet_size;
                 } else if (address == protocol::kEpDataOut0 || address == protocol::kEpDataOut1) {
                     data_out_[address == protocol::kEpDataOut0 ? 0 : 1] = packet_size;
                 }
-                // kEpCmdIn(0x81): Linux 不读, 不挂接收; 应答一律走 data IN。
+                // 命令应答与 CAN 记录使用独立 IN 管道。
             }
             descriptor = tu_desc_next(descriptor);
         }
@@ -152,8 +169,14 @@ public:
     }
 
     void on_transfer(uint8_t endpoint_address, xfer_result_t result, uint32_t size) {
-        if (tu_edpt_dir(endpoint_address) == TUSB_DIR_IN)
-            return; // data IN 空出: 下一轮 poll() 自会续上
+        if (tu_edpt_dir(endpoint_address) == TUSB_DIR_IN) {
+            if (endpoint_address == protocol::kEpDataIn && result == XFER_RESULT_SUCCESS)
+                in_staged_size_ = 0;
+            if (endpoint_address == protocol::kEpCmdIn && result == XFER_RESULT_SUCCESS)
+                device_check_.completed();
+            publish();
+            return; // 失败时保留整条短包, 下一轮重试。
+        }
         if (result != XFER_RESULT_SUCCESS) {
             arm_out(endpoint_address);
             return;
@@ -166,10 +189,12 @@ public:
             on_tx_packet(
                 0, std::span{g_endpoint_buffers.data_out0}.first(
                        std::min<std::size_t>(size, CFG_TUD_VENDOR_EPSIZE)));
+            return; // 数据端点由 drain_tx_packet 在整包收下后重挂。
         } else if (endpoint_address == protocol::kEpDataOut1) {
             on_tx_packet(
                 1, std::span{g_endpoint_buffers.data_out1}.first(
                        std::min<std::size_t>(size, CFG_TUD_VENDOR_EPSIZE)));
+            return;
         }
         arm_out(endpoint_address);
     }
@@ -177,6 +202,7 @@ public:
     void on_usb_reset() {
         opened_ = false;
         cmd_out_ = 0;
+        cmd_in_ = 0;
         data_in_ = 0;
         data_out_ = {};
         reset();
@@ -207,21 +233,41 @@ public:
         }
     }
 
+    void push_tx_complete(std::size_t can_index, const TxComplete& event) {
+        if (can_index < tx_completions_.size() && !tx_completions_[can_index].push_back(event))
+            overruns_[can_index].fetch_add(1, std::memory_order::relaxed);
+    }
+
     // ---- 主循环 ----
 
     void poll() {
+        if (opened_ && cmd_in_ != 0 && device_check_.pending()
+            && !usbd_edpt_busy(rhport_, protocol::kEpCmdIn)
+            && usbd_edpt_claim(rhport_, protocol::kEpCmdIn)) {
+            const auto& reply = device_check_.reply();
+            std::copy(reply.begin(), reply.end(), g_endpoint_buffers.cmd_in);
+            if (!usbd_edpt_xfer(
+                    rhport_, protocol::kEpCmdIn, g_endpoint_buffers.cmd_in,
+                    static_cast<uint16_t>(reply.size()), false))
+                (void)usbd_edpt_release(rhport_, protocol::kEpCmdIn);
+        }
+        for (std::size_t channel = 0; channel < pending_tx_.size(); ++channel) {
+            if (!pending_tx_[channel].empty())
+                drain_tx_packet(channel);
+        }
         if (!opened_ || !in_ready())
             return;
 
-        const auto out = std::span{g_endpoint_buffers.data_in}.first(data_in_ - 1U);
-        std::size_t used = 0;
-
-        used = emit_periodic(out, used);
-        used = emit_rx_frames(out, used);
-        used = emit_overruns(out, used);
-
-        if (used != 0)
-            send_in(used);
+        if (in_staged_size_ == 0) {
+            const auto out = std::span{g_endpoint_buffers.data_in}.first(data_in_ - 1U);
+            std::size_t used = emit_periodic(out, 0);
+            used = emit_tx_echoes(out, used);
+            used = emit_rx_frames(out, used);
+            in_staged_size_ = emit_overruns(out, used);
+            publish();
+        }
+        if (in_staged_size_ != 0)
+            send_in(in_staged_size_);
     }
 
     // 1 kHz tick 块(pcan::poll_tick): 周期记录的排期与状态变化检测。
@@ -233,8 +279,10 @@ public:
 
         bool pending = false;
         if (options_calibration_) {
-            calibration_due_ = internal::g_rx_mask.load(std::memory_order::relaxed) != 0;
-            pending |= calibration_due_;
+            // Windows drops CAN records until the first calibration completes.
+            // The USB clock must run even while every CAN channel is in reset.
+            calibration_due_ = true;
+            pending = true;
         }
 
         // ERROR 选项开着的通道: 错计数变化发 ERROR 记录(内核的 get_berr_counter
@@ -253,11 +301,10 @@ public:
                 channel.error_pending = true;
                 pending = true;
             }
-            const uint8_t bits =
-                status.flags & (data::kCanErrorPassive | data::kCanWarning | data::kCanBusOff);
-            if (!channel.status_valid || bits != channel.status_bits) {
+            const uint8_t bits = channel.status_bits(status.flags);
+            if (!channel.status_valid || bits != channel.reported_status_bits) {
                 channel.status_valid = true;
-                channel.status_bits = bits;
+                channel.reported_status_bits = bits;
                 channel.status_pending = true;
                 pending = true;
             }
@@ -269,24 +316,33 @@ public:
     // 总线复位: 回到"未会话"。协议状态全清; 控制器电气状态不动 -- 真实适配器在
     // 主机意外拔出后同样保持原样, 新主机的 ifup 序列会整体重配。
     void reset() {
+        internal::g_rx_mask.store(0, std::memory_order::release);
         for (auto& channel : channels_) {
             channel.mode = ChannelMode::kReset;
             channel.timing_known = false;
             channel.data_known = false;
             channel.fd = false;
             channel.non_iso = false;
+            channel.configuration_failed = false;
             channel.error_option = false;
             channel.error_pending = false;
             channel.status_pending = false;
             channel.barrier_pending = false;
             channel.status_valid = false;
-            channel.status_bits = 0;
+            channel.reported_status_bits = 0;
             channel.tec = 0;
             channel.rec = 0;
             channel.filter.fill(0xFFFFFFFFU);
         }
         options_calibration_ = false;
         calibration_due_ = false;
+        in_staged_size_ = 0;
+        device_check_.reset();
+        pending_tx_ = {};
+        for (auto& echoes : tx_echoes_)
+            echoes.clear();
+        for (auto& queue : tx_completions_)
+            (void)queue.clear();
         for (auto& queue : rx_queues_)
             (void)queue.clear();
         for (auto& overrun : overruns_)
@@ -300,28 +356,14 @@ public:
     }
 
 private:
-    enum class ChannelMode : uint8_t {
-        kReset,     // RESET_MODE: 控制器在 init 模式, 不上线(上电默认, 与真卡一致)
-        kNormal,    // NORMAL_MODE
-        kListenOnly // LISTEN_ONLY_MODE(MCAN CCCR.MON, 不应答)
-    };
-
-    struct Channel {
-        ChannelMode mode = ChannelMode::kReset;
-        bool timing_known = false; // 收到过 TIMING_SLOW
-        bool data_known = false;   // 收到过 TIMING_FAST(FD; 否则按经典模式配置)
-        bool fd = false;           // 最近一次应用的总线帧型(data_known 的快照)
-        bool non_iso = false;      // CANDFDISO 选项被清(= non-ISO)
+    struct Channel : BusState<can::Can::PhaseTiming> {
         bool error_option = false; // uCAN ERROR 选项
-        // TIMING 命令存这里, NORMAL/LISTEN 上线时应用; 数据段字段仅在 fd 时使用。
-        can::Can::PhaseTiming nominal{};
-        can::Can::PhaseTiming data{};
         // 周期检测的缓存(read_status 的快照)。
         bool error_pending = false;
         bool status_pending = false;
         bool barrier_pending = false;
         bool status_valid = false;
-        uint8_t status_bits = 0;
+        uint8_t reported_status_bits = 0;
         uint8_t tec = 0;
         uint8_t rec = 0;
         // 标准 ID 接收位图(internal::g_filter 的主循环侧真值; 拷贝一份在 Adapter
@@ -358,14 +400,19 @@ private:
     void send_in(std::size_t size) {
         if (!usbd_edpt_claim(rhport_, protocol::kEpDataIn)) [[unlikely]]
             return;
-        (void)usbd_edpt_xfer(
-            rhport_, protocol::kEpDataIn, g_endpoint_buffers.data_in, static_cast<uint16_t>(size),
-            false);
+        if (!usbd_edpt_xfer(
+                rhport_, protocol::kEpDataIn, g_endpoint_buffers.data_in,
+                static_cast<uint16_t>(size), false))
+            (void)usbd_edpt_release(rhport_, protocol::kEpDataIn);
     }
 
     // ---- 命令流 ----
 
     void on_command_packet(std::span<const uint8_t> bytes) {
+        if (device_check_.receive(bytes)) {
+            publish();
+            return;
+        }
         protocol::for_each_command(
             bytes, [this](const protocol::Command& command) { handle_command(command); });
     }
@@ -415,8 +462,15 @@ private:
             return;
         }
         case Opcode::kTxAbort:
-            // 软件发送队列由主循环每轮排空, 几乎恒空; 作废语义由 MCAN 的发送
-            // 取消与 TXBCF 计数承担, 这里无事可做。
+            // PCAN 的通道重置会先 TX_ABORT 再 RX_BARRIER。不能空转, 否则
+            // 不应答/IN 停读后留下的 CAN 请求和回显槽只能靠拔插 USB 释放。
+            if (channel < channels_.size()) {
+                const bool held = !pending_tx_[channel].empty();
+                pending_tx_[channel] = {};
+                apply_bus_state(channel); // 撤下、清队列并按原有时序/模式重建。
+                if (held)
+                    arm_out(channel == 0 ? protocol::kEpDataOut0 : protocol::kEpDataOut1);
+            }
             return;
         case Opcode::kWrErrCnt: {
             if (can::Can* can = channel_can(channel))
@@ -458,15 +512,12 @@ private:
     }
 
     // 模式切换 + 按当前意图重摆控制器。RESET: 撤下总线; NORMAL/LISTEN: 按存的
-    // 时序重配(带新的 FD/ISO 意图)再上线; 时序未知(主机还没发 TIMING)时按上电
-    // 默认配置直接上线, 与真卡一致。
+    // 时序重配(带新的 FD/ISO 意图)再上线; 未收到时序或应用失败则保持离线并上报。
     void set_channel_mode(uint8_t channel, ChannelMode mode) {
         if (channel >= channels_.size())
             return;
         channels_[channel].mode = mode;
         apply_bus_state(channel);
-        led::led->set_channel_active(channel, mode != ChannelMode::kReset);
-        publish();
     }
 
     void apply_bus_state(uint8_t channel) {
@@ -475,23 +526,24 @@ private:
             return;
         auto& state = channels_[channel];
 
-        if (state.mode == ChannelMode::kReset) {
-            can->set_bus_off();
-            return;
+        // 重配取消旧使用者的请求。先关该路 CAN 中断/接收闸再清 SPSC 完成队列,
+        // 防止旧 marker 被误配到新的 USB 请求。
+        internal::g_rx_mask.store(
+            internal::g_rx_mask.load(std::memory_order::relaxed) & ~(1U << channel),
+            std::memory_order::release);
+        can->set_bus_off();
+        (void)tx_completions_[channel].clear();
+        tx_echoes_[channel].clear();
+        if (state.mode == ChannelMode::kReset && !pending_tx_[channel].empty()) {
+            pending_tx_[channel] = {};
+            arm_out(channel == 0 ? protocol::kEpDataOut0 : protocol::kEpDataOut1);
         }
-        if (state.timing_known) {
-            const bool fd = state.data_known;
-            // TIMING 的 10 位分频超出 MCAN 的 9 位字段(80 MHz 下低于 ~5 kbps 才
-            // 可能): 拒收这组时序, 保持旧配置 -- 总线照常上线。
-            const auto fits = [](const can::Can::PhaseTiming& phase) {
-                return phase.prescaler != 0 && phase.prescaler <= 512U && phase.seg1 != 0
-                    && phase.seg2 != 0 && phase.sjw != 0;
-            };
-            if (fits(state.nominal) && (!fd || fits(state.data)))
-                (void)can->reconfigure_timing(fd, state.nominal, state.data);
-            state.fd = fd;
-        }
-        can->set_bus_on(state.mode == ChannelMode::kListenOnly, state.non_iso && state.fd);
+        const bool active = state.apply(*can);
+        led::led->set_channel_active(channel, active);
+        state.reported_status_bits = state.status_bits(can->read_status().flags);
+        state.status_valid = true;
+        state.status_pending = state.error_option;
+        publish();
     }
 
     void apply_filter(uint8_t channel, const protocol::FilterMask& mask) {
@@ -533,17 +585,30 @@ private:
 
     // ---- TX ----
 
-    // 一包一串记录, 逐帧转发。队列满丢弃并点 LED(与 DMTool 路径同一决策:
-    // 背压 hold 在不应答的总线上会永久卡死端点)。
+    // 一包一串记录。CAN/回显槽满时保留当前记录, 暂不重挂这一数据 OUT 端点;
+    // 命令端点仍工作, 主机 RESET 可撤下故障通道并释放请求。
     void on_tx_packet(std::size_t channel, std::span<const uint8_t> bytes) {
-        auto rest = bytes;
-        while (const auto request = protocol::parse_tx_frame(rest)) {
-            transmit(static_cast<uint8_t>(channel), *request);
-            rest = rest.subspan(request->encoded_size);
-        }
+        pending_tx_[channel] = bytes;
+        drain_tx_packet(channel);
     }
 
-    void transmit(uint8_t channel, const protocol::TxFrame& request) {
+    void drain_tx_packet(std::size_t channel) {
+        auto& rest = pending_tx_[channel];
+        while (const auto request = protocol::parse_tx_frame(rest)) {
+            if (!transmit(static_cast<uint8_t>(channel), *request)) {
+                publish();
+                return;
+            }
+            rest = rest.subspan(request->encoded_size);
+        }
+        rest = {};
+        arm_out(channel == 0 ? protocol::kEpDataOut0 : protocol::kEpDataOut1);
+        publish();
+    }
+
+    bool transmit(uint8_t channel, const protocol::TxFrame& request) {
+        if (channel >= channels_.size() || !channels_[channel].active())
+            return true;
         can::Can* can = channel_can(channel);
         const uint8_t dlc = request.channel_dlc >> 4;
         const auto payload = std::min<std::size_t>(
@@ -552,7 +617,14 @@ private:
         const bool extended = (request.flags & protocol::kTxFlagExtId) != 0;
         const bool id_valid = extended || request.can_id <= 0x7FFU;
         if (can == nullptr || !id_valid)
-            return;
+            return true;
+
+        std::optional<uint8_t> marker;
+        if (TxEchoes<>::requested(request)) {
+            marker = tx_echoes_[channel].reserve(channel, request);
+            if (!marker)
+                return false;
+        }
 
         const bool ok = can->handle_downlink_as(
             {
@@ -565,11 +637,14 @@ private:
                 .wire_dlc = dlc, // 长帧 DLC 9-15 直传
                 .fd = (request.flags & protocol::kTxFlagExtDataLen) != 0,
                 .bitrate_switch = (request.flags & protocol::kTxFlagBitrateSwitch) != 0,
+                .echo = marker.has_value(),
+                .echo_marker = marker.value_or(0),
             });
-        if (!ok)
-            led::led->downlink_buffer_full();
+        if (!ok && marker)
+            tx_echoes_[channel].release(*marker);
         // SINGLE_SHOT 逐帧标志不跟随(MCAN 的重传开关是控制器级的), ESI 由硬件
-        // 生成, SELF_RECEIVE 回显默认关(见 PCAN_PROTOCOL.md)。
+        // 生成。回显只由真实 TX 完成事件产生, 不在此伪造成功。
+        return ok;
     }
 
     // ---- 记录流泵 ----
@@ -579,8 +654,8 @@ private:
     // 记录留在队列里等下一轮。
     std::size_t emit_periodic(std::span<uint8_t> out, std::size_t used) {
         if (calibration_due_) {
-            const std::size_t written = protocol::encode_calibration(
-                {.timestamp_us = now_timestamp_us()}, out.subspan(used));
+            const std::size_t written =
+                protocol::encode_calibration(calibration_sample(), out.subspan(used));
             if (written == 0)
                 return used;
             used += written;
@@ -603,7 +678,7 @@ private:
             if (channel.status_pending) {
                 const std::size_t written = protocol::encode_status(
                     {.timestamp_us = now_timestamp_us(),
-                     .channel_bits = static_cast<uint8_t>(bits | channel.status_bits)},
+                     .channel_bits = static_cast<uint8_t>(bits | channel.reported_status_bits)},
                     out.subspan(used));
                 if (written == 0)
                     return used;
@@ -623,6 +698,28 @@ private:
                     return used;
                 used += written;
                 channel.error_pending = false;
+            }
+        }
+        return used;
+    }
+
+    std::size_t emit_tx_echoes(std::span<uint8_t> out, std::size_t used) {
+        for (std::size_t channel = 0; channel < tx_completions_.size(); ++channel) {
+            auto& queue = tx_completions_[channel];
+            auto& echoes = tx_echoes_[channel];
+            while (const TxComplete* event = queue.peek_front()) {
+                const uint8_t marker = event->marker;
+                const auto record = echoes.completed(
+                    marker, to_timestamp_us(event->timestamp_sec, event->timestamp_ns),
+                    event->flags);
+                if (record) {
+                    const std::size_t written = protocol::encode_can_rx(*record, out.subspan(used));
+                    if (written == 0)
+                        return used;
+                    used += written;
+                    echoes.release(marker);
+                }
+                queue.pop_front([](const TxComplete&) noexcept {});
             }
         }
         return used;
@@ -686,13 +783,17 @@ private:
         uint8_t service = 0;
         if (opened_) {
             for (std::size_t i = 0; i < channels_.size(); ++i) {
-                if (channels_[i].mode != ChannelMode::kReset)
+                if (channels_[i].active())
                     rx_mask |= 1U << i;
             }
         }
         if (rx_mask != 0)
             service |= kServiceRx;
-        if (calibration_due_)
+        for (const auto& pending : pending_tx_) {
+            if (!pending.empty())
+                service |= kServiceTx;
+        }
+        if (calibration_due_ || in_staged_size_ != 0 || device_check_.pending())
             service |= kServicePeriodic;
         for (const auto& channel : channels_) {
             if (channel.error_pending || channel.status_pending || channel.barrier_pending) {
@@ -707,10 +808,17 @@ private:
     uint8_t rhport_ = 0;
     bool opened_ = false;
     uint16_t cmd_out_ = 0;
+    uint16_t cmd_in_ = 0;
+    device_check::Exchange device_check_;
     uint16_t data_in_ = 0;
     std::array<uint16_t, 2> data_out_{};
 
     std::array<Channel, kChannelCount> channels_{};
+    std::array<std::span<const uint8_t>, kChannelCount> pending_tx_{};
+    std::array<TxEchoes<>, kChannelCount> tx_echoes_{};
+    std::array<utility::RingBuffer<TxComplete, TxEchoes<>::kCapacity>, kChannelCount>
+        tx_completions_{};
+    std::size_t in_staged_size_ = 0;
 
     // 1 Mbit 经典帧满载约 9 帧/ms, 泵每主循环一轮至少一次; 32 深(与 dmtool 同
     // 一量纲), 满了丢帧 + OVERRUN 记录。
@@ -788,6 +896,11 @@ void poll_slow() { adapter->poll(); }
 // ISR 侧只有闸打开时才会调到, 而闸只能由构造好的实例打开。
 void push_can_rx(std::size_t can_index, const RxEvent& event) {
     adapter->push_can_rx(can_index, event);
+}
+
+ATTR_PLACE_AT(".fast")
+void push_tx_complete(std::size_t can_index, const TxComplete& event) {
+    adapter->push_tx_complete(can_index, event);
 }
 
 void poll_tick(uint32_t tick) {

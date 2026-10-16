@@ -134,7 +134,21 @@ USB 身份（唯一来源 `core/include/libhcs/protocol/usb_identity.hpp`）：�
 - 通道上电停在 reset 模式（真卡语义），NORMAL/LISTEN_ONLY 命令才上线；时序走 DMTool 同一条
   `reconfigure_timing`（TQ 直写、自动重传开）；CAN 侧冷方法 `set_bus_off/set_bus_on/
   clear_error_counters` 只在本人格编译。CAN_DIAG/PULSE_TEST/SOF_DIAG 与人格互斥。
-- 烧录/验收/刷回命令与 Windows 待验项见 `PCAN_PROTOCOL.md` 第 7 节。
+- 原版 Windows PCAN DLL/驱动使用 `hpm_board_app_pcan`，设备初始化命令应答走
+  独立 `0x81`；必须保留变长记录与 CAN 命令的解析边界。已测驱动/DLL 与持续/恢复范围见
+  `PCAN_PROTOCOL.md` 7.13，不得外推全部版本/功能兼容。
+- `hpm_board_app_pcan_winusb` + `host/compat/pcan_basic` 是独立兼容 DLL 备用路径，
+  身份为 `0xA511:0xF531/F532`。不可将该 DLL 与 PEAK 身份固件混用；切回原版路径先恢复
+  安装目录中的原 DLL（兼容层 `install.ps1 -Restore`）。
+- 烧录/验收/刷回记录见 `PCAN_PROTOCOL.md` 第 7 节；独立固件构建、烧录命令：
+
+  ```bash
+  cmake --build firmware/hpm_board/build --target hpm_board_app_pcan
+  dfu-util -p <USB-path> -d 0x0c72:0x0011,0xa511:* -a 0 -D <build>/app_pcan/output/hpm_board_app_hpm5321_pcan.dfu
+  ```
+
+  单 CAN 的 runtime PID 为 `0x0012`；从 WinUSB 人格切换时第一对身份改为
+  `0xA511:0xF532`（双 CAN）或 `0xF531`（单 CAN）。
 
 ## 10. CAN 帧时间戳与共享时间基准（机制与实测见 `SOF_TIMEBASE.md` 第 8 节）
 
@@ -154,7 +168,8 @@ USB 身份（唯一来源 `core/include/libhcs/protocol/usb_identity.hpp`）：�
 ## 12. 中断与诊断
 
 - 延迟相关事件全部中断驱动：CAN RX 优先级 3（ISR 内排空 + 序列化）> USB 2 > UART 1；1 kHz tick（MTIP，绕过
-  PLIC）只自增计数，LED 等工作在主循环。CAN TX 完成中断不开。（`HOST_TUNING.md` 第 8 节）
+  PLIC）只自增计数，LED 等工作在主循环。默认镜像不开 CAN TX 完成中断；PCAN 人格仅为
+  主机请求的发送确认开启 TX Event FIFO 中断。（`HOST_TUNING.md` 第 8 节、`PCAN_PROTOCOL.md` 第 4 节）
 - 板上调试口只有通孔焊盘，不当数据/日志通道；探针只用 J-Link。
 - 带内诊断（都编成 UART0 上行帧）：`-Dlibhcs_CAN_DIAG=ON`（CAN 转发计数、主循环周期）、`-Dlibhcs_SOF_DIAG=ON`
   （FRINDEX 直方图）、`-Dlibhcs_PULSE_TEST=ON`（跨板脉冲，借走 UART0）。`CAN_DIAG` 与 `SOF_DIAG` 不得同开，

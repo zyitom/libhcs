@@ -82,7 +82,11 @@ public:
     static constexpr uint32_t kEnabledInterrupts =
         MCAN_INT_RXFIFO0_NEW_MSG | MCAN_INT_BUS_OFF_STATUS | MCAN_INT_WARNING_STATUS
         | MCAN_INT_ERROR_PASSIVE | MCAN_INT_PROTOCOL_ERR_IN_ARB_PHASE
-        | MCAN_INT_PROTOCOL_ERR_IN_DATA_PHASE;
+        | MCAN_INT_PROTOCOL_ERR_IN_DATA_PHASE
+#if defined(libhcs_APP_PCAN_PERSONALITY) && libhcs_APP_PCAN_PERSONALITY
+        | MCAN_INT_TX_EVT_FIFO_NEW_ENTRY
+#endif
+        ;
 
     explicit Can(data::DataId data_id, size_t board_can_index)
         : Can(data_id, board::can_port(board_can_index), board_can_index) {}
@@ -216,6 +220,10 @@ public:
         uint8_t wire_dlc;
         bool fd;
         bool bitrate_switch;
+#if defined(libhcs_APP_PCAN_PERSONALITY) && libhcs_APP_PCAN_PERSONALITY
+        bool echo = false;
+        uint8_t echo_marker = 0;
+#endif
 
         [[nodiscard]] constexpr bool wants_fd() const { return fd; }
         [[nodiscard]] constexpr bool wants_bitrate_switch() const { return bitrate_switch; }

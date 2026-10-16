@@ -123,6 +123,18 @@ add_hpm_board_subbuild(
     -Dlibhcs_APP_ILM_HOT_PATH=${libhcs_ILM_HOT_PATH}
 )
 add_hpm_board_subbuild(
+    hpm_board_app_pcan_winusb
+    app
+    BINARY_SUBDIR app_pcan_winusb
+    -Dlibhcs_APP_PCAN_PERSONALITY=ON
+    -Dlibhcs_APP_PCAN_WINUSB=ON
+    -Dlibhcs_APP_CAN_DIAG=OFF
+    -Dlibhcs_APP_PULSE_TEST=OFF
+    -Dlibhcs_APP_SOF_DIAG=OFF
+    -Dlibhcs_APP_WATCHDOG=${libhcs_WATCHDOG}
+    -Dlibhcs_APP_ILM_HOT_PATH=${libhcs_ILM_HOT_PATH}
+)
+add_hpm_board_subbuild(
     hpm_board_bootloader
     bootloader
     -DBOARD_BOOTLOADER_MODE=${BOARD_BOOTLOADER_MODE}

@@ -73,7 +73,7 @@ TimingSlow decode_timing_slow(std::span<const uint8_t> args) {
         .timing =
             {
                      .prescaler = static_cast<uint16_t>(load16(args.data() + 4) + 1U),
-                     .seg1 = static_cast<uint8_t>(args[3] + 1U),
+                     .seg1 = static_cast<uint16_t>(args[3] + 1U),
                      .seg2 = static_cast<uint8_t>(args[2] + 1U),
                      .sjw = static_cast<uint8_t>((args[1] & 0x7FU) + 1U),
                      },
@@ -87,7 +87,7 @@ TimingFast decode_timing_fast(std::span<const uint8_t> args) {
         .timing =
             {
                      .prescaler = static_cast<uint16_t>(load16(args.data() + 4) + 1U),
-                     .seg1 = static_cast<uint8_t>(args[3] + 1U),
+                     .seg1 = static_cast<uint16_t>(args[3] + 1U),
                      .seg2 = static_cast<uint8_t>(args[2] + 1U),
                      .sjw = static_cast<uint8_t>(args[1] + 1U),
                      },
@@ -154,10 +154,10 @@ std::size_t encode_can_rx(const CanRxRecord& record, std::span<uint8_t> out) {
     store16(p + 2, kMsgCanRx);
     store32(p + 4, static_cast<uint32_t>(record.timestamp_us));
     store32(p + 8, static_cast<uint32_t>(record.timestamp_us >> 32));
-    store32(p + 12, 0); // tag: Linux 不用; Windows 回显路径(kSelfReceiveEcho)才需要
-    store32(p + 16, 0);
+    store32(p + 12, record.tag_low);
+    store32(p + 16, record.tag_high);
     p[20] = record.channel_dlc;
-    p[21] = 0; // client
+    p[21] = record.client;
     store16(p + 22, record.flags);
     store32(p + 24, record.can_id);
     std::memset(p + 28, 0, payload); // 负载不足对齐界的尾部补 0
@@ -171,7 +171,7 @@ std::size_t encode_calibration(const CalibrationRecord& record, std::span<uint8_
         return 0;
     uint8_t* p = out.data();
     p += store_record_head(p, kMsgCalibration, record.timestamp_us);
-    store16(p, 0); // usb_frame_index: 内核 decode_ts 不读, 恒 0
+    store16(p, record.usb_frame_index);
     store16(p + 2, 0);
     return kFixedRecordSize;
 }

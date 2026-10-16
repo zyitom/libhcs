@@ -40,3 +40,8 @@ libhcs_add_test(board_v4_test board_v4_test.cpp)
 
 libhcs_add_test(spsc_ring_test spsc_ring_test.cpp)
 libhcs_add_test(stream_writer_test stream_writer_test.cpp)
+# Firmware-only tests are unavailable in the SDK source archive.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../firmware/hpm_board/app/src/pcan")
+    libhcs_add_test(pcan_test pcan_test.cpp
+        ../../firmware/hpm_board/app/src/pcan/pcan_protocol.cpp)
+endif()

@@ -33,6 +33,7 @@ inline constexpr std::size_t kFilterRows = 64;
 // 需要主循环服务的功能, 位或进 internal::g_service。
 inline constexpr uint8_t kServiceRx = 1U << 0;       // 有通道在收: 泵 data IN 记录流
 inline constexpr uint8_t kServicePeriodic = 1U << 1; // 周期工作到点(CALIBRATION / ERROR / STATUS)
+inline constexpr uint8_t kServiceTx = 1U << 2;       // 等待 CAN/回显槽的 USB OUT 包
 
 namespace internal {
 
@@ -89,6 +90,16 @@ struct RxEvent {
 // 直接收(位图只覆盖标准 ID 空间, 与真实硬件一致)。队列满时丢帧并计数(OVERRUN
 // 记录在主循环按计数差补发)。
 void push_can_rx(std::size_t can_index, const RxEvent& event);
+
+struct TxComplete {
+    uint32_t timestamp_sec = 0;
+    uint32_t timestamp_ns = 0;
+    uint16_t flags = 0;
+    uint8_t marker = 0;
+};
+
+// 仅在真实 TX Event FIFO 报告发送成功后调用, 不把 USB 收到请求当作 CAN 已发出。
+void push_tx_complete(std::size_t can_index, const TxComplete& event);
 
 // ---- 主循环侧 ----
 

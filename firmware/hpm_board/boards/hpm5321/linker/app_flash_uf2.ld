@@ -65,6 +65,8 @@ SECTIONS
         *(.text._ZN6libhcs4core4time*)
         *(.text._ZNK6libhcs4core4time*)
         *(.text.mcan_read_rxfifo*)
+        *(.text.mcan_read_tx_evt_fifo*)
+        *(.text.mcan_get_timestamp_from_tx_event*)
         /* Everything the ILM code above still reached in FLASH on every frame.
          * One out-of-ILM callee is enough to put the whole path back on the
          * XIP caches: whether its line survives the ~1 ms between frames
@@ -126,6 +128,14 @@ SECTIONS
             && mcan_get_timestamp_from_received_message < ORIGIN(ILM) + LENGTH(ILM)
             && mcan_transmit_via_txfifo_nonblocking < ORIGIN(ILM) + LENGTH(ILM),
         "A per-frame callee of the ILM hot path is in FLASH: check the libc archive:member and mcan_* specs in .vectors against the linker map.")
+
+    /* TX event helpers are only retained by the PCAN personality. */
+    ASSERT(
+        DEFINED(mcan_read_tx_evt_fifo) ? mcan_read_tx_evt_fifo < ORIGIN(ILM) + LENGTH(ILM) : 1,
+        "mcan_read_tx_evt_fifo is outside ILM: check its .vectors rule.")
+    ASSERT(
+        DEFINED(mcan_get_timestamp_from_tx_event) ? mcan_get_timestamp_from_tx_event < ORIGIN(ILM) + LENGTH(ILM) : 1,
+        "mcan_get_timestamp_from_tx_event is outside ILM: check its .vectors rule.")
 
     .text (__vector_load_addr__ + SIZEOF(.vectors)): {
         . = ALIGN(8);

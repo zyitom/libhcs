@@ -49,6 +49,13 @@ bool Can::submit_downlink(const data::CanDataView& data, Policy policy) {
     frame.canfd_frame = send_fd;
     frame.bitrate_switch = send_fd && policy.wants_bitrate_switch();
     frame.rtr = data.is_remote_transmission;
+#if defined(libhcs_APP_PCAN_PERSONALITY) && libhcs_APP_PCAN_PERSONALITY
+    if constexpr (std::same_as<Policy, RequestedFrame>) {
+        frame.event_fifo_control = policy.echo;
+        frame.timestamp_capture_enable = policy.echo;
+        frame.message_marker_l = policy.echo_marker;
+    }
+#endif
 
     // DLC: <=8 字节按字节数直写; 长帧(负载 12-64 字节)经 DLC 编解码取线上码
     // (9-15) -- 4 位字段: 字节数 16 直写会截断成 0, 线上 DLC 0, 接收方全丢。
@@ -844,6 +851,30 @@ void Can::poll() {
 ATTR_PLACE_AT(".fast")
 void Can::handle_interrupt_flags(uint32_t flags) {
     mcan_clear_interrupt_flags(can_base_, flags);
+
+#if defined(libhcs_APP_PCAN_PERSONALITY) && libhcs_APP_PCAN_PERSONALITY
+    if ((flags & MCAN_INT_TX_EVT_FIFO_NEW_ENTRY) != 0) {
+        mcan_tx_event_fifo_elem_t tx;
+        while (mcan_read_tx_evt_fifo(can_base_, &tx) == status_success) {
+            if (!pcan::rx_enabled(can_index()))
+                continue;
+            pcan::TxComplete event{.marker = static_cast<uint8_t>(tx.message_marker)};
+            if (tx.canfd_frame)
+                event.flags |= pcan::protocol::kRxFlagExtDataLen;
+            if (tx.bitrate_switch)
+                event.flags |= pcan::protocol::kRxFlagBitrateSwitch;
+            if (tx.error_state_indicator)
+                event.flags |= pcan::protocol::kRxFlagErrorStateInd;
+            mcan_timestamp_value_t timestamp;
+            if (mcan_get_timestamp_from_tx_event(can_base_, &tx, &timestamp) == status_success
+                && timestamp.is_64bit) {
+                event.timestamp_sec = static_cast<uint32_t>(timestamp.ts_64bit >> 32);
+                event.timestamp_ns = static_cast<uint32_t>(timestamp.ts_64bit);
+            }
+            pcan::push_tx_complete(can_index(), event);
+        }
+    }
+#endif
 
     // RF0L 不在使能掩码里, 但 IR 照样置位, 上面按读到的整份 IR 一并清掉: 在这里数。
     if (flags & MCAN_INT_RXFIFO0_MSG_LOST) [[unlikely]]

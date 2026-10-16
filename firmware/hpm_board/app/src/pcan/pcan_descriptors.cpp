@@ -6,6 +6,7 @@
 #include <tusb_config.h>
 
 #include "firmware/hpm_board/app/src/pcan/pcan_adapter.hpp"
+#include "firmware/hpm_board/app/src/pcan/pcan_winusb.hpp"
 
 // PCAN 人格的描述符数据与 TinyUSB 回调。字段依据见 PCAN_PROTOCOL.md: 真实
 // PCAN-USB FD 的身份事实(VID:PID / 端点 / 接口形状)取自内核 peak_usb 驱动的
@@ -105,9 +106,19 @@ constexpr auto kConfigurationHsSingle = make_single(512);
 constexpr auto kConfigurationHsDual = make_dual(512);
 
 constexpr std::array<uint8_t, 2> kLanguageId = {0x09, 0x04};
+#if libhcs_APP_PCAN_WINUSB
+constexpr std::string_view kManufacturerString = "libhcs";
+constexpr std::string_view kProductStringSingle = "HCS CAN FD Bridge";
+constexpr std::string_view kProductStringDual = "HCS Dual CAN FD Bridge";
+constexpr uint8_t kBosDescriptor[] = {
+    TUD_BOS_DESCRIPTOR(33, 1),
+    TUD_BOS_MS_OS_20_DESCRIPTOR(winusb::kDescriptorSet.size(), winusb::kVendorCode),
+};
+#else
 constexpr std::string_view kManufacturerString = "PEAK-System";
 constexpr std::string_view kProductStringSingle = "PCAN-USB FD";
 constexpr std::string_view kProductStringDual = "PCAN-USB Pro FD";
+#endif
 constexpr std::string_view kDfuRuntimeString = "DFU Runtime";
 
 } // namespace
@@ -133,6 +144,14 @@ Descriptors::Descriptors() {
     };
     if (board::board_identity().dual_can())
         device_descriptor_.idProduct = core::protocol::usb_identity::kPcanUsbProFdProductId;
+
+#if libhcs_APP_PCAN_WINUSB
+    device_descriptor_.bcdUSB = 0x0210;
+    device_descriptor_.idVendor = winusb::kVendorId;
+    device_descriptor_.idProduct =
+        board::board_identity().dual_can() ? winusb::kDualProductId : winusb::kSingleProductId;
+    device_descriptor_.bcdDevice = 0x0100;
+#endif
 
     // 序列号十进制化(u32 最长 10 位): iSerialNumber 显示的就是 fw_info.ser_no。
     uint32_t serial = serial_number();
@@ -193,6 +212,10 @@ uint16_t const* Descriptors::get_string_descriptor(uint16_t index) {
 
 // TinyUSB 描述符回调(pcan 构建里的唯一定义; 默认镜像的那份在 usb_descriptors.cpp)。
 extern "C" {
+
+#if libhcs_APP_PCAN_WINUSB
+uint8_t const* tud_descriptor_bos_cb(void) { return libhcs::firmware::pcan::kBosDescriptor; }
+#endif
 
 uint8_t const* tud_descriptor_device_cb(void) {
     return libhcs::firmware::pcan::descriptors->get_device_descriptor();

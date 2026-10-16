@@ -18,6 +18,7 @@
 #include "firmware/hpm_board/app/src/link/uplink.hpp"
 #include "firmware/hpm_board/app/src/pcan/pcan_adapter.hpp"
 #include "firmware/hpm_board/app/src/pcan/pcan_descriptors.hpp"
+#include "firmware/hpm_board/app/src/pcan/pcan_winusb.hpp"
 #include "firmware/hpm_board/app/src/utility/boot_mailbox.hpp"
 
 // PCAN 人格的 EP0 / USB 初始化 / 引导胶水 -- 默认镜像里由 usb/vendor.cpp 与
@@ -123,6 +124,18 @@ bool tud_vendor_control_xfer_cb(
     uint8_t rhport, uint8_t stage, const tusb_control_request_t* request) {
     if (request->bmRequestType_bit.type != TUSB_REQ_TYPE_VENDOR)
         return false;
+
+#if libhcs_APP_PCAN_WINUSB
+    if (request->bRequest == libhcs::firmware::pcan::winusb::kVendorCode
+        && request->bmRequestType_bit.direction == TUSB_DIR_IN && request->wIndex == 7) {
+        if (stage != CONTROL_STAGE_SETUP)
+            return true;
+        const auto& descriptor = libhcs::firmware::pcan::winusb::kDescriptorSet;
+        return tud_control_xfer(
+            rhport, request, const_cast<uint8_t*>(descriptor.data()),
+            static_cast<uint16_t>(descriptor.size()));
+    }
+#endif
 
     if (request->bRequest == pp::kReqFct) {
         // DRVLD: OUT 数据段带上"驱动已加载"标志, 到达后再改状态。

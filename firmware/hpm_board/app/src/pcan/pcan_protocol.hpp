@@ -58,7 +58,7 @@ inline constexpr uint16_t kDrvldLength = 16; // DRVLD 的 OUT 数据段长度(�
 // Pro 系默认端点(PCAN-USB FD 单通道不用 0x03)。fw_info 的 EXT 端点表与此一致;
 // 描述符(pcan_descriptors.hpp)与适配器(pcan_adapter.cpp)从这里取值。
 inline constexpr uint8_t kEpCmdOut = 0x01;   // bulk OUT: uCAN 命令流
-inline constexpr uint8_t kEpCmdIn = 0x81;    // bulk IN: 命令应答(Linux 不读, 仅声明)
+inline constexpr uint8_t kEpCmdIn = 0x81;    // bulk IN: Windows 设备初始化应答
 inline constexpr uint8_t kEpDataOut0 = 0x02; // bulk OUT: CAN0 发送
 inline constexpr uint8_t kEpDataOut1 = 0x03; // bulk OUT: CAN1 发送(双通道板)
 inline constexpr uint8_t kEpDataIn = 0x82;   // bulk IN: 共享 RX 记录流
@@ -68,9 +68,8 @@ inline constexpr uint8_t kEpUnusedIn = 0x83; // Pro FD 保留的第三个 IN 管
 
 // 主机按 fw_version[0] >= 2 判断"固件支持 ISO/non-ISO 切换"(内核 pcan_usb_fd_init);
 // 本板用 MCAN CCCR.NISO 真实实现。版本号对齐真实 Pro FD 的当前固件 3.5.4
-// (PEAK 固件信息页, 2026-08-27)——Windows 驱动按版本分支行为, 报 2016 年的
-// 2.0.0 会走老固件兼容路径(实测 2026-10-15: 驱动 5.0.0.20000 对 2.0.0 报
-// Code 10 启动失败)。
+// (PEAK 固件信息页, 2026-08-27)。这是兼容身份, 不表示本实现具备真卡全部特性。
+// 早期 Code 10 修复同时改了版本、描述符与 EP0, 不能单独归因于版本号。
 inline constexpr std::array<uint8_t, 3> kFwVersion{3, 5, 4};
 inline constexpr uint8_t kHwVersion = 1;
 inline constexpr uint8_t kHwType = 1;
@@ -154,7 +153,7 @@ void for_each_command(std::span<const uint8_t> bytes, OnCommand&& on_command) {
 // Can::PhaseTiming 对齐: seg1 = 传播段 + 相位段 1, 位长 = seg1 + seg2 + 1 个 tq。
 struct PhaseTiming {
     uint16_t prescaler = 0; // 10 位字段; MCAN NBRP/DBRP 只有 9 位, 超界由适配器拒收
-    uint8_t seg1 = 0;
+    uint16_t seg1 = 0;
     uint8_t seg2 = 0;
     uint8_t sjw = 0;
 };
@@ -216,8 +215,8 @@ struct TxFrame {
     uint32_t tag_low = 0;
     uint32_t tag_high = 0;
     uint32_t can_id = 0;
-    std::span<const uint8_t> data; // payload_length(dlc) 字节, 指向传入缓冲
-    uint8_t channel_dlc = 0;       // 低 4 位通道, 高 4 位线上 DLC
+    std::span<const uint8_t> data{}; // payload_length(dlc) 字节, 指向传入缓冲
+    uint8_t channel_dlc = 0;         // 低 4 位通道, 高 4 位线上 DLC
     uint8_t client = 0;
     uint16_t flags = 0;
     std::size_t encoded_size = 0; // 本帧(含对齐填充)在传输中占的字节数
@@ -271,10 +270,14 @@ struct CanRxRecord {
     std::span<const uint8_t> data;
     uint8_t channel_dlc = 0;
     uint16_t flags = 0;
+    uint32_t tag_low = 0;
+    uint32_t tag_high = 0;
+    uint8_t client = 0;
 };
 
 struct CalibrationRecord {
     uint64_t timestamp_us = 0;
+    uint16_t usb_frame_index = 0;
 };
 
 struct ErrorRecord {
